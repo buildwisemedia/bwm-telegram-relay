@@ -1,0 +1,15 @@
+{
+  "name": "bwm-telegram-relay",
+  "version": "1.0.0",
+  "description": "Telegram relay for BWM ops alerts — send + webhook receive (PROJ-COMMS-CHANNEL-MIGRATION-001)",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250320.0",
+    "typescript": "^5.7.0",
+    "wrangler": "^4.0.0"
+  }
+}

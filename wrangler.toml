@@ -1,0 +1,12 @@
+name = "bwm-telegram-relay"
+main = "src/index.ts"
+compatibility_date = "2025-04-25"
+account_id = "ba00448499190431e6e4a00820f2200d"
+
+[[kv_namespaces]]
+binding = "BWM_TELEGRAM_KV"
+id = "ab6c7f536e92480d877341b28e551d15"
+
+[[services]]
+binding = "CRED_BROKER"
+service = "bwm-cred-broker"
