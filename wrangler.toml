@@ -2,6 +2,11 @@ name = "bwm-telegram-relay"
 main = "src/index.ts"
 compatibility_date = "2025-04-25"
 account_id = "ba00448499190431e6e4a00820f2200d"
+workers_dev = true
+
+[triggers]
+# Heartbeat every 15 min — watchdog threshold is 2× interval = 30 min staleness max.
+crons = ["*/15 * * * *"]
 
 [[kv_namespaces]]
 binding = "BWM_TELEGRAM_KV"
@@ -16,3 +21,20 @@ service = "bwm-cred-broker"
 [[services]]
 binding = "ATTENTION_ROUTER"
 service = "bwm-attention-router"
+
+[vars]
+ENVIRONMENT = "production"
+
+[observability]
+enabled = true
+
+# Secrets (set via `wrangler secret put`):
+#   BROKER_BEARER                — bearer token for bwm-cred-broker auth
+#   BWM_INTERNAL_KEY             — X-BWM-Internal-Key for /send legacy route
+#   ATTENTION_ROUTER_KEY         — X-BWM-Internal-Key for bwm-attention-router /classify
+#   TELEGRAM_WEBHOOK_SECRET      — X-Telegram-Bot-Api-Secret-Token from Telegram
+#   TELEGRAM_RELAY_ADMIN_HMAC    — pre-image secret for /test admin HMAC
+#   SUPABASE_URL                 — https://lscifhwmmkjiobnthlak.supabase.co
+#   SUPABASE_SERVICE_KEY         — sb_secret_* for operational_events heartbeat writes
+#
+# TELEGRAM_BOT_TOKEN is minted via CRED_BROKER at runtime — not stored as a direct secret here.

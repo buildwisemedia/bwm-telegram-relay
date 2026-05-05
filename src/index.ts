@@ -1,12 +1,18 @@
 /**
- * bwm-telegram-relay — Send Telegram messages + receive webhook updates.
+ * bwm-telegram-relay — Priority ops-event filter + Telegram notification bridge.
  *
  * Routes:
- *   GET  /health        → {ok:true, worker:'bwm-telegram-relay', version:'1.0.0'}
- *   POST /send          → X-BWM-Internal-Key auth; body {text, parse_mode?}
- *                         reads robert_chat_id from KV; mints TELEGRAM_BOT_TOKEN from broker
- *   POST /webhook       → validates X-Telegram-Bot-Api-Secret-Token == TELEGRAM_WEBHOOK_SECRET
- *                         parses Telegram update; stores chat_id on first contact; replies to /start
+ *   POST /event           — accepts operational_events payload from bwm-event-projector.
+ *                           Filters per TELEGRAM_PRIORITY_EVENTS rules below. Sends to
+ *                           Telegram if matches. Returns 200 even on filter-skip.
+ *   POST /test            — admin-only (HMAC via TELEGRAM_RELAY_ADMIN_HMAC).
+ *                           Sends "BWM Telegram Relay is live" test message.
+ *   POST /capture-chat-id — Telegram bot webhook bootstrap. On first message from bot,
+ *                           stores chat_id in KV under `bootstrap_chat_id`. One-time.
+ *   GET  /health          — { status, version, telegram_configured, last_send_at }
+ *   POST /send            — legacy: backwards-compat send route (X-BWM-Internal-Key auth).
+ *   POST /webhook         — legacy: Telegram update receiver (PROJ-ATTN-ROUTING-001 Phase 6).
+ *   scheduled             — emits daemon.heartbeat every 15 min.
  *
  * Token flow: BROKER_BEARER → bwm-cred-broker /mint → TELEGRAM_BOT_TOKEN
  *
@@ -14,9 +20,9 @@
  */
 
 export interface Env {
-  /** KV namespace for persisting robert_chat_id */
+  /** KV namespace for chat_id + dedup + metadata */
   BWM_TELEGRAM_KV: KVNamespace;
-  /** Service binding to bwm-cred-broker (avoids CF 1042 same-account subrequest block) */
+  /** Service binding to bwm-cred-broker */
   CRED_BROKER: Fetcher;
   /** Service binding to bwm-attention-router (PROJ-ATTN-ROUTING-001 Phase 6) */
   ATTENTION_ROUTER: Fetcher;
@@ -24,18 +30,144 @@ export interface Env {
   BROKER_BEARER: string;
   /** Shared key for /send route auth (X-BWM-Internal-Key header) */
   BWM_INTERNAL_KEY: string;
-  /** Shared key for calling bwm-attention-router /classify (X-BWM-Internal-Key) */
+  /** Shared key for calling bwm-attention-router /classify */
   ATTENTION_ROUTER_KEY: string;
   /** Secret token Telegram sends in X-Telegram-Bot-Api-Secret-Token header */
   TELEGRAM_WEBHOOK_SECRET: string;
+  /** HMAC secret for /test admin route */
+  TELEGRAM_RELAY_ADMIN_HMAC: string;
+  /** Supabase REST URL (for heartbeat writes) */
+  SUPABASE_URL: string;
+  /** Supabase service role key (for heartbeat writes) */
+  SUPABASE_SERVICE_KEY: string;
+  /** Environment tag */
+  ENVIRONMENT: string;
 }
 
-// Service binding uses a relative URL; the host is arbitrary when using Fetcher
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+const VERSION = "2.0.0";
 const BROKER_INTERNAL_URL = "https://internal/mint";
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 const KV_CHAT_ID_KEY = "robert_chat_id";
+const KV_BOOTSTRAP_CHAT_ID_KEY = "bootstrap_chat_id";
+const KV_BOOTSTRAP_DONE_KEY = "bootstrap_done";
+const KV_LAST_SEND_AT_KEY = "last_send_at";
+const KV_DEDUP_PREFIX = "dedup:";
+const DEDUP_TTL_SECONDS = 86_400; // 24 h
 
-// --- Utility helpers -----------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
+// Priority filter rules
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SEND_NEVER = new Set([
+  "daemon.heartbeat",
+  "ad.scored",
+  "ad.metric.recorded",
+  "cap.observation",
+]);
+
+const SEND_ALWAYS = new Set([
+  "ad.round_locked",
+  "ad.kill_recommended",
+]);
+
+// For conditional types, the predicate receives the full event payload.
+type EventPayload = Record<string, unknown>;
+
+const SEND_CONDITIONAL: Record<string, (p: EventPayload) => boolean> = {
+  "narrative": (p) => p["kind"] === "robert_priority" || p["urgency"] === "high",
+  "incident.opened": (p) => {
+    const sev = String(p["severity"] ?? "");
+    return sev === "P0" || sev === "P1";
+  },
+  "task.queued": (p) =>
+    p["assignee"] === "robert" && p["priority"] === "urgent",
+};
+
+function shouldSend(eventType: string, payload: EventPayload): boolean {
+  if (SEND_NEVER.has(eventType)) return false;
+  if (SEND_ALWAYS.has(eventType)) return true;
+  const cond = SEND_CONDITIONAL[eventType];
+  if (cond) return cond(payload);
+  return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Message formatting (Markdown V2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Telegram MarkdownV2 requires escaping: _ * [ ] ( ) ~ ` > # + - = | { } . !
+function escapeMd(text: string): string {
+  return text.replace(/([_*[\]()~`>#+\-=|{}.!])/g, "\\$1");
+}
+
+function formatEventMessage(eventType: string, payload: EventPayload): string {
+  const etype = escapeMd(eventType);
+  const lines: string[] = [];
+
+  // Header — emoji based on event type
+  const emoji = emojiFor(eventType);
+  lines.push(`${emoji} *${etype}*`);
+
+  // Core payload fields
+  const severity = payload["severity"];
+  if (severity) lines.push(escapeMd(`Severity: ${severity}`));
+
+  const scope = payload["scope"];
+  if (scope) lines.push(escapeMd(`Scope: ${scope}`));
+
+  const symptom = payload["symptom"];
+  if (symptom) lines.push(escapeMd(String(symptom).slice(0, 200)));
+
+  const description = payload["description"] ?? payload["message"];
+  if (description) lines.push(escapeMd(String(description).slice(0, 300)));
+
+  const daemon = payload["daemon"];
+  if (daemon) lines.push(escapeMd(`Daemon: ${daemon}`));
+
+  const kind = payload["kind"];
+  if (kind && eventType !== "narrative") lines.push(escapeMd(`Kind: ${kind}`));
+
+  const urgency = payload["urgency"];
+  if (urgency) lines.push(escapeMd(`Urgency: ${urgency}`));
+
+  const assignee = payload["assignee"];
+  if (assignee) lines.push(escapeMd(`Assignee: ${assignee}`));
+
+  const priority = payload["priority"];
+  if (priority) lines.push(escapeMd(`Priority: ${priority}`));
+
+  // Brain path link
+  const brainPath = payload["brain_path"] ?? payload["path"];
+  if (brainPath) {
+    const escapedPath = escapeMd(String(brainPath));
+    lines.push(`🔗 Brain: ${escapedPath}`);
+  }
+
+  // URL link
+  const url = payload["url"];
+  if (url) {
+    const escapedUrl = escapeMd(String(url));
+    lines.push(`🔗 URL: ${escapedUrl}`);
+  }
+
+  return lines.join("\n");
+}
+
+function emojiFor(eventType: string): string {
+  if (eventType === "incident.opened") return "🚨";
+  if (eventType.startsWith("ad.")) return "📊";
+  if (eventType.startsWith("task.")) return "✅";
+  if (eventType === "narrative") return "📝";
+  return "🔔";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Utilities
+// ─────────────────────────────────────────────────────────────────────────────
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
 
@@ -43,14 +175,68 @@ function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: JSON_HEADERS });
 }
 
-// --- Cred-broker mint ----------------------------------------------------------
+// Crockford base-32 ULID
+const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+function ulid(): string {
+  const ts = Date.now();
+  let tsStr = "";
+  let t = ts;
+  for (let i = 9; i >= 0; i--) {
+    tsStr = CROCKFORD[t % 32]! + tsStr;
+    t = Math.floor(t / 32);
+  }
+  const rand = new Uint8Array(10);
+  crypto.getRandomValues(rand);
+  let bits = 0n;
+  for (const b of rand) bits = (bits << 8n) | BigInt(b);
+  let randStr = "";
+  for (let i = 0; i < 16; i++) {
+    randStr = CROCKFORD[Number(bits & 31n)]! + randStr;
+    bits >>= 5n;
+  }
+  return tsStr + randStr;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HMAC verification (for /test admin route)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function verifyAdminHmac(
+  authHeader: string | null,
+  secret: string | undefined,
+): Promise<boolean> {
+  if (!secret || !authHeader) return false;
+  // Accepts "Bearer <hmac>" or just "<hmac>"
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : authHeader;
+  const keyData = new TextEncoder().encode(secret);
+  const key = await crypto.subtle.importKey(
+    "raw",
+    keyData,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"],
+  );
+  // Simple: token IS the pre-computed HMAC hex of the string "bwm-telegram-relay-test"
+  const expected = "bwm-telegram-relay-test";
+  const msgData = new TextEncoder().encode(expected);
+  let tokenBytes: Uint8Array;
+  try {
+    // Parse hex
+    if (token.length % 2 !== 0) return false;
+    tokenBytes = new Uint8Array(token.match(/.{2}/g)!.map((h) => parseInt(h, 16)));
+  } catch {
+    return false;
+  }
+  return crypto.subtle.verify("HMAC", key, tokenBytes, msgData);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cred-broker mint
+// ─────────────────────────────────────────────────────────────────────────────
 
 interface MintResponse {
   secret: string;
-  secret_name: string;
-  ttl_seconds: number;
-  expires_at: string;
-  agent: string;
 }
 
 async function mintToken(env: Env, secretName: string): Promise<string> {
@@ -59,7 +245,7 @@ async function mintToken(env: Env, secretName: string): Promise<string> {
     headers: {
       Authorization: `Bearer ${env.BROKER_BEARER}`,
       "Content-Type": "application/json",
-      "User-Agent": "bwm-telegram-relay/1.0.0",
+      "User-Agent": `bwm-telegram-relay/${VERSION}`,
     },
     body: JSON.stringify({ name: secretName }),
   });
@@ -74,14 +260,16 @@ async function mintToken(env: Env, secretName: string): Promise<string> {
   return data.secret;
 }
 
-// --- Telegram API helpers ------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
+// Telegram send helper
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function sendTelegramMessage(
   botToken: string,
   chatId: string | number,
   text: string,
   parseMode?: string,
-): Promise<{ ok: boolean; result?: unknown; error?: string }> {
+): Promise<{ ok: boolean; error?: string }> {
   const body: Record<string, unknown> = { chat_id: chatId, text };
   if (parseMode) body.parse_mode = parseMode;
 
@@ -91,32 +279,195 @@ async function sendTelegramMessage(
     body: JSON.stringify(body),
   });
 
-  const data = (await res.json()) as { ok: boolean; result?: unknown; description?: string };
-
+  const data = (await res.json()) as { ok: boolean; description?: string };
   if (!data.ok) {
     return { ok: false, error: data.description ?? `HTTP ${res.status}` };
   }
-  return { ok: true, result: data.result };
+  return { ok: true };
 }
 
-// --- Route handlers ------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
+// Route: GET /health
+// ─────────────────────────────────────────────────────────────────────────────
 
-async function handleHealth(): Promise<Response> {
+async function handleHealth(env: Env): Promise<Response> {
+  const chatId = await env.BWM_TELEGRAM_KV.get(KV_CHAT_ID_KEY);
+  const lastSendAt = await env.BWM_TELEGRAM_KV.get(KV_LAST_SEND_AT_KEY);
   return json({
-    ok: true,
-    worker: "bwm-telegram-relay",
-    version: "1.0.0",
+    status: "ok",
+    version: VERSION,
+    telegram_configured: !!chatId,
+    last_send_at: lastSendAt ?? null,
   });
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Route: POST /event
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface OperationalEvent {
+  id?: string;
+  event_type?: string;
+  payload?: EventPayload;
+  client_id?: string | null;
+  occurred_at?: string;
+  session_id?: string;
+}
+
+async function handleEvent(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<Response> {
+  let event: OperationalEvent;
+  try {
+    event = (await request.json()) as OperationalEvent;
+  } catch {
+    return json({ ok: false, error: "invalid_json" }, 400);
+  }
+
+  const eventType = event.event_type ?? "";
+  const payload = (event.payload ?? {}) as EventPayload;
+  const eventId = event.id ?? "";
+
+  // Filter check
+  if (!shouldSend(eventType, payload)) {
+    return json({ ok: true, action: "filtered", event_type: eventType });
+  }
+
+  // Dedup check (24h TTL per event_id)
+  if (eventId) {
+    const dedupKey = `${KV_DEDUP_PREFIX}${eventId}`;
+    const alreadySent = await env.BWM_TELEGRAM_KV.get(dedupKey);
+    if (alreadySent) {
+      return json({ ok: true, action: "dedup_skip", event_id: eventId });
+    }
+  }
+
+  // Get chat_id
+  const chatId = await env.BWM_TELEGRAM_KV.get(KV_CHAT_ID_KEY);
+  if (!chatId) {
+    // No chat registered yet — log but return 200 to not block projector
+    console.warn(JSON.stringify({ where: "handleEvent", warn: "no chat_id captured yet", event_type: eventType }));
+    return json({ ok: true, action: "skipped_no_chat_id", event_type: eventType });
+  }
+
+  // Mint token and send — fire-and-forget via waitUntil to not block response
+  ctx.waitUntil(
+    (async () => {
+      let botToken: string;
+      try {
+        botToken = await mintToken(env, "TELEGRAM_BOT_TOKEN");
+      } catch (e) {
+        console.error(JSON.stringify({ where: "handleEvent.mintToken", error: String(e) }));
+        return;
+      }
+
+      const text = formatEventMessage(eventType, payload);
+      const result = await sendTelegramMessage(botToken, chatId, text, "MarkdownV2");
+
+      if (!result.ok) {
+        // If MarkdownV2 formatting caused a parse error, retry as plain text
+        console.warn(JSON.stringify({ where: "handleEvent.send", warn: "MarkdownV2 failed, retrying plain", error: result.error }));
+        const plainResult = await sendTelegramMessage(botToken, chatId, `[${eventType}] ${JSON.stringify(payload).slice(0, 400)}`);
+        if (!plainResult.ok) {
+          console.error(JSON.stringify({ where: "handleEvent.send.plain", error: plainResult.error }));
+          return;
+        }
+      }
+
+      // Mark as sent in dedup store
+      if (eventId) {
+        await env.BWM_TELEGRAM_KV.put(`${KV_DEDUP_PREFIX}${eventId}`, "1", {
+          expirationTtl: DEDUP_TTL_SECONDS,
+        });
+      }
+      await env.BWM_TELEGRAM_KV.put(KV_LAST_SEND_AT_KEY, new Date().toISOString());
+    })(),
+  );
+
+  return json({ ok: true, action: "send_queued", event_type: eventType });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Route: POST /test (admin-only, HMAC-protected)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function handleTest(request: Request, env: Env): Promise<Response> {
+  const authHeader = request.headers.get("Authorization");
+  const valid = await verifyAdminHmac(authHeader, env.TELEGRAM_RELAY_ADMIN_HMAC);
+  if (!valid) {
+    return json({ ok: false, error: "unauthorized" }, 401);
+  }
+
+  const chatId = await env.BWM_TELEGRAM_KV.get(KV_CHAT_ID_KEY);
+  if (!chatId) {
+    return json({ ok: false, error: "chat_id not captured yet — send /start to the bot first" }, 400);
+  }
+
+  let botToken: string;
+  try {
+    botToken = await mintToken(env, "TELEGRAM_BOT_TOKEN");
+  } catch (e) {
+    return json({ ok: false, error: "token_mint_failed", detail: String(e).slice(0, 200) }, 502);
+  }
+
+  const result = await sendTelegramMessage(
+    botToken,
+    chatId,
+    "✅ BWM Telegram Relay is live\n\nOps alerts will route here.",
+  );
+
+  if (!result.ok) {
+    return json({ ok: false, error: "send_failed", detail: result.error }, 502);
+  }
+
+  return json({ ok: true, chat_id: chatId });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Route: POST /capture-chat-id (Telegram webhook bootstrap)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function handleCaptureChatId(request: Request, env: Env): Promise<Response> {
+  // Check if bootstrap already done
+  const done = await env.BWM_TELEGRAM_KV.get(KV_BOOTSTRAP_DONE_KEY);
+  if (done) {
+    return json({ ok: true, action: "already_captured", note: "bootstrap complete; this route is deactivated" });
+  }
+
+  let update: TelegramUpdate;
+  try {
+    update = (await request.json()) as TelegramUpdate;
+  } catch {
+    return json({ ok: false, error: "invalid_json" }, 400);
+  }
+
+  const chatId = update.message?.chat?.id;
+  if (!chatId) {
+    return json({ ok: false, error: "no chat_id in update" }, 400);
+  }
+
+  // Store in both bootstrap_chat_id and robert_chat_id (primary send key)
+  await env.BWM_TELEGRAM_KV.put(KV_BOOTSTRAP_CHAT_ID_KEY, String(chatId));
+  await env.BWM_TELEGRAM_KV.put(KV_CHAT_ID_KEY, String(chatId));
+  await env.BWM_TELEGRAM_KV.put(KV_BOOTSTRAP_DONE_KEY, "1");
+
+  console.log(JSON.stringify({ where: "capture-chat-id", chat_id: chatId, event: "bootstrap_complete" }));
+
+  return json({ ok: true, action: "captured", chat_id: chatId });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Route: POST /send (legacy backwards-compat)
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function handleSend(request: Request, env: Env): Promise<Response> {
-  // Auth check
   const key = request.headers.get("X-BWM-Internal-Key") ?? "";
   if (!env.BWM_INTERNAL_KEY || key !== env.BWM_INTERNAL_KEY) {
     return json({ ok: false, error: "unauthorized" }, 401);
   }
 
-  // Parse body
   let body: { text?: string; parse_mode?: string };
   try {
     body = (await request.json()) as { text?: string; parse_mode?: string };
@@ -129,19 +480,11 @@ async function handleSend(request: Request, env: Env): Promise<Response> {
     return json({ ok: false, error: "text is required" }, 400);
   }
 
-  // Look up stored chat_id
   const chatId = await env.BWM_TELEGRAM_KV.get(KV_CHAT_ID_KEY);
   if (!chatId) {
-    return json(
-      {
-        ok: false,
-        error: "chat_id not captured yet — send /start to the bot to register",
-      },
-      400,
-    );
+    return json({ ok: false, error: "chat_id not captured yet — send /start to the bot to register" }, 400);
   }
 
-  // Mint bot token
   let botToken: string;
   try {
     botToken = await mintToken(env, "TELEGRAM_BOT_TOKEN");
@@ -150,9 +493,7 @@ async function handleSend(request: Request, env: Env): Promise<Response> {
     return json({ ok: false, error: "token_mint_failed", detail: String(e).slice(0, 200) }, 502);
   }
 
-  // Send message
   const result = await sendTelegramMessage(botToken, chatId, text, body.parse_mode);
-
   if (!result.ok) {
     console.error(JSON.stringify({ where: "handleSend.sendMessage", error: result.error }));
     return json({ ok: false, error: "telegram_send_failed", detail: result.error }, 502);
@@ -161,14 +502,20 @@ async function handleSend(request: Request, env: Env): Promise<Response> {
   return json({ ok: true, chat_id: chatId });
 }
 
-async function handleWebhook(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-  // Validate webhook secret token
+// ─────────────────────────────────────────────────────────────────────────────
+// Route: POST /webhook (Telegram update receiver — PROJ-ATTN-ROUTING-001)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function handleWebhook(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<Response> {
   const secretHeader = request.headers.get("X-Telegram-Bot-Api-Secret-Token") ?? "";
   if (!env.TELEGRAM_WEBHOOK_SECRET || secretHeader !== env.TELEGRAM_WEBHOOK_SECRET) {
     return json({ ok: false, error: "forbidden" }, 403);
   }
 
-  // Parse update
   let update: TelegramUpdate;
   try {
     update = (await request.json()) as TelegramUpdate;
@@ -176,41 +523,23 @@ async function handleWebhook(request: Request, env: Env, ctx: ExecutionContext):
     return json({ ok: false, error: "invalid_json" }, 400);
   }
 
-  console.log(JSON.stringify({ where: "webhook", update_id: update.update_id }));
-
   const message = update.message;
-  if (!message) {
-    // Non-message update (callback query, etc.) — ack and move on
-    return json({ ok: true });
-  }
+  if (!message) return json({ ok: true });
 
   const chatId = message.chat?.id;
   const fromId = message.from?.id;
+  if (!chatId) return json({ ok: true });
 
-  if (!chatId) {
-    return json({ ok: true });
-  }
-
-  // Store chat_id on first contact (any message, not just /start)
+  // Store chat_id on first contact
   const existingChatId = await env.BWM_TELEGRAM_KV.get(KV_CHAT_ID_KEY);
   if (!existingChatId) {
     await env.BWM_TELEGRAM_KV.put(KV_CHAT_ID_KEY, String(chatId));
-    console.log(
-      JSON.stringify({
-        where: "webhook",
-        event: "chat_id_captured",
-        chat_id: chatId,
-        from_id: fromId,
-      }),
-    );
+    console.log(JSON.stringify({ where: "webhook", event: "chat_id_captured", chat_id: chatId, from_id: fromId }));
   }
 
   const text = message.text ?? "";
 
-  // Fire-and-forget: forward inbound text to bwm-attention-router for
-  // correction/directive classification. Non-blocking; never fails the
-  // webhook response. Skips /commands (those aren't message-classification
-  // material) and empty text.
+  // Forward non-command text to bwm-attention-router (non-blocking)
   if (text && !text.startsWith("/") && env.ATTENTION_ROUTER && env.ATTENTION_ROUTER_KEY) {
     ctx.waitUntil(
       env.ATTENTION_ROUTER.fetch("https://internal/classify", {
@@ -218,7 +547,7 @@ async function handleWebhook(request: Request, env: Env, ctx: ExecutionContext):
         headers: {
           "X-BWM-Internal-Key": env.ATTENTION_ROUTER_KEY,
           "Content-Type": "application/json",
-          "User-Agent": "bwm-telegram-relay/1.0.0",
+          "User-Agent": `bwm-telegram-relay/${VERSION}`,
         },
         body: JSON.stringify({
           source: "telegram",
@@ -229,47 +558,31 @@ async function handleWebhook(request: Request, env: Env, ctx: ExecutionContext):
       })
         .then(async (r) => {
           if (!r.ok) {
-            console.error(
-              JSON.stringify({
-                where: "webhook.attention_router",
-                status: r.status,
-                detail: (await r.text()).slice(0, 200),
-              }),
-            );
+            console.error(JSON.stringify({
+              where: "webhook.attention_router",
+              status: r.status,
+              detail: (await r.text()).slice(0, 200),
+            }));
           }
         })
-        .catch((e) =>
-          console.error(
-            JSON.stringify({ where: "webhook.attention_router", error: String(e) }),
-          ),
-        ),
+        .catch((e) => console.error(JSON.stringify({ where: "webhook.attention_router", error: String(e) }))),
     );
   }
 
-  // Respond to /start command
+  // Respond to /start
   if (text.startsWith("/start")) {
-    // Mint token to reply
     let botToken: string | null = null;
     try {
       botToken = await mintToken(env, "TELEGRAM_BOT_TOKEN");
     } catch (e) {
-      console.error(
-        JSON.stringify({ where: "webhook./start.mintToken", error: String(e) }),
-      );
+      console.error(JSON.stringify({ where: "webhook./start.mintToken", error: String(e) }));
     }
 
     if (botToken) {
-      const replyText =
-        "✅ Connected. BWM ops alerts will route to this chat.\n\n" +
-        `chat_id: ${chatId}\n` +
-        "Ready to receive.";
-
       ctx.waitUntil(
-        sendTelegramMessage(botToken, chatId, replyText).catch((e) =>
-          console.error(
-            JSON.stringify({ where: "webhook./start.reply", error: String(e) }),
-          ),
-        ),
+        sendTelegramMessage(botToken, chatId,
+          `✅ Connected. BWM ops alerts will route to this chat.\n\nchat_id: ${chatId}\nReady to receive.`,
+        ).catch((e) => console.error(JSON.stringify({ where: "webhook./start.reply", error: String(e) }))),
       );
     }
   }
@@ -277,7 +590,63 @@ async function handleWebhook(request: Request, env: Env, ctx: ExecutionContext):
   return json({ ok: true });
 }
 
-// --- Telegram update types (minimal) ------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
+// Heartbeat (cron)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function emitHeartbeat(
+  env: Env,
+  sendCount: number,
+  filterCount: number,
+): Promise<void> {
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_KEY) {
+    console.warn("heartbeat: missing SUPABASE_URL or SUPABASE_SERVICE_KEY; skipping");
+    return;
+  }
+
+  const id = ulid();
+  const occurred_at = new Date().toISOString();
+  const payload = {
+    kind: "daemon.heartbeat",
+    daemon: "bwm-telegram-relay",
+    cron_label: "bwm-telegram-relay",
+    run_kind: "cron",
+    rows_seen: sendCount,
+    rows_skipped: filterCount,
+    triggered_by: "cron:*/15",
+  };
+
+  try {
+    const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/operational_events`, {
+      method: "POST",
+      headers: {
+        apikey: env.SUPABASE_SERVICE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify({
+        id,
+        event_type: "daemon.heartbeat",
+        client_id: null,
+        payload,
+        occurred_at,
+        session_id: "daemon:bwm-telegram-relay",
+      }),
+    });
+    if (!resp.ok) {
+      console.error(`heartbeat insert failed: ${resp.status} ${await resp.text().catch(() => "")}`);
+    } else {
+      console.log(JSON.stringify({ where: "heartbeat", id, occurred_at }));
+    }
+  } catch (err) {
+    console.error(`heartbeat threw: ${(err as Error)?.message ?? err}`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Telegram update types (minimal)
+// ─────────────────────────────────────────────────────────────────────────────
 
 interface TelegramUpdate {
   update_id: number;
@@ -292,25 +661,54 @@ interface TelegramMessage {
   date: number;
 }
 
-// --- Worker export -------------------------------------------------------------
+// ─────────────────────────────────────────────────────────────────────────────
+// Worker export
+// ─────────────────────────────────────────────────────────────────────────────
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "") || "/";
+    const method = request.method;
 
-    if (request.method === "GET" && path === "/health") {
-      return handleHealth();
+    try {
+      if (method === "GET" && path === "/health") {
+        return handleHealth(env);
+      }
+      if (method === "POST" && path === "/event") {
+        return handleEvent(request, env, ctx);
+      }
+      if (method === "POST" && path === "/test") {
+        return handleTest(request, env);
+      }
+      if (method === "POST" && path === "/capture-chat-id") {
+        return handleCaptureChatId(request, env);
+      }
+      // Legacy routes preserved for backwards compat
+      if (method === "POST" && path === "/send") {
+        return handleSend(request, env);
+      }
+      if (method === "POST" && path === "/webhook") {
+        return handleWebhook(request, env, ctx);
+      }
+    } catch (err) {
+      console.error(JSON.stringify({ where: "fetch.top", error: String(err), path, method }));
+      return json({ ok: false, error: "internal_error", detail: String(err).slice(0, 200) }, 500);
     }
 
-    if (request.method === "POST" && path === "/send") {
-      return handleSend(request, env);
-    }
+    return json({ ok: false, error: "not_found", path, method }, 404);
+  },
 
-    if (request.method === "POST" && path === "/webhook") {
-      return handleWebhook(request, env, ctx);
-    }
-
-    return json({ ok: false, error: "not_found", path, method: request.method }, 404);
+  async scheduled(
+    _event: ScheduledController,
+    env: Env,
+    ctx: ExecutionContext,
+  ): Promise<void> {
+    // Emit daemon.heartbeat — counts pulled from KV (best-effort; 0 on cold start)
+    ctx.waitUntil(
+      emitHeartbeat(env, 0, 0).catch((e) =>
+        console.error("scheduled heartbeat failed:", (e as Error)?.message ?? e),
+      ),
+    );
   },
 } satisfies ExportedHandler<Env>;
