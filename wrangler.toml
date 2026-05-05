@@ -10,3 +10,9 @@ id = "ab6c7f536e92480d877341b28e551d15"
 [[services]]
 binding = "CRED_BROKER"
 service = "bwm-cred-broker"
+
+# Forward inbound Robert messages to bwm-attention-router for classification
+# (PROJ-ATTN-ROUTING-001 Phase 6). Non-blocking via ctx.waitUntil.
+[[services]]
+binding = "ATTENTION_ROUTER"
+service = "bwm-attention-router"

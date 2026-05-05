@@ -18,10 +18,14 @@ export interface Env {
   BWM_TELEGRAM_KV: KVNamespace;
   /** Service binding to bwm-cred-broker (avoids CF 1042 same-account subrequest block) */
   CRED_BROKER: Fetcher;
+  /** Service binding to bwm-attention-router (PROJ-ATTN-ROUTING-001 Phase 6) */
+  ATTENTION_ROUTER: Fetcher;
   /** Bearer token for authenticating to bwm-cred-broker */
   BROKER_BEARER: string;
   /** Shared key for /send route auth (X-BWM-Internal-Key header) */
   BWM_INTERNAL_KEY: string;
+  /** Shared key for calling bwm-attention-router /classify (X-BWM-Internal-Key) */
+  ATTENTION_ROUTER_KEY: string;
   /** Secret token Telegram sends in X-Telegram-Bot-Api-Secret-Token header */
   TELEGRAM_WEBHOOK_SECRET: string;
 }
@@ -201,8 +205,48 @@ async function handleWebhook(request: Request, env: Env, ctx: ExecutionContext):
     );
   }
 
-  // Respond to /start command
   const text = message.text ?? "";
+
+  // Fire-and-forget: forward inbound text to bwm-attention-router for
+  // correction/directive classification. Non-blocking; never fails the
+  // webhook response. Skips /commands (those aren't message-classification
+  // material) and empty text.
+  if (text && !text.startsWith("/") && env.ATTENTION_ROUTER && env.ATTENTION_ROUTER_KEY) {
+    ctx.waitUntil(
+      env.ATTENTION_ROUTER.fetch("https://internal/classify", {
+        method: "POST",
+        headers: {
+          "X-BWM-Internal-Key": env.ATTENTION_ROUTER_KEY,
+          "Content-Type": "application/json",
+          "User-Agent": "bwm-telegram-relay/1.0.0",
+        },
+        body: JSON.stringify({
+          source: "telegram",
+          raw_text: text,
+          message_id: String(message.message_id),
+          user_id: String(fromId ?? chatId),
+        }),
+      })
+        .then(async (r) => {
+          if (!r.ok) {
+            console.error(
+              JSON.stringify({
+                where: "webhook.attention_router",
+                status: r.status,
+                detail: (await r.text()).slice(0, 200),
+              }),
+            );
+          }
+        })
+        .catch((e) =>
+          console.error(
+            JSON.stringify({ where: "webhook.attention_router", error: String(e) }),
+          ),
+        ),
+    );
+  }
+
+  // Respond to /start command
   if (text.startsWith("/start")) {
     // Mint token to reply
     let botToken: string | null = null;
