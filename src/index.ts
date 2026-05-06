@@ -162,11 +162,14 @@ function formatEventMessage(eventType: string, payload: EventPayload): string {
     lines.push(`🔗 Brain: ${escapedPath}`);
   }
 
-  // URL link
+  // URL link — MarkdownV2 inline link: [text](url). Inside (...) only ) and \
+  // need escaping; escaping dots/hyphens (as escapeMd does) breaks auto-link.
   const url = payload["url"];
   if (url) {
-    const escapedUrl = escapeMd(String(url));
-    lines.push(`🔗 URL: ${escapedUrl}`);
+    const urlStr = String(url);
+    const linkText = escapeMd(urlStr);
+    const linkTarget = urlStr.replace(/[\\)]/g, "\\$&");
+    lines.push(`🔗 URL: [${linkText}](${linkTarget})`);
   }
 
   // Free-form body — used by trg.* / listing.* status events that need
