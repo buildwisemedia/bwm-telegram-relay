@@ -184,11 +184,10 @@ function formatEventMessage(eventType: string, payload: EventPayload): string {
     lines.push(`🔗 URL: [${linkText}](${linkTarget})`);
   }
 
-  // Free-form body — used by trg.* / listing.* status events that need
-  // multi-line content (round summaries, project status reports). Capped at 8
-  // lines so messages stay scannable; truncate-with-ellipsis if longer.
+  // Free-form body — used by trg.* / listing.* status events AND narratives
+  // (Bob-to-Robert messages). Capped at 8 lines; truncate-with-ellipsis if longer.
   const body = payload["body"];
-  if (body && typeof body === "string" && eventType !== "narrative") {
+  if (body && typeof body === "string") {
     const allLines = String(body).split("\n").filter((l) => l.trim());
     const shown = allLines.slice(0, 8);
     if (allLines.length > 0) lines.push("");
@@ -721,13 +720,22 @@ async function persistInboundMessage(
   eventId: string,
   update: TelegramUpdate,
 ): Promise<void> {
+  console.log(JSON.stringify({ where: "persistInboundMessage", phase: "enter", eventId }));
   if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_KEY) {
-    console.warn("persistInboundMessage: missing SUPABASE_URL or SUPABASE_SERVICE_KEY; skipping");
+    console.warn(JSON.stringify({
+      where: "persistInboundMessage",
+      phase: "missing_env",
+      has_url: !!env.SUPABASE_URL,
+      has_key: !!env.SUPABASE_SERVICE_KEY,
+    }));
     return;
   }
 
   const message = update.message;
-  if (!message) return;
+  if (!message) {
+    console.log(JSON.stringify({ where: "persistInboundMessage", phase: "no_message" }));
+    return;
+  }
 
   const row = {
     event_id: eventId,
@@ -741,6 +749,7 @@ async function persistInboundMessage(
   };
 
   try {
+    console.log(JSON.stringify({ where: "persistInboundMessage", phase: "fetch_start", eventId, message_id: row.message_id }));
     const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/telegram_inbound`, {
       method: "POST",
       headers: {
@@ -754,12 +763,15 @@ async function persistInboundMessage(
     if (!resp.ok) {
       console.error(JSON.stringify({
         where: "persistInboundMessage",
+        phase: "non_2xx",
         status: resp.status,
-        detail: (await resp.text().catch(() => "")).slice(0, 200),
+        detail: (await resp.text().catch(() => "")).slice(0, 300),
       }));
+    } else {
+      console.log(JSON.stringify({ where: "persistInboundMessage", phase: "ok", eventId, status: resp.status }));
     }
   } catch (err) {
-    console.error(JSON.stringify({ where: "persistInboundMessage", error: String(err) }));
+    console.error(JSON.stringify({ where: "persistInboundMessage", phase: "throw", error: String(err) }));
   }
 }
 
