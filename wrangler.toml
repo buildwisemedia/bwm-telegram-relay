@@ -22,6 +22,14 @@ service = "bwm-cred-broker"
 binding = "ATTENTION_ROUTER"
 service = "bwm-attention-router"
 
+# Forward inbound Robert messages to bwm-content-classifier for content
+# tagging (brand/strategy/lock/decision/idea/todo). Sibling of attention-router;
+# tagged content routes to Brain inbox/telegram-YYYY-MM-DD.md automatically.
+# PROJ-TELEGRAM-MIGRATION-001 Phase 0 / Chip 7b. Non-blocking via ctx.waitUntil.
+[[services]]
+binding = "CONTENT_CLASSIFIER"
+service = "bwm-content-classifier"
+
 [vars]
 ENVIRONMENT = "production"
 

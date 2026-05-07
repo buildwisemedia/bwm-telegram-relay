@@ -26,12 +26,16 @@ export interface Env {
   CRED_BROKER: Fetcher;
   /** Service binding to bwm-attention-router (PROJ-ATTN-ROUTING-001 Phase 6) */
   ATTENTION_ROUTER: Fetcher;
+  /** Service binding to bwm-content-classifier (PROJ-TELEGRAM-MIGRATION-001 Phase 0 / Chip 7b) */
+  CONTENT_CLASSIFIER: Fetcher;
   /** Bearer token for authenticating to bwm-cred-broker */
   BROKER_BEARER: string;
   /** Shared key for /send route auth (X-BWM-Internal-Key header) */
   BWM_INTERNAL_KEY: string;
   /** Shared key for calling bwm-attention-router /classify */
   ATTENTION_ROUTER_KEY: string;
+  /** Shared key for calling bwm-content-classifier /classify */
+  CONTENT_CLASSIFIER_KEY: string;
   /** Secret token Telegram sends in X-Telegram-Bot-Api-Secret-Token header */
   TELEGRAM_WEBHOOK_SECRET: string;
   /** HMAC secret for /test admin route */
@@ -652,6 +656,38 @@ async function handleWebhook(
           }
         })
         .catch((e) => console.error(JSON.stringify({ where: "webhook.attention_router", error: String(e) }))),
+    );
+  }
+
+  // Forward non-command text to bwm-content-classifier (non-blocking, sibling of attention-router)
+  // PROJ-TELEGRAM-MIGRATION-001 Phase 0 / Chip 7b. Tagged content routes to Brain inbox.
+  if (text && !text.startsWith("/") && env.CONTENT_CLASSIFIER && env.CONTENT_CLASSIFIER_KEY) {
+    ctx.waitUntil(
+      env.CONTENT_CLASSIFIER.fetch("https://internal/classify", {
+        method: "POST",
+        headers: {
+          "X-BWM-Internal-Key": env.CONTENT_CLASSIFIER_KEY,
+          "Content-Type": "application/json",
+          "User-Agent": `bwm-telegram-relay/${VERSION}`,
+        },
+        body: JSON.stringify({
+          source: "telegram",
+          raw_text: text,
+          message_id: String(message.message_id),
+          event_id: inboundEventId,
+          user_id: String(fromId ?? chatId),
+        }),
+      })
+        .then(async (r) => {
+          if (!r.ok) {
+            console.error(JSON.stringify({
+              where: "webhook.content_classifier",
+              status: r.status,
+              detail: (await r.text()).slice(0, 200),
+            }));
+          }
+        })
+        .catch((e) => console.error(JSON.stringify({ where: "webhook.content_classifier", error: String(e) }))),
     );
   }
 
