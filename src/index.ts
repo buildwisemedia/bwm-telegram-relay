@@ -67,12 +67,34 @@ const SEND_NEVER = new Set([
   "ad.scored",
   "ad.metric.recorded",
   "cap.observation",
+  // Intermediate-state events (recommendations, not decisions). They are
+  // unactionable for Robert — system says "should kill X", but no human is
+  // expected to act ad-by-ad. These are dashboard data, not Telegram data.
+  // Re-route to a daily digest if/when PROJ-META-ADS-AUTOMATION-001 adds one.
+  "ad.kill_recommended",
+  // Brain-selfheal calibration milestones. Autonomous progress, not Robert-action.
+  // Re-add only when a human review gate is meaningful.
+  "ad.round_locked",
 ]);
 
-const SEND_ALWAYS = new Set([
-  "ad.round_locked",
-  "ad.kill_recommended",
+const SEND_ALWAYS = new Set<string>([
+  // Empty: nothing is unconditionally sent. Use SEND_CONDITIONAL or
+  // NAMESPACE_ALWAYS for events that should reach Robert.
 ]);
+
+// Per-event-type rate-limit window (seconds). After firing, the same event_type
+// is suppressed for this many seconds. 0 / missing = no rate limit.
+// Suppressed events still INSERT into operational_events (Brain has the record);
+// only the Telegram surface is rate-limited.
+// (Currently empty — SEND_NEVER handles the previous high-volume offenders.
+// Add entries here for future event types that should rate-limit rather than
+// fully suppress.)
+const RATE_LIMIT_SECONDS: Record<string, number> = {};
+
+// Listing-engine + listing-namespace events route through the trg.* / listing.*
+// namespace and always send (subject to rate limit). One-shot status events:
+// trg.henry_round_complete, trg.tom_round_complete, trg.project_status, etc.
+const NAMESPACE_ALWAYS = ["trg.", "listing."];
 
 // For conditional types, the predicate receives the full event payload.
 type EventPayload = Record<string, unknown>;
@@ -90,6 +112,7 @@ const SEND_CONDITIONAL: Record<string, (p: EventPayload) => boolean> = {
 function shouldSend(eventType: string, payload: EventPayload): boolean {
   if (SEND_NEVER.has(eventType)) return false;
   if (SEND_ALWAYS.has(eventType)) return true;
+  if (NAMESPACE_ALWAYS.some((ns) => eventType.startsWith(ns))) return true;
   const cond = SEND_CONDITIONAL[eventType];
   if (cond) return cond(payload);
   return false;
@@ -147,11 +170,44 @@ function formatEventMessage(eventType: string, payload: EventPayload): string {
     lines.push(`🔗 Brain: ${escapedPath}`);
   }
 
-  // URL link
+  // URL link — MarkdownV2 inline link: [text](url). Inside (...) only ) and \
+  // need escaping; escaping dots/hyphens (as escapeMd does) breaks auto-link.
   const url = payload["url"];
   if (url) {
-    const escapedUrl = escapeMd(String(url));
-    lines.push(`🔗 URL: ${escapedUrl}`);
+    const urlStr = String(url);
+    const linkText = escapeMd(urlStr);
+    const linkTarget = urlStr.replace(/[\\)]/g, "\\$&");
+    lines.push(`🔗 URL: [${linkText}](${linkTarget})`);
+  }
+
+  // Free-form body — used by trg.* / listing.* status events that need
+  // multi-line content (round summaries, project status reports). Capped at 8
+  // lines so messages stay scannable; truncate-with-ellipsis if longer.
+  const body = payload["body"];
+  if (body && typeof body === "string" && eventType !== "narrative") {
+    const allLines = String(body).split("\n").filter((l) => l.trim());
+    const shown = allLines.slice(0, 8);
+    if (allLines.length > 0) lines.push("");
+    for (const ln of shown) {
+      lines.push(escapeMd(ln));
+    }
+    if (allLines.length > 8) lines.push(escapeMd("…"));
+  }
+
+  // Inline key-value metrics for status reports.
+  const metrics = payload["metrics"];
+  if (metrics && typeof metrics === "object" && !Array.isArray(metrics)) {
+    if (Object.keys(metrics).length > 0) lines.push("");
+    for (const [k, v] of Object.entries(metrics as Record<string, unknown>)) {
+      lines.push(escapeMd(`${k}: ${v}`));
+    }
+  }
+
+  // Call-to-action footer (for events that ask Robert to react/reply).
+  const cta = payload["cta"];
+  if (cta) {
+    lines.push("");
+    lines.push(escapeMd(String(cta)));
   }
 
   return lines.join("\n");
@@ -161,6 +217,7 @@ function emojiFor(eventType: string): string {
   if (eventType === "incident.opened") return "🚨";
   if (eventType.startsWith("ad.")) return "📊";
   if (eventType.startsWith("task.")) return "✅";
+  if (eventType.startsWith("trg.") || eventType.startsWith("listing.")) return "🏘️";
   if (eventType === "narrative") return "📝";
   return "🔔";
 }
@@ -342,6 +399,31 @@ async function handleEvent(
     if (alreadySent) {
       return json({ ok: true, action: "dedup_skip", event_id: eventId });
     }
+  }
+
+  // Per-event-type rate limit (separate from per-event_id dedup).
+  // Suppresses repeats of high-volume event types so the channel stays scannable.
+  // Suppressed events still INSERT into operational_events; only the Telegram
+  // surface is rate-limited.
+  const rateLimitWindow = RATE_LIMIT_SECONDS[eventType];
+  if (rateLimitWindow) {
+    const rateLimitKey = `ratelimit:${eventType}`;
+    const lastFiredStr = await env.BWM_TELEGRAM_KV.get(rateLimitKey);
+    if (lastFiredStr) {
+      const elapsedMs = Date.now() - parseInt(lastFiredStr, 10);
+      if (elapsedMs < rateLimitWindow * 1000) {
+        return json({
+          ok: true,
+          action: "rate_limit_skip",
+          event_type: eventType,
+          retry_after_seconds: rateLimitWindow - Math.floor(elapsedMs / 1000),
+        });
+      }
+    }
+    // Stamp now BEFORE the send (so concurrent calls don't both pass the gate).
+    await env.BWM_TELEGRAM_KV.put(rateLimitKey, String(Date.now()), {
+      expirationTtl: rateLimitWindow,
+    });
   }
 
   // Get chat_id
@@ -530,6 +612,9 @@ async function handleWebhook(
   const fromId = message.from?.id;
   if (!chatId) return json({ ok: true });
 
+  const inboundEventId = ulid();
+  ctx.waitUntil(persistInboundMessage(env, inboundEventId, update));
+
   // Store chat_id on first contact
   const existingChatId = await env.BWM_TELEGRAM_KV.get(KV_CHAT_ID_KEY);
   if (!existingChatId) {
@@ -553,6 +638,7 @@ async function handleWebhook(
           source: "telegram",
           raw_text: text,
           message_id: String(message.message_id),
+          inbound_event_id: inboundEventId,
           user_id: String(fromId ?? chatId),
         }),
       })
@@ -588,6 +674,57 @@ async function handleWebhook(
   }
 
   return json({ ok: true });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Inbound persistence
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function persistInboundMessage(
+  env: Env,
+  eventId: string,
+  update: TelegramUpdate,
+): Promise<void> {
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_KEY) {
+    console.warn("persistInboundMessage: missing SUPABASE_URL or SUPABASE_SERVICE_KEY; skipping");
+    return;
+  }
+
+  const message = update.message;
+  if (!message) return;
+
+  const row = {
+    event_id: eventId,
+    chat_id: message.chat.id,
+    from_id: message.from?.id ?? null,
+    message_id: message.message_id,
+    text: message.text ?? null,
+    entities: (message as { entities?: unknown }).entities ?? null,
+    raw_update: update,
+    forward_status: "pending",
+  };
+
+  try {
+    const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/telegram_inbound`, {
+      method: "POST",
+      headers: {
+        apikey: env.SUPABASE_SERVICE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "return=minimal,resolution=ignore-duplicates",
+      },
+      body: JSON.stringify(row),
+    });
+    if (!resp.ok) {
+      console.error(JSON.stringify({
+        where: "persistInboundMessage",
+        status: resp.status,
+        detail: (await resp.text().catch(() => "")).slice(0, 200),
+      }));
+    }
+  } catch (err) {
+    console.error(JSON.stringify({ where: "persistInboundMessage", error: String(err) }));
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
