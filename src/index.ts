@@ -67,21 +67,29 @@ const SEND_NEVER = new Set([
   "ad.scored",
   "ad.metric.recorded",
   "cap.observation",
+  // Intermediate-state events (recommendations, not decisions). They are
+  // unactionable for Robert — system says "should kill X", but no human is
+  // expected to act ad-by-ad. These are dashboard data, not Telegram data.
+  // Re-route to a daily digest if/when PROJ-META-ADS-AUTOMATION-001 adds one.
+  "ad.kill_recommended",
+  // Brain-selfheal calibration milestones. Autonomous progress, not Robert-action.
+  // Re-add only when a human review gate is meaningful.
+  "ad.round_locked",
 ]);
 
-const SEND_ALWAYS = new Set([
-  "ad.round_locked",
-  "ad.kill_recommended",
+const SEND_ALWAYS = new Set<string>([
+  // Empty: nothing is unconditionally sent. Use SEND_CONDITIONAL or
+  // NAMESPACE_ALWAYS for events that should reach Robert.
 ]);
 
 // Per-event-type rate-limit window (seconds). After firing, the same event_type
 // is suppressed for this many seconds. 0 / missing = no rate limit.
 // Suppressed events still INSERT into operational_events (Brain has the record);
-// only the Telegram surface is rate-limited to protect signal quality.
-const RATE_LIMIT_SECONDS: Record<string, number> = {
-  "ad.kill_recommended": 3600,   // max 1 per hour (was firing 5×/40min — drowning the channel)
-  "ad.round_locked": 1800,       // max 1 per 30 min
-};
+// only the Telegram surface is rate-limited.
+// (Currently empty — SEND_NEVER handles the previous high-volume offenders.
+// Add entries here for future event types that should rate-limit rather than
+// fully suppress.)
+const RATE_LIMIT_SECONDS: Record<string, number> = {};
 
 // Listing-engine + listing-namespace events route through the trg.* / listing.*
 // namespace and always send (subject to rate limit). One-shot status events:
