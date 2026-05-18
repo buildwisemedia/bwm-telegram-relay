@@ -107,7 +107,9 @@ const SEND_CONDITIONAL: Record<string, (p: EventPayload) => boolean> = {
   "narrative": (p) => p["kind"] === "robert_priority" || p["urgency"] === "high",
   "incident.opened": (p) => {
     const sev = String(p["severity"] ?? "");
-    return sev === "P0" || sev === "P1";
+    // PROJ-APPROVAL-ACTION-001 Phase 3 closeout (2026-05-18): accept P2 so
+    // SLA-breach incidents from bwm-sla-monitor surface on Robert's Telegram.
+    return sev === "P0" || sev === "P1" || sev === "P2";
   },
   "task.queued": (p) =>
     p["assignee"] === "robert" && p["priority"] === "urgent",
