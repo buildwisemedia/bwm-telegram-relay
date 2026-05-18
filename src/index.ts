@@ -792,6 +792,7 @@ async function emitHeartbeat(
   const id = ulid();
   const occurred_at = new Date().toISOString();
   const payload = {
+    source: "bwm-telegram-relay cron.heartbeat",
     kind: "daemon.heartbeat",
     daemon: "bwm-telegram-relay",
     cron_label: "bwm-telegram-relay",
