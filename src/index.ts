@@ -1355,15 +1355,30 @@ async function processTelegramReply(
   const replyToMessageId = replyTo.message_id;
   if (!replyToMessageId) return false;
 
+  // Authorization gate: only the registered operator chat may trigger reply
+  // processing — any other Telegram user who finds the bot must not be able
+  // to act on (or probe) Robert-owned outbound messages.
+  const registeredChatId = await env.BWM_TELEGRAM_KV.get(KV_CHAT_ID_KEY);
+  if (!registeredChatId || String(chatId) !== registeredChatId) {
+    console.warn(JSON.stringify({
+      where: "processTelegramReply", phase: "unauthorized_chat",
+      chat_id: String(chatId), from_id: message.from?.id ?? null,
+    }));
+    return false;
+  }
+
   if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_KEY) {
     console.warn("processTelegramReply: Supabase not configured");
     return false;
   }
 
-  // 1. Look up origin event from outbound message log
+  // 1. Look up origin event from outbound message log (scoped to this chat so
+  // a colliding message_id from a foreign chat can never resolve).
   const lookupUrl =
     `${env.SUPABASE_URL.replace(/\/+$/, "")}/rest/v1/telegram_outbound` +
-    `?telegram_message_id=eq.${replyToMessageId}&select=origin_event_id,origin_event_type&limit=1`;
+    `?telegram_message_id=eq.${replyToMessageId}` +
+    `&chat_id=eq.${encodeURIComponent(String(chatId))}` +
+    `&select=origin_event_id,origin_event_type&limit=1`;
   let originEventId = "";
   let originEventType = "";
 
@@ -1706,6 +1721,16 @@ async function routeInboundMessage(
 async function handleReactionUpdate(env: Env, update: TelegramUpdate): Promise<void> {
   const reaction = update.message_reaction;
   if (!reaction) return;
+
+  // Authorization gate: acks only count from the registered operator chat.
+  const registeredChatId = await env.BWM_TELEGRAM_KV.get(KV_CHAT_ID_KEY);
+  if (!registeredChatId || String(reaction.chat.id) !== registeredChatId) {
+    console.warn(JSON.stringify({
+      where: "handleReactionUpdate", phase: "unauthorized_chat",
+      chat_id: String(reaction.chat.id), from_id: reaction.user?.id ?? null,
+    }));
+    return;
+  }
 
   const emojis = (reaction.new_reaction ?? [])
     .map((r) => r.emoji)
