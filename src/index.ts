@@ -62,7 +62,7 @@ export interface Env {
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-const VERSION = "2.0.0";
+const VERSION = "2.1.0";
 const BROKER_INTERNAL_URL = "https://internal/mint";
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 const KV_CHAT_ID_KEY = "robert_chat_id";
@@ -1006,6 +1006,17 @@ async function handleWebhook(
     return json({ ok: false, error: "invalid_json" }, 400);
   }
 
+  // Emoji reactions arrive as message_reaction updates (not message).
+  // Treat a reaction on one of our outbound messages as Robert's acknowledgment.
+  if (update.message_reaction) {
+    ctx.waitUntil(
+      handleReactionUpdate(env, update).catch((e) =>
+        console.error(JSON.stringify({ where: "webhook.reaction", error: String(e) })),
+      ),
+    );
+    return json({ ok: true });
+  }
+
   const message = update.message;
   if (!message) return json({ ok: true });
 
@@ -1685,6 +1696,165 @@ async function routeInboundMessage(
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Emoji-ack handling (message_reaction updates)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Persist a reaction to telegram_inbound + emit a telegram-ack narrative so
+ *  downstream loops (feedback sweeps, follow-up watchers, sessions) can see
+ *  that Robert acknowledged a specific outbound message. */
+async function handleReactionUpdate(env: Env, update: TelegramUpdate): Promise<void> {
+  const reaction = update.message_reaction;
+  if (!reaction) return;
+
+  const emojis = (reaction.new_reaction ?? [])
+    .map((r) => r.emoji)
+    .filter((e): e is string => !!e);
+  const removed = emojis.length === 0;
+  const eventId = ulid();
+  const ackText = removed
+    ? `(reaction removed from message ${reaction.message_id})`
+    : `${emojis.join(" ")} (reaction to message ${reaction.message_id})`;
+
+  if (supabaseConfigured(env)) {
+    // Catch-all persistence — same table as text replies so telegram-recent.sh
+    // and session cold-start loaders see acks inline.
+    try {
+      const resp = await fetch(supabaseRestUrl(env, "telegram_inbound"), {
+        method: "POST",
+        headers: supabaseHeaders(env, "return=minimal"),
+        body: JSON.stringify({
+          event_id: eventId,
+          chat_id: reaction.chat.id,
+          from_id: reaction.user?.id ?? null,
+          message_id: reaction.message_id,
+          text: ackText,
+          entities: null,
+          raw_update: update,
+          forward_status: removed ? "dropped" : "acked",
+        }),
+      });
+      if (!resp.ok) {
+        console.error(JSON.stringify({
+          where: "handleReactionUpdate.persist",
+          status: resp.status,
+          body: (await resp.text().catch(() => "")).slice(0, 200),
+        }));
+      }
+    } catch (e) {
+      console.error(JSON.stringify({ where: "handleReactionUpdate.persist", error: String(e) }));
+    }
+  }
+
+  if (removed) return;
+
+  // Resolve which outbound message was acked (telegram_outbound audit log).
+  let origin: { origin_event_id?: string; origin_event_type?: string; source_route?: string;
+                text_redacted?: string } | null = null;
+  if (supabaseConfigured(env)) {
+    try {
+      const q = `telegram_outbound?chat_id=eq.${encodeURIComponent(String(reaction.chat.id))}` +
+        `&telegram_message_id=eq.${reaction.message_id}` +
+        `&select=origin_event_id,origin_event_type,source_route,text_redacted&limit=1`;
+      const resp = await fetch(supabaseRestUrl(env, q), { headers: supabaseHeaders(env) });
+      if (resp.ok) {
+        const rows = (await resp.json()) as Array<Record<string, string>>;
+        origin = rows[0] ?? null;
+      }
+    } catch (e) {
+      console.error(JSON.stringify({ where: "handleReactionUpdate.lookup", error: String(e) }));
+    }
+  }
+
+  // Narrative so the ack is visible in operational_events (Bob/Sarah/sweeps).
+  if (supabaseConfigured(env)) {
+    try {
+      const preview = (origin?.text_redacted ?? "").slice(0, 160);
+      const resp = await fetch(supabaseRestUrl(env, "operational_events"), {
+        method: "POST",
+        headers: supabaseHeaders(env, "return=minimal"),
+        body: JSON.stringify({
+          id: ulid(),
+          event_type: "narrative",
+          client_id: null,
+          occurred_at: new Date().toISOString(),
+          session_id: "daemon:bwm-telegram-relay",
+          payload: {
+            source: "bwm-telegram-relay webhook.reaction",
+            kind: "telegram-ack",
+            title: `Robert acked via ${emojis.join(" ")}`,
+            body: origin
+              ? `Reaction ${emojis.join(" ")} on outbound msg ${reaction.message_id}` +
+                ` (route ${origin.source_route ?? "?"}` +
+                `${origin.origin_event_id ? `, origin ${origin.origin_event_id}` : ""}): ${preview}`
+              : `Reaction ${emojis.join(" ")} on msg ${reaction.message_id} (no outbound audit match)`,
+            emoji: emojis,
+            reacted_message_id: reaction.message_id,
+            origin_event_id: origin?.origin_event_id ?? null,
+            origin_event_type: origin?.origin_event_type ?? null,
+            inbound_event_id: eventId,
+          },
+        }),
+      });
+      if (!resp.ok) {
+        console.error(JSON.stringify({
+          where: "handleReactionUpdate.narrative",
+          status: resp.status,
+        }));
+      } else {
+        console.log(JSON.stringify({
+          where: "handleReactionUpdate", phase: "acked",
+          emojis, message_id: reaction.message_id,
+          origin_event_id: origin?.origin_event_id ?? null,
+        }));
+      }
+    } catch (e) {
+      console.error(JSON.stringify({ where: "handleReactionUpdate.narrative", error: String(e) }));
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Route: POST /admin/refresh-webhook (internal-key protected)
+// Re-registers the Telegram webhook with allowed_updates including
+// message_reaction — required once, and again after any webhook change,
+// because Telegram only delivers reaction updates when explicitly subscribed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function handleRefreshWebhook(request: Request, env: Env): Promise<Response> {
+  const key = request.headers.get("X-BWM-Internal-Key") ?? "";
+  if (!env.BWM_INTERNAL_KEY || key !== env.BWM_INTERNAL_KEY) {
+    return json({ ok: false, error: "unauthorized" }, 401);
+  }
+  if (!env.TELEGRAM_WEBHOOK_SECRET) {
+    return json({ ok: false, error: "webhook_secret_not_configured" }, 500);
+  }
+
+  let botToken = "";
+  try {
+    botToken = await mintToken(env, "TELEGRAM_BOT_TOKEN");
+  } catch (e) {
+    return json({ ok: false, error: "token_mint_failed", detail: String(e).slice(0, 200) }, 502);
+  }
+
+  const webhookUrl = `${new URL(request.url).origin}/webhook`;
+  const resp = await fetch(`https://api.telegram.org/bot${botToken}/setWebhook`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      url: webhookUrl,
+      secret_token: env.TELEGRAM_WEBHOOK_SECRET,
+      allowed_updates: ["message", "message_reaction"],
+    }),
+  });
+  const result = (await resp.json().catch(() => ({}))) as Record<string, unknown>;
+  const info = await fetch(`https://api.telegram.org/bot${botToken}/getWebhookInfo`)
+    .then((r) => r.json() as Promise<Record<string, unknown>>)
+    .catch(() => ({} as Record<string, unknown>));
+  // Strip nothing sensitive: webhook info contains the URL + counts only.
+  return json({ ok: !!result.ok, set_webhook: result, webhook_info: info.result ?? info });
+}
+
 async function persistInboundMessage(
   env: Env,
   eventId: string,
@@ -1807,6 +1977,18 @@ async function emitHeartbeat(
 interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
+  message_reaction?: MessageReactionUpdated;
+}
+
+/** Telegram MessageReactionUpdated — only delivered when setWebhook
+ *  allowed_updates includes "message_reaction" (see POST /admin/refresh-webhook). */
+interface MessageReactionUpdated {
+  chat: { id: number; type: string };
+  message_id: number;
+  user?: { id: number; first_name?: string; username?: string };
+  date: number;
+  old_reaction: Array<{ type: string; emoji?: string }>;
+  new_reaction: Array<{ type: string; emoji?: string }>;
 }
 
 interface TelegramMessage {
@@ -1850,6 +2032,9 @@ export default {
       }
       if (method === "POST" && path === "/webhook") {
         return handleWebhook(request, env, ctx);
+      }
+      if (method === "POST" && path === "/admin/refresh-webhook") {
+        return handleRefreshWebhook(request, env);
       }
     } catch (err) {
       console.error(JSON.stringify({ where: "fetch.top", error: String(err), path, method }));
