@@ -46,6 +46,16 @@ export interface Env {
   SUPABASE_SERVICE_KEY: string;
   /** Environment tag */
   ENVIRONMENT: string;
+  /**
+   * Brain Proxy read key — x-brain-key header for brain.buildwisemedia.com.
+   * Required for directive auto-handling: read current spec before appending rule.
+   */
+  BRAIN_KEY?: string;
+  /**
+   * Brain Proxy write key — x-write-key header for brain.buildwisemedia.com /write.
+   * Required for directive auto-handling: append silent_handle rule to Attention-Routing-Spec.
+   */
+  BRAIN_WRITE_KEY?: string;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -60,7 +70,10 @@ const KV_BOOTSTRAP_CHAT_ID_KEY = "bootstrap_chat_id";
 const KV_BOOTSTRAP_DONE_KEY = "bootstrap_done";
 const KV_LAST_SEND_AT_KEY = "last_send_at";
 const KV_DEDUP_PREFIX = "dedup:";
+const KV_OUTBOUND_LOG_PREFIX = "outbound:";
 const DEDUP_TTL_SECONDS = 86_400; // 24 h
+const OUTBOUND_LOG_TTL_SECONDS = 90 * 24 * 60 * 60;
+const OUTBOUND_TEXT_MAX = 4_000;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Priority filter rules
@@ -237,6 +250,187 @@ function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: JSON_HEADERS });
 }
 
+function supabaseConfigured(env: Env): boolean {
+  return !!env.SUPABASE_URL && !!env.SUPABASE_SERVICE_KEY;
+}
+
+function supabaseRestUrl(env: Env, path: string): string {
+  return `${env.SUPABASE_URL.replace(/\/+$/, "")}/rest/v1/${path}`;
+}
+
+function supabaseHeaders(env: Env, prefer?: string): HeadersInit {
+  return {
+    apikey: env.SUPABASE_SERVICE_KEY,
+    Authorization: `Bearer ${env.SUPABASE_SERVICE_KEY}`,
+    "Content-Type": "application/json",
+    ...(prefer ? { Prefer: prefer } : {}),
+  };
+}
+
+async function sha256Hex(text: string): Promise<string> {
+  const bytes = new TextEncoder().encode(text);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function redactOutboundText(text: string): string {
+  const redacted = text
+    .replace(/\b(Bearer|token|secret|password|api[_-]?key)\s*[:=]\s*\S+/gi, "$1=[REDACTED]")
+    .replace(/\b[A-Za-z0-9_-]{40,}\b/g, "[REDACTED_TOKEN]");
+
+  if (redacted.length <= OUTBOUND_TEXT_MAX) return redacted;
+  return `${redacted.slice(0, OUTBOUND_TEXT_MAX)}\n[truncated]`;
+}
+
+type OutboundStatus = "queued" | "sent" | "failed" | "skipped";
+
+interface OutboundLogInput {
+  id?: string;
+  sourceRoute: string;
+  originEventId?: string | null;
+  originEventType?: string | null;
+  originSessionId?: string | null;
+  chatId?: string | number | null;
+  parseMode?: string | null;
+  text: string;
+  dedupeKey?: string | null;
+  status?: OutboundStatus;
+  error?: string | null;
+  metadata?: Record<string, unknown>;
+}
+
+async function putOutboundKv(env: Env, id: string, row: Record<string, unknown>): Promise<void> {
+  try {
+    await env.BWM_TELEGRAM_KV.put(`${KV_OUTBOUND_LOG_PREFIX}${id}`, JSON.stringify(row), {
+      expirationTtl: OUTBOUND_LOG_TTL_SECONDS,
+    });
+  } catch (err) {
+    console.error(JSON.stringify({ where: "putOutboundKv", error: String(err), id }));
+  }
+}
+
+async function createOutboundLog(env: Env, input: OutboundLogInput): Promise<string> {
+  const id = input.id ?? ulid();
+  const now = new Date().toISOString();
+  const status = input.status ?? "queued";
+  const row = {
+    id,
+    source_route: input.sourceRoute,
+    origin_event_id: input.originEventId ?? null,
+    origin_event_type: input.originEventType ?? null,
+    origin_session_id: input.originSessionId ?? null,
+    chat_id: input.chatId == null ? null : String(input.chatId),
+    parse_mode: input.parseMode ?? null,
+    text_sha256: await sha256Hex(input.text),
+    text_redacted: redactOutboundText(input.text),
+    dedupe_key: input.dedupeKey ?? null,
+    status,
+    error: input.error ?? null,
+    metadata: input.metadata ?? {},
+    queued_at: now,
+    failed_at: status === "failed" ? now : null,
+    sent_at: status === "sent" ? now : null,
+    updated_at: now,
+  };
+
+  await putOutboundKv(env, id, row);
+
+  if (!supabaseConfigured(env)) {
+    console.warn(JSON.stringify({
+      where: "createOutboundLog",
+      warn: "missing_supabase_env",
+      source_route: input.sourceRoute,
+      id,
+    }));
+    return id;
+  }
+
+  try {
+    const resp = await fetch(supabaseRestUrl(env, "telegram_outbound"), {
+      method: "POST",
+      headers: supabaseHeaders(env, "return=minimal,resolution=ignore-duplicates"),
+      body: JSON.stringify(row),
+    });
+    if (!resp.ok) {
+      console.error(JSON.stringify({
+        where: "createOutboundLog",
+        status: resp.status,
+        detail: (await resp.text().catch(() => "")).slice(0, 300),
+        id,
+      }));
+    }
+  } catch (err) {
+    console.error(JSON.stringify({ where: "createOutboundLog", error: String(err), id }));
+  }
+
+  return id;
+}
+
+async function updateOutboundLog(
+  env: Env,
+  id: string,
+  patch: {
+    status: OutboundStatus;
+    telegramMessageId?: number | null;
+    telegramResponse?: unknown;
+    error?: string | null;
+    metadata?: Record<string, unknown>;
+  },
+): Promise<void> {
+  const now = new Date().toISOString();
+  const kvKey = `${KV_OUTBOUND_LOG_PREFIX}${id}`;
+  try {
+    const existing = await env.BWM_TELEGRAM_KV.get(kvKey);
+    const existingRow = existing ? JSON.parse(existing) as Record<string, unknown> : {};
+    const nextRow: Record<string, unknown> = {
+      ...existingRow,
+      status: patch.status,
+      updated_at: now,
+    };
+    if (patch.status === "sent") nextRow.sent_at = now;
+    if (patch.status === "failed") nextRow.failed_at = now;
+    if (patch.telegramMessageId != null) nextRow.telegram_message_id = patch.telegramMessageId;
+    if (patch.telegramResponse !== undefined) nextRow.telegram_response = patch.telegramResponse;
+    if (patch.error !== undefined) nextRow.error = patch.error;
+    if (patch.metadata !== undefined) nextRow.metadata = patch.metadata;
+    await putOutboundKv(env, id, nextRow);
+  } catch (err) {
+    console.error(JSON.stringify({ where: "updateOutboundLog.kv", error: String(err), id }));
+  }
+
+  if (!supabaseConfigured(env)) return;
+  const body: Record<string, unknown> = {
+    status: patch.status,
+    updated_at: now,
+  };
+  if (patch.status === "sent") body.sent_at = now;
+  if (patch.status === "failed") body.failed_at = now;
+  if (patch.telegramMessageId != null) body.telegram_message_id = patch.telegramMessageId;
+  if (patch.telegramResponse !== undefined) body.telegram_response = patch.telegramResponse;
+  if (patch.error !== undefined) body.error = patch.error;
+  if (patch.metadata !== undefined) body.metadata = patch.metadata;
+
+  try {
+    const resp = await fetch(supabaseRestUrl(env, `telegram_outbound?id=eq.${encodeURIComponent(id)}`), {
+      method: "PATCH",
+      headers: supabaseHeaders(env, "return=minimal"),
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      console.error(JSON.stringify({
+        where: "updateOutboundLog",
+        status: resp.status,
+        detail: (await resp.text().catch(() => "")).slice(0, 300),
+        id,
+      }));
+    }
+  } catch (err) {
+    console.error(JSON.stringify({ where: "updateOutboundLog", error: String(err), id }));
+  }
+}
+
 // Crockford base-32 ULID
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
@@ -326,14 +520,24 @@ async function mintToken(env: Env, secretName: string): Promise<string> {
 // Telegram send helper
 // ─────────────────────────────────────────────────────────────────────────────
 
+interface TelegramSendResult {
+  ok: boolean;
+  status: number;
+  error?: string;
+  telegramMessageId?: number;
+  response?: unknown;
+}
+
 async function sendTelegramMessage(
   botToken: string,
   chatId: string | number,
   text: string,
   parseMode?: string,
-): Promise<{ ok: boolean; error?: string }> {
+  replyToMessageId?: number,
+): Promise<TelegramSendResult> {
   const body: Record<string, unknown> = { chat_id: chatId, text };
   if (parseMode) body.parse_mode = parseMode;
+  if (replyToMessageId) body.reply_to_message_id = replyToMessageId;
 
   const res = await fetch(`${TELEGRAM_API_BASE}/bot${botToken}/sendMessage`, {
     method: "POST",
@@ -341,11 +545,29 @@ async function sendTelegramMessage(
     body: JSON.stringify(body),
   });
 
-  const data = (await res.json()) as { ok: boolean; description?: string };
-  if (!data.ok) {
-    return { ok: false, error: data.description ?? `HTTP ${res.status}` };
+  const data = (await res.json().catch(() => ({
+    ok: false,
+    description: "telegram_non_json_response",
+  }))) as {
+    ok: boolean;
+    description?: string;
+    result?: { message_id?: number };
+  };
+
+  if (!res.ok || !data.ok) {
+    return {
+      ok: false,
+      status: res.status,
+      error: data.description ?? `HTTP ${res.status}`,
+      response: data,
+    };
   }
-  return { ok: true };
+  return {
+    ok: true,
+    status: res.status,
+    telegramMessageId: data.result?.message_id,
+    response: data,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -355,11 +577,58 @@ async function sendTelegramMessage(
 async function handleHealth(env: Env): Promise<Response> {
   const chatId = await env.BWM_TELEGRAM_KV.get(KV_CHAT_ID_KEY);
   const lastSendAt = await env.BWM_TELEGRAM_KV.get(KV_LAST_SEND_AT_KEY);
-  return json({
-    status: "ok",
-    version: VERSION,
+  const attentionRouterConfigured = !!env.ATTENTION_ROUTER && !!env.ATTENTION_ROUTER_KEY;
+  const checks = {
     telegram_configured: !!chatId,
+    supabase_configured: supabaseConfigured(env),
+    attention_router_configured: attentionRouterConfigured,
+    content_classifier_configured: !!env.CONTENT_CLASSIFIER && !!env.CONTENT_CLASSIFIER_KEY,
+  };
+  const ok = checks.telegram_configured && checks.supabase_configured && checks.attention_router_configured;
+  return json({
+    status: ok ? "ok" : "degraded",
+    version: VERSION,
+    ...checks,
     last_send_at: lastSendAt ?? null,
+  }, ok ? 200 : 503);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Route: GET /audit/outbound (internal-key protected KV fallback audit)
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function handleOutboundAudit(request: Request, env: Env): Promise<Response> {
+  const key = request.headers.get("X-BWM-Internal-Key") ?? "";
+  if (!env.BWM_INTERNAL_KEY || key !== env.BWM_INTERNAL_KEY) {
+    return json({ ok: false, error: "unauthorized" }, 401);
+  }
+
+  const url = new URL(request.url);
+  const requestedLimit = Number(url.searchParams.get("limit") ?? "50");
+  const limit = Number.isFinite(requestedLimit)
+    ? Math.max(1, Math.min(Math.floor(requestedLimit), 200))
+    : 50;
+
+  const listed = await env.BWM_TELEGRAM_KV.list({ prefix: KV_OUTBOUND_LOG_PREFIX, limit });
+  const rows = await Promise.all(
+    listed.keys.map(async (item) => {
+      const raw = await env.BWM_TELEGRAM_KV.get(item.name);
+      if (!raw) return null;
+      try {
+        return JSON.parse(raw) as Record<string, unknown>;
+      } catch {
+        return { key: item.name, parse_error: true };
+      }
+    }),
+  );
+
+  return json({
+    ok: true,
+    source: "kv",
+    count: rows.filter(Boolean).length,
+    rows: rows
+      .filter((row): row is Record<string, unknown> => !!row)
+      .sort((a, b) => String(b.created_at ?? "").localeCompare(String(a.created_at ?? ""))),
   });
 }
 
@@ -397,11 +666,24 @@ async function handleEvent(
     return json({ ok: true, action: "filtered", event_type: eventType });
   }
 
+  const text = formatEventMessage(eventType, payload);
+  const dedupeKey = eventId ? `${KV_DEDUP_PREFIX}${eventId}` : null;
+
   // Dedup check (24h TTL per event_id)
-  if (eventId) {
-    const dedupKey = `${KV_DEDUP_PREFIX}${eventId}`;
-    const alreadySent = await env.BWM_TELEGRAM_KV.get(dedupKey);
+  if (dedupeKey) {
+    const alreadySent = await env.BWM_TELEGRAM_KV.get(dedupeKey);
     if (alreadySent) {
+      await createOutboundLog(env, {
+        sourceRoute: "/event",
+        originEventId: eventId,
+        originEventType: eventType,
+        originSessionId: event.session_id ?? null,
+        parseMode: "MarkdownV2",
+        text,
+        dedupeKey,
+        status: "skipped",
+        metadata: { reason: "dedup_skip" },
+      });
       return json({ ok: true, action: "dedup_skip", event_id: eventId });
     }
   }
@@ -417,6 +699,20 @@ async function handleEvent(
     if (lastFiredStr) {
       const elapsedMs = Date.now() - parseInt(lastFiredStr, 10);
       if (elapsedMs < rateLimitWindow * 1000) {
+        await createOutboundLog(env, {
+          sourceRoute: "/event",
+          originEventId: eventId || null,
+          originEventType: eventType,
+          originSessionId: event.session_id ?? null,
+          parseMode: "MarkdownV2",
+          text,
+          dedupeKey,
+          status: "skipped",
+          metadata: {
+            reason: "rate_limit_skip",
+            retry_after_seconds: rateLimitWindow - Math.floor(elapsedMs / 1000),
+          },
+        });
         return json({
           ok: true,
           action: "rate_limit_skip",
@@ -436,8 +732,31 @@ async function handleEvent(
   if (!chatId) {
     // No chat registered yet — log but return 200 to not block projector
     console.warn(JSON.stringify({ where: "handleEvent", warn: "no chat_id captured yet", event_type: eventType }));
+    await createOutboundLog(env, {
+      sourceRoute: "/event",
+      originEventId: eventId || null,
+      originEventType: eventType,
+      originSessionId: event.session_id ?? null,
+      parseMode: "MarkdownV2",
+      text,
+      dedupeKey,
+      status: "skipped",
+      metadata: { reason: "missing_chat_id" },
+    });
     return json({ ok: true, action: "skipped_no_chat_id", event_type: eventType });
   }
+
+  const outboundId = await createOutboundLog(env, {
+    sourceRoute: "/event",
+    originEventId: eventId || null,
+    originEventType: eventType,
+    originSessionId: event.session_id ?? null,
+    chatId,
+    parseMode: "MarkdownV2",
+    text,
+    dedupeKey,
+    status: "queued",
+  });
 
   // Mint token and send — fire-and-forget via waitUntil to not block response
   ctx.waitUntil(
@@ -447,10 +766,13 @@ async function handleEvent(
         botToken = await mintToken(env, "TELEGRAM_BOT_TOKEN");
       } catch (e) {
         console.error(JSON.stringify({ where: "handleEvent.mintToken", error: String(e) }));
+        await updateOutboundLog(env, outboundId, {
+          status: "failed",
+          error: `token_mint_failed: ${String(e).slice(0, 200)}`,
+        });
         return;
       }
 
-      const text = formatEventMessage(eventType, payload);
       const result = await sendTelegramMessage(botToken, chatId, text, "MarkdownV2");
 
       if (!result.ok) {
@@ -459,8 +781,28 @@ async function handleEvent(
         const plainResult = await sendTelegramMessage(botToken, chatId, `[${eventType}] ${JSON.stringify(payload).slice(0, 400)}`);
         if (!plainResult.ok) {
           console.error(JSON.stringify({ where: "handleEvent.send.plain", error: plainResult.error }));
+          await updateOutboundLog(env, outboundId, {
+            status: "failed",
+            error: plainResult.error ?? result.error ?? "telegram_send_failed",
+            telegramResponse: { markdown: result.response, plain: plainResult.response },
+            metadata: { fallback: "plain_failed" },
+          });
           return;
         }
+        await updateOutboundLog(env, outboundId, {
+          status: "sent",
+          telegramMessageId: plainResult.telegramMessageId,
+          telegramResponse: plainResult.response,
+          error: null,
+          metadata: { fallback: "plain" },
+        });
+      } else {
+        await updateOutboundLog(env, outboundId, {
+          status: "sent",
+          telegramMessageId: result.telegramMessageId,
+          telegramResponse: result.response,
+          error: null,
+        });
       }
 
       // Mark as sent in dedup store
@@ -492,22 +834,46 @@ async function handleTest(request: Request, env: Env): Promise<Response> {
     return json({ ok: false, error: "chat_id not captured yet — send /start to the bot first" }, 400);
   }
 
+  const text = "✅ BWM Telegram Relay is live\n\nOps alerts will route here.";
+  const outboundId = await createOutboundLog(env, {
+    sourceRoute: "/test",
+    chatId,
+    text,
+    status: "queued",
+  });
+
   let botToken: string;
   try {
     botToken = await mintToken(env, "TELEGRAM_BOT_TOKEN");
   } catch (e) {
+    await updateOutboundLog(env, outboundId, {
+      status: "failed",
+      error: `token_mint_failed: ${String(e).slice(0, 200)}`,
+    });
     return json({ ok: false, error: "token_mint_failed", detail: String(e).slice(0, 200) }, 502);
   }
 
   const result = await sendTelegramMessage(
     botToken,
     chatId,
-    "✅ BWM Telegram Relay is live\n\nOps alerts will route here.",
+    text,
   );
 
   if (!result.ok) {
+    await updateOutboundLog(env, outboundId, {
+      status: "failed",
+      error: result.error ?? "telegram_send_failed",
+      telegramResponse: result.response,
+    });
     return json({ ok: false, error: "send_failed", detail: result.error }, 502);
   }
+
+  await updateOutboundLog(env, outboundId, {
+    status: "sent",
+    telegramMessageId: result.telegramMessageId,
+    telegramResponse: result.response,
+    error: null,
+  });
 
   return json({ ok: true, chat_id: chatId });
 }
@@ -569,23 +935,53 @@ async function handleSend(request: Request, env: Env): Promise<Response> {
 
   const chatId = await env.BWM_TELEGRAM_KV.get(KV_CHAT_ID_KEY);
   if (!chatId) {
+    await createOutboundLog(env, {
+      sourceRoute: "/send",
+      text,
+      parseMode: body.parse_mode ?? null,
+      status: "skipped",
+      metadata: { reason: "missing_chat_id" },
+    });
     return json({ ok: false, error: "chat_id not captured yet — send /start to the bot to register" }, 400);
   }
+
+  const outboundId = await createOutboundLog(env, {
+    sourceRoute: "/send",
+    chatId,
+    text,
+    parseMode: body.parse_mode ?? null,
+    status: "queued",
+  });
 
   let botToken: string;
   try {
     botToken = await mintToken(env, "TELEGRAM_BOT_TOKEN");
   } catch (e) {
     console.error(JSON.stringify({ where: "handleSend.mintToken", error: String(e) }));
+    await updateOutboundLog(env, outboundId, {
+      status: "failed",
+      error: `token_mint_failed: ${String(e).slice(0, 200)}`,
+    });
     return json({ ok: false, error: "token_mint_failed", detail: String(e).slice(0, 200) }, 502);
   }
 
   const result = await sendTelegramMessage(botToken, chatId, text, body.parse_mode);
   if (!result.ok) {
     console.error(JSON.stringify({ where: "handleSend.sendMessage", error: result.error }));
+    await updateOutboundLog(env, outboundId, {
+      status: "failed",
+      error: result.error ?? "telegram_send_failed",
+      telegramResponse: result.response,
+    });
     return json({ ok: false, error: "telegram_send_failed", detail: result.error }, 502);
   }
 
+  await updateOutboundLog(env, outboundId, {
+    status: "sent",
+    telegramMessageId: result.telegramMessageId,
+    telegramResponse: result.response,
+    error: null,
+  });
   return json({ ok: true, chat_id: chatId });
 }
 
@@ -618,7 +1014,6 @@ async function handleWebhook(
   if (!chatId) return json({ ok: true });
 
   const inboundEventId = ulid();
-  ctx.waitUntil(persistInboundMessage(env, inboundEventId, update));
 
   // Store chat_id on first contact
   const existingChatId = await env.BWM_TELEGRAM_KV.get(KV_CHAT_ID_KEY);
@@ -628,69 +1023,35 @@ async function handleWebhook(
   }
 
   const text = message.text ?? "";
+  ctx.waitUntil(
+    (async () => {
+      await persistInboundMessage(env, inboundEventId, update);
+      let botToken = "";
+      try {
+        botToken = await mintToken(env, "TELEGRAM_BOT_TOKEN");
+      } catch (e) {
+        console.error(JSON.stringify({ where: "webhook.mintToken", error: String(e) }));
+      }
 
-  // Forward non-command text to bwm-attention-router (non-blocking)
-  if (text && !text.startsWith("/") && env.ATTENTION_ROUTER && env.ATTENTION_ROUTER_KEY) {
-    ctx.waitUntil(
-      env.ATTENTION_ROUTER.fetch("https://internal/classify", {
-        method: "POST",
-        headers: {
-          "X-BWM-Internal-Key": env.ATTENTION_ROUTER_KEY,
-          "Content-Type": "application/json",
-          "User-Agent": `bwm-telegram-relay/${VERSION}`,
-        },
-        body: JSON.stringify({
-          source: "telegram",
-          raw_text: text,
-          message_id: String(message.message_id),
-          inbound_event_id: inboundEventId,
-          user_id: String(fromId ?? chatId),
-        }),
-      })
-        .then(async (r) => {
-          if (!r.ok) {
-            console.error(JSON.stringify({
-              where: "webhook.attention_router",
-              status: r.status,
-              detail: (await r.text()).slice(0, 200),
-            }));
-          }
-        })
-        .catch((e) => console.error(JSON.stringify({ where: "webhook.attention_router", error: String(e) }))),
-    );
-  }
+      let acted = false;
+      if (botToken) {
+        try {
+          acted = await processTelegramReply(env, inboundEventId, message, text, chatId, botToken);
+        } catch (e) {
+          console.error(JSON.stringify({ where: "webhook.processTelegramReply", error: String(e) }));
+        }
+      }
 
-  // Forward non-command text to bwm-content-classifier (non-blocking, sibling of attention-router)
-  // PROJ-TELEGRAM-MIGRATION-001 Phase 0 / Chip 7b. Tagged content routes to Brain inbox.
-  if (text && !text.startsWith("/") && env.CONTENT_CLASSIFIER && env.CONTENT_CLASSIFIER_KEY) {
-    ctx.waitUntil(
-      env.CONTENT_CLASSIFIER.fetch("https://internal/classify", {
-        method: "POST",
-        headers: {
-          "X-BWM-Internal-Key": env.CONTENT_CLASSIFIER_KEY,
-          "Content-Type": "application/json",
-          "User-Agent": `bwm-telegram-relay/${VERSION}`,
-        },
-        body: JSON.stringify({
-          source: "telegram",
-          raw_text: text,
-          message_id: String(message.message_id),
-          event_id: inboundEventId,
-          user_id: String(fromId ?? chatId),
-        }),
-      })
-        .then(async (r) => {
-          if (!r.ok) {
-            console.error(JSON.stringify({
-              where: "webhook.content_classifier",
-              status: r.status,
-              detail: (await r.text()).slice(0, 200),
-            }));
-          }
-        })
-        .catch((e) => console.error(JSON.stringify({ where: "webhook.content_classifier", error: String(e) }))),
-    );
-  }
+      if (acted) {
+        await updateInboundMessage(env, inboundEventId, {
+          forward_status: "acted",
+          forward_error: null,
+        });
+      } else {
+        await routeInboundMessage(env, inboundEventId, message, text, String(fromId ?? chatId));
+      }
+    })().catch((e) => console.error(JSON.stringify({ where: "webhook.routeInboundMessage", error: String(e) }))),
+  );
 
   // Respond to /start
   if (text.startsWith("/start")) {
@@ -702,10 +1063,35 @@ async function handleWebhook(
     }
 
     if (botToken) {
+      const startReply = `✅ Connected. BWM ops alerts will route to this chat.\n\nchat_id: ${chatId}\nReady to receive.`;
+      const outboundId = await createOutboundLog(env, {
+        sourceRoute: "/webhook_reply",
+        originEventId: inboundEventId,
+        chatId,
+        text: startReply,
+        status: "queued",
+      });
       ctx.waitUntil(
-        sendTelegramMessage(botToken, chatId,
-          `✅ Connected. BWM ops alerts will route to this chat.\n\nchat_id: ${chatId}\nReady to receive.`,
-        ).catch((e) => console.error(JSON.stringify({ where: "webhook./start.reply", error: String(e) }))),
+        sendTelegramMessage(botToken, chatId, startReply)
+          .then((result) => updateOutboundLog(env, outboundId, result.ok
+            ? {
+              status: "sent",
+              telegramMessageId: result.telegramMessageId,
+              telegramResponse: result.response,
+              error: null,
+            }
+            : {
+              status: "failed",
+              error: result.error ?? "telegram_send_failed",
+              telegramResponse: result.response,
+            }))
+          .catch((e) => {
+            console.error(JSON.stringify({ where: "webhook./start.reply", error: String(e) }));
+            return updateOutboundLog(env, outboundId, {
+              status: "failed",
+              error: String(e).slice(0, 200),
+            });
+          }),
       );
     }
   }
@@ -714,8 +1100,590 @@ async function handleWebhook(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Inbound persistence
+// Inbound persistence + fanout status
 // ─────────────────────────────────────────────────────────────────────────────
+
+async function updateInboundMessage(
+  env: Env,
+  eventId: string,
+  patch: Record<string, unknown>,
+): Promise<void> {
+  if (!supabaseConfigured(env)) return;
+
+  const url = supabaseRestUrl(env, `telegram_inbound?event_id=eq.${encodeURIComponent(eventId)}`);
+  try {
+    const resp = await fetch(url, {
+      method: "PATCH",
+      headers: supabaseHeaders(env, "return=minimal"),
+      body: JSON.stringify(patch),
+    });
+    if (!resp.ok) {
+      const detail = (await resp.text().catch(() => "")).slice(0, 300);
+      const basePatch: Record<string, unknown> = {};
+      if ("forward_status" in patch) basePatch.forward_status = patch.forward_status;
+      if ("forwarded_to_router_at" in patch) {
+        basePatch.forwarded_to_router_at = patch.forwarded_to_router_at;
+      }
+      if (Object.keys(basePatch).length > 0 && Object.keys(basePatch).length < Object.keys(patch).length) {
+        const retry = await fetch(url, {
+          method: "PATCH",
+          headers: supabaseHeaders(env, "return=minimal"),
+          body: JSON.stringify(basePatch),
+        });
+        if (retry.ok) {
+          console.warn(JSON.stringify({
+            where: "updateInboundMessage",
+            eventId,
+            warn: "diagnostic_columns_unavailable_base_patch_applied",
+          }));
+          return;
+        }
+        console.error(JSON.stringify({
+          where: "updateInboundMessage",
+          eventId,
+          status: retry.status,
+          detail: (await retry.text().catch(() => "")).slice(0, 300),
+        }));
+        return;
+      }
+      console.error(JSON.stringify({
+        where: "updateInboundMessage",
+        eventId,
+        status: resp.status,
+        detail,
+      }));
+    }
+  } catch (err) {
+    console.error(JSON.stringify({ where: "updateInboundMessage", eventId, error: String(err) }));
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Directive classification — matches Robert's natural "you handle it" language
+// ─────────────────────────────────────────────────────────────────────────────
+
+const DIRECTIVE_PATTERNS: Array<RegExp> = [
+  /you\s+handle\s+(?:this|it|that)/i,
+  /(?:not|isn'?t)\s+a\s+me\s+thing/i,
+  /auto[- ]?handle/i,
+  /handle\s+(?:this|it|that)\s+(?:silently|without\s+me|yourself)/i,
+  /your\s+(?:call|decision|thing)(?:\s+(?:on|here))?/i,
+  /you\s+own\s+(?:this|it|that)/i,
+  /(?:update|update the)\s+brain/i,
+  /system\s+should\s+handle/i,
+  /(?:not|isn'?t)\s+on\s+my\s+radar/i,
+  /(?:don'?t|stop)\s+surface/i,
+];
+
+const RESOLVE_CMDS = new Set([
+  "resolve", "resolved", "done", "completed", "close", "approve", "approved",
+]);
+
+type ReplyIntent =
+  | { kind: "resolve" }
+  | { kind: "directive"; scope: string }
+  | { kind: "unknown" };
+
+function classifyReplyIntent(text: string): ReplyIntent {
+  const trimmed = text.trim();
+  if (RESOLVE_CMDS.has(trimmed.toLowerCase())) return { kind: "resolve" };
+  for (const pat of DIRECTIVE_PATTERNS) {
+    if (pat.test(trimmed)) {
+      const match = trimmed.match(pat);
+      return { kind: "directive", scope: match ? match[0] : trimmed.slice(0, 60) };
+    }
+  }
+  return { kind: "unknown" };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Brain Proxy helpers (brain.buildwisemedia.com)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const BRAIN_BASE_URL = "https://brain.buildwisemedia.com";
+const ATTN_SPEC_PATH = "reference/Attention-Routing-Spec.md";
+
+async function readFromBrain(env: Env, path: string): Promise<string | null> {
+  if (!env.BRAIN_KEY) return null;
+  try {
+    const resp = await fetch(`${BRAIN_BASE_URL}/read?path=${encodeURIComponent(path)}`, {
+      headers: {
+        "x-brain-key": env.BRAIN_KEY,
+        "User-Agent": "bwm-telegram-relay/directive-handler",
+      },
+    });
+    if (!resp.ok) return null;
+    const data = (await resp.json()) as { content?: string };
+    return data.content ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeToBrain(
+  env: Env,
+  path: string,
+  content: string,
+  message: string,
+): Promise<{ ok: boolean; error?: string }> {
+  if (!env.BRAIN_KEY || !env.BRAIN_WRITE_KEY) {
+    return { ok: false, error: "brain keys not configured" };
+  }
+  try {
+    const resp = await fetch(`${BRAIN_BASE_URL}/write`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-brain-key": env.BRAIN_KEY,
+        "x-write-key": env.BRAIN_WRITE_KEY,
+        "User-Agent": "bwm-telegram-relay/directive-handler",
+      },
+      body: JSON.stringify({ path, content, message }),
+    });
+    if (!resp.ok) {
+      const detail = await resp.text().catch(() => "");
+      return { ok: false, error: `brain write ${resp.status}: ${detail.slice(0, 200)}` };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+/**
+ * Appends a new silent_handle override entry to Attention-Routing-Spec.md.
+ * Non-fatal if Brain keys are absent — Supabase log is still written.
+ */
+async function appendDirectiveOverride(
+  env: Env,
+  eventType: string,
+  triggerText: string,
+  scope: string,
+  originEventId: string,
+): Promise<{ ok: boolean; error?: string }> {
+  const current = await readFromBrain(env, ATTN_SPEC_PATH);
+  if (current === null) {
+    console.warn("appendDirectiveOverride: could not read Attention-Routing-Spec — Supabase log still written");
+    return { ok: false, error: "brain read failed" };
+  }
+
+  const ts = new Date().toISOString().slice(0, 10);
+  const entry = [
+    ``,
+    `### Override \u2014 ${ts}`,
+    `- **trigger:** "${triggerText}"`,
+    `- **event_type:** ${eventType}`,
+    `- **scope:** ${scope}`,
+    `- **action:** silent_handle`,
+    `- **origin_event_id:** ${originEventId}`,
+    `- **locked:** ${new Date().toISOString()}`,
+  ].join("\n");
+
+  const OVERRIDES_HEADER = "## Directive Overrides";
+  const nextContent = current.includes(OVERRIDES_HEADER)
+    ? current.replace(OVERRIDES_HEADER, `${OVERRIDES_HEADER}\n${entry}`)
+    : `${current.trimEnd()}\n\n${OVERRIDES_HEADER}\n${entry}\n`;
+
+  return writeToBrain(
+    env,
+    ATTN_SPEC_PATH,
+    nextContent,
+    `directive override: ${scope} \u2192 silent_handle (triggered by Telegram reply on ${originEventId})`,
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared Supabase emit helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function emitOperationalEvent(
+  env: Env,
+  eventType: string,
+  payload: Record<string, unknown>,
+  sessionId: string,
+): Promise<boolean> {
+  try {
+    const resp = await fetch(`${env.SUPABASE_URL.replace(/\/+$/, "")}/rest/v1/operational_events`, {
+      method: "POST",
+      headers: {
+        apikey: env.SUPABASE_SERVICE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify({
+        id: ulid(),
+        event_type: eventType,
+        client_id: null,
+        payload,
+        occurred_at: new Date().toISOString(),
+        session_id: sessionId,
+      }),
+    });
+    return resp.ok;
+  } catch {
+    return false;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Core reply processor
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function processTelegramReply(
+  env: Env,
+  inboundEventId: string,
+  message: TelegramMessage,
+  text: string,
+  chatId: string | number,
+  botToken: string,
+): Promise<boolean> {
+  const replyTo = message.reply_to_message;
+  if (!replyTo) return false;
+
+  const replyToMessageId = replyTo.message_id;
+  if (!replyToMessageId) return false;
+
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_KEY) {
+    console.warn("processTelegramReply: Supabase not configured");
+    return false;
+  }
+
+  // 1. Look up origin event from outbound message log
+  const lookupUrl =
+    `${env.SUPABASE_URL.replace(/\/+$/, "")}/rest/v1/telegram_outbound` +
+    `?telegram_message_id=eq.${replyToMessageId}&select=origin_event_id,origin_event_type&limit=1`;
+  let originEventId = "";
+  let originEventType = "";
+
+  try {
+    const resp = await fetch(lookupUrl, {
+      headers: {
+        apikey: env.SUPABASE_SERVICE_KEY,
+        Authorization: `Bearer ${env.SUPABASE_SERVICE_KEY}`,
+        Accept: "application/json",
+      },
+    });
+    if (!resp.ok) {
+      console.error(`processTelegramReply: query failed ${resp.status} ${await resp.text().catch(() => "")}`);
+      return false;
+    }
+    const data = (await resp.json()) as Array<{
+      origin_event_id: string | null;
+      origin_event_type: string | null;
+    }>;
+    if (!data || data.length === 0) {
+      console.log(`processTelegramReply: no outbound log for message_id=${replyToMessageId}`);
+      return false;
+    }
+    originEventId = data[0].origin_event_id ?? "";
+    originEventType = data[0].origin_event_type ?? "";
+  } catch (err) {
+    console.error("processTelegramReply: query threw", err);
+    return false;
+  }
+
+  if (!originEventId || !originEventType) {
+    console.log("processTelegramReply: missing origin event details");
+    return false;
+  }
+
+  // 2. Classify the reply intent
+  const intent = classifyReplyIntent(text);
+  if (intent.kind === "unknown") return false;
+
+  const sessionId = `telegram-reply-${inboundEventId}`;
+  let actionTaken = false;
+  const confirmationLines: string[] = [];
+
+  // ── DIRECTIVE PATH ──────────────────────────────────────────────────────────
+  // "You handle this" / "not a me thing" / "update the brain" etc.
+  // (a) write rule to Brain → (b) log to Supabase → (c) auto-resolve → (d) confirm
+  if (intent.kind === "directive") {
+    const { scope } = intent;
+
+    // (a) Append override to Attention-Routing-Spec in Brain
+    const brainResult = await appendDirectiveOverride(env, originEventType, text.trim(), scope, originEventId);
+    if (!brainResult.ok) {
+      console.warn(`processTelegramReply: brain write failed — ${brainResult.error}`);
+    }
+
+    // (b) Log directive override to Supabase for dashboard + EA pattern-detection
+    await emitOperationalEvent(
+      env,
+      "narrative",
+      {
+        source: "telegram-reply",
+        kind: "directive_override",
+        event_type: originEventType,
+        origin_event_id: originEventId,
+        scope,
+        trigger_text: text.trim(),
+        action: "silent_handle",
+        brain_write_ok: brainResult.ok,
+        note: `Robert replied "${text.trim()}" \u2014 marked silent_handle. Brain spec updated: ${brainResult.ok ? "\u2713" : "FAILED"}.`,
+      },
+      sessionId,
+    );
+
+    // (c) Auto-resolve the underlying event
+    if (originEventType === "incident.opened") {
+      const ok = await emitOperationalEvent(
+        env,
+        "narrative",
+        {
+          source: "telegram-directive",
+          kind: "incident-resolved",
+          closes_incident_id: originEventId,
+          note: `Auto-resolved via directive: "${text.trim()}"`,
+        },
+        sessionId,
+      );
+      actionTaken = ok;
+      confirmationLines.push(
+        "\u2705 *Directive applied*",
+        `Brain rule added: \`${originEventType}\` \u2192 silent\\_handle`,
+        "Incident auto\\-resolved\\.",
+        brainResult.ok ? "\uD83D\uDD17 Attention\\-Routing\\-Spec updated\\." : "\u26A0\uFE0F Brain write failed \\(Supabase log preserved\\)\\.",
+      );
+    } else if (originEventType === "task.queued") {
+      const ok = await emitOperationalEvent(
+        env,
+        "task.resolved",
+        {
+          source: "telegram-directive",
+          task_id: originEventId,
+          outcome: "auto-handled",
+          resolution: `Auto-resolved via directive: "${text.trim()}"`,
+        },
+        sessionId,
+      );
+      actionTaken = ok;
+      confirmationLines.push(
+        "\u2705 *Directive applied*",
+        `Brain rule added: \`${originEventType}\` \u2192 silent\\_handle`,
+        "Task auto\\-resolved\\.",
+        brainResult.ok ? "\uD83D\uDD17 Attention\\-Routing\\-Spec updated\\." : "\u26A0\uFE0F Brain write failed \\(Supabase log preserved\\)\\.",
+      );
+    } else if (originEventType === "client_state.transition") {
+      const ok = await emitOperationalEvent(
+        env,
+        "narrative",
+        {
+          source: "telegram-directive",
+          kind: "directive_override",
+          closes_event_id: originEventId,
+          action: "silent_handle",
+          note: `Auto-handled via directive: "${text.trim()}"`,
+        },
+        sessionId,
+      );
+      actionTaken = ok;
+      confirmationLines.push(
+        "\u2705 *Directive applied*",
+        `Brain rule added: \`${originEventType}\` \u2192 silent\\_handle`,
+        "System will handle this class of notification automatically going forward\\.",
+        brainResult.ok ? "\uD83D\uDD17 Attention\\-Routing\\-Spec updated\\." : "\u26A0\uFE0F Brain write failed \\(Supabase log preserved\\)\\.",
+      );
+    } else {
+      // Unknown event type — directive still logged
+      actionTaken = true;
+      confirmationLines.push(
+        "\u2705 *Directive logged*",
+        `Event type \`${originEventType}\` noted \u2014 will not surface again\\.`,
+        brainResult.ok ? "\uD83D\uDD17 Attention\\-Routing\\-Spec updated\\." : "\u26A0\uFE0F Brain write failed \\(Supabase log preserved\\)\\.",
+      );
+    }
+  }
+
+  // ── RESOLVE PATH ────────────────────────────────────────────────────────────
+  if (intent.kind === "resolve") {
+    if (originEventType === "incident.opened") {
+      const ok = await emitOperationalEvent(
+        env,
+        "narrative",
+        {
+          source: "telegram-reply",
+          kind: "incident-resolved",
+          closes_incident_id: originEventId,
+          note: `Incident resolved by Robert via Telegram reply: "${text}"`,
+        },
+        sessionId,
+      );
+      actionTaken = ok;
+      confirmationLines.push("\u2705 Incident resolved successfully\\.");
+    } else if (originEventType === "task.queued") {
+      const ok = await emitOperationalEvent(
+        env,
+        "task.resolved",
+        {
+          task_id: originEventId,
+          outcome: "done",
+          resolution: `Resolved via Telegram reply: "${text}"`,
+        },
+        sessionId,
+      );
+      actionTaken = ok;
+      confirmationLines.push("\u2705 Task resolved successfully\\.");
+    }
+  }
+
+  // 3. Send confirmation back to Robert
+  if (actionTaken && confirmationLines.length > 0) {
+    try {
+      await sendTelegramMessage(
+        botToken,
+        chatId,
+        confirmationLines.join("\n"),
+        "MarkdownV2",
+        message.message_id,
+      );
+    } catch (err) {
+      console.error("processTelegramReply: send confirmation threw", err);
+    }
+  }
+
+  return actionTaken;
+}
+
+async function routeInboundMessage(
+  env: Env,
+  eventId: string,
+  message: TelegramMessage,
+  text: string,
+  userId: string,
+): Promise<void> {
+  const trimmed = text.trim();
+
+  if (!trimmed) {
+    await updateInboundMessage(env, eventId, {
+      forward_status: "skipped_empty",
+      forward_error: null,
+    });
+    return;
+  }
+
+  if (trimmed.startsWith("/")) {
+    await updateInboundMessage(env, eventId, {
+      forward_status: "skipped_command",
+      forward_error: null,
+    });
+    return;
+  }
+
+  if (!env.ATTENTION_ROUTER || !env.ATTENTION_ROUTER_KEY) {
+    const error = "attention_router_not_configured";
+    console.error(JSON.stringify({ where: "routeInboundMessage.attention_router", eventId, error }));
+    await updateInboundMessage(env, eventId, {
+      forward_status: "error",
+      forward_error: error,
+    });
+    return;
+  }
+
+  try {
+    const routerResp = await env.ATTENTION_ROUTER.fetch("https://internal/classify", {
+      method: "POST",
+      headers: {
+        "X-BWM-Internal-Key": env.ATTENTION_ROUTER_KEY,
+        "Content-Type": "application/json",
+        "User-Agent": `bwm-telegram-relay/${VERSION}`,
+      },
+      body: JSON.stringify({
+        source: "telegram",
+        raw_text: trimmed,
+        message_id: String(message.message_id),
+        inbound_event_id: eventId,
+        user_id: userId,
+      }),
+    });
+
+    if (!routerResp.ok) {
+      const detail = (await routerResp.text().catch(() => "")).slice(0, 300);
+      console.error(JSON.stringify({
+        where: "routeInboundMessage.attention_router",
+        eventId,
+        status: routerResp.status,
+        detail,
+      }));
+      await updateInboundMessage(env, eventId, {
+        forward_status: "error",
+        router_status: routerResp.status,
+        forward_error: detail || `attention_router_http_${routerResp.status}`,
+      });
+      return;
+    }
+
+    await updateInboundMessage(env, eventId, {
+      forward_status: "forwarded",
+      forwarded_to_router_at: new Date().toISOString(),
+      router_status: routerResp.status,
+      forward_error: null,
+    });
+  } catch (err) {
+    const error = String(err).slice(0, 300);
+    console.error(JSON.stringify({ where: "routeInboundMessage.attention_router", eventId, error }));
+    await updateInboundMessage(env, eventId, {
+      forward_status: "error",
+      forward_error: error,
+    });
+    return;
+  }
+
+  // Forward non-command text to bwm-content-classifier (sibling of attention-router).
+  // Classifier failures should not downgrade the attention-router forward status.
+  if (!env.CONTENT_CLASSIFIER || !env.CONTENT_CLASSIFIER_KEY) {
+    await updateInboundMessage(env, eventId, {
+      classifier_error: "content_classifier_not_configured",
+    });
+    return;
+  }
+
+  try {
+    const classifierResp = await env.CONTENT_CLASSIFIER.fetch("https://internal/classify", {
+      method: "POST",
+      headers: {
+        "X-BWM-Internal-Key": env.CONTENT_CLASSIFIER_KEY,
+        "Content-Type": "application/json",
+        "User-Agent": `bwm-telegram-relay/${VERSION}`,
+      },
+      body: JSON.stringify({
+        source: "telegram",
+        raw_text: trimmed,
+        message_id: String(message.message_id),
+        event_id: eventId,
+        user_id: userId,
+      }),
+    });
+
+    if (!classifierResp.ok) {
+      const detail = (await classifierResp.text().catch(() => "")).slice(0, 300);
+      console.error(JSON.stringify({
+        where: "routeInboundMessage.content_classifier",
+        eventId,
+        status: classifierResp.status,
+        detail,
+      }));
+      await updateInboundMessage(env, eventId, {
+        classifier_status: classifierResp.status,
+        classifier_error: detail || `content_classifier_http_${classifierResp.status}`,
+      });
+      return;
+    }
+
+    await updateInboundMessage(env, eventId, {
+      forwarded_to_classifier_at: new Date().toISOString(),
+      classifier_status: classifierResp.status,
+      classifier_error: null,
+    });
+  } catch (err) {
+    const error = String(err).slice(0, 300);
+    console.error(JSON.stringify({ where: "routeInboundMessage.content_classifier", eventId, error }));
+    await updateInboundMessage(env, eventId, {
+      classifier_error: error,
+    });
+  }
+}
 
 async function persistInboundMessage(
   env: Env,
@@ -847,6 +1815,7 @@ interface TelegramMessage {
   chat: { id: number; type: string };
   text?: string;
   date: number;
+  reply_to_message?: TelegramMessage;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -862,6 +1831,9 @@ export default {
     try {
       if (method === "GET" && path === "/health") {
         return handleHealth(env);
+      }
+      if (method === "GET" && path === "/audit/outbound") {
+        return handleOutboundAudit(request, env);
       }
       if (method === "POST" && path === "/event") {
         return handleEvent(request, env, ctx);
