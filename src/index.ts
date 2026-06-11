@@ -62,7 +62,7 @@ export interface Env {
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-const VERSION = "2.1.0";
+const VERSION = "2.1.1";
 const BROKER_INTERNAL_URL = "https://internal/mint";
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 const KV_CHAT_ID_KEY = "robert_chat_id";
@@ -1042,6 +1042,32 @@ async function handleWebhook(
         botToken = await mintToken(env, "TELEGRAM_BOT_TOKEN");
       } catch (e) {
         console.error(JSON.stringify({ where: "webhook.mintToken", error: String(e) }));
+      }
+
+      // Receipt reaction: 👍 on Robert's message so he can SEE the system
+      // received + logged it (Robert directive 2026-06-11 — emoji acks both
+      // directions). Registered chat only; fail-soft.
+      const registeredChat = existingChatId ?? String(chatId);
+      if (botToken && String(chatId) === registeredChat) {
+        try {
+          const r = await fetch(`https://api.telegram.org/bot${botToken}/setMessageReaction`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              chat_id: chatId,
+              message_id: message.message_id,
+              reaction: [{ type: "emoji", emoji: "👍" }],
+            }),
+          });
+          if (!r.ok) {
+            console.warn(JSON.stringify({
+              where: "webhook.receiptReaction", status: r.status,
+              body: (await r.text().catch(() => "")).slice(0, 150),
+            }));
+          }
+        } catch (e) {
+          console.error(JSON.stringify({ where: "webhook.receiptReaction", error: String(e) }));
+        }
       }
 
       let acted = false;
