@@ -147,14 +147,31 @@ function shouldSend(eventType: string, payload: EventPayload): boolean {
 // Telegram alert/hour, while the FIRST incident of any distinct kind still fires
 // immediately (first-of-kind always surfaces). This preserves migration 118's
 // intent — real P0 secret events must not be buried — while killing the flood.
+// Small synchronous non-crypto string hash (djb2 → 8 hex chars). Used only to
+// bound rate-limit KV keys; not security-sensitive.
+function shortHash(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(16).padStart(8, "0");
+}
+
 function rateLimitFor(
   eventType: string,
   payload: EventPayload,
 ): { window: number; key: string } | null {
   if (eventType === "incident.opened") {
+    // kind falls back to symptom, which can be long free-form text (the emitter
+    // truncates symptom to 1500 chars) — and scope is free-form too. Workers KV
+    // keys are capped at 512 bytes, so hash the discriminator to keep the key
+    // bounded; an oversized key would make KV.get/put THROW and fail the alert
+    // before it is logged or sent (codex review 2026-07-05). Same (kind,scope) →
+    // same hash → coalesces; distinct kind → distinct hash → still fires.
     const kind = String(payload["kind"] ?? payload["symptom"] ?? "unknown");
     const scope = String(payload["scope"] ?? "");
-    return { window: 3600, key: `ratelimit:incident.opened:${kind}:${scope}` };
+    return {
+      window: 3600,
+      key: `ratelimit:incident.opened:${shortHash(`${kind}\x00${scope}`)}`,
+    };
   }
   const window = RATE_LIMIT_SECONDS[eventType];
   return window ? { window, key: `ratelimit:${eventType}` } : null;
