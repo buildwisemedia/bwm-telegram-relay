@@ -765,6 +765,14 @@ async function handleEvent(
   // for the full window (codex review 2026-07-05).
   const activeRateLimitKey = rl ? rl.key : null;
   if (rl) {
+    // NOTE (known limitation): this is a best-effort check-then-set on Workers KV,
+    // which has no atomic compare-and-set. A truly concurrent same-key burst could
+    // all read no-stamp before any put lands and each send once. We accept that:
+    // the real storms this coalesces (file-watcher / startup) arrive SEQUENTIALLY
+    // (~1-2/sec via the DB fanout), so the race window (KV get→put latency) is far
+    // smaller than the gap between events, and worst case is a small burst instead
+    // of an unbounded flood. An atomic claim would require a Durable Object —
+    // disproportionate for a best-effort alert throttle (codex review 2026-07-05).
     const rateLimitWindow = rl.window;
     const rateLimitKey = rl.key;
     const lastFiredStr = await env.BWM_TELEGRAM_KV.get(rateLimitKey);
