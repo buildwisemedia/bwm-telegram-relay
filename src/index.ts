@@ -164,13 +164,19 @@ function rateLimitFor(
     // truncates symptom to 1500 chars) — and scope is free-form too. Workers KV
     // keys are capped at 512 bytes, so hash the discriminator to keep the key
     // bounded; an oversized key would make KV.get/put THROW and fail the alert
-    // before it is logged or sent (codex review 2026-07-05). Same (kind,scope) →
-    // same hash → coalesces; distinct kind → distinct hash → still fires.
+    // before it is logged or sent (codex review 2026-07-05). Same discriminator →
+    // same hash → coalesces; a distinct one → distinct hash → still fires.
+    //
+    // SEVERITY is part of the key so a P0 escalation of a kind that already fired
+    // at a lower severity within the window is NOT buried — it hashes to a
+    // different key and surfaces immediately. The same-severity storm (e.g. the
+    // all-P0 secret-write flood) still coalesces to one alert/window.
+    const severity = String(payload["severity"] ?? "");
     const kind = String(payload["kind"] ?? payload["symptom"] ?? "unknown");
     const scope = String(payload["scope"] ?? "");
     return {
       window: 3600,
-      key: `ratelimit:incident.opened:${shortHash(`${kind}\x00${scope}`)}`,
+      key: `ratelimit:incident.opened:${shortHash(`${severity}\x00${kind}\x00${scope}`)}`,
     };
   }
   const window = RATE_LIMIT_SECONDS[eventType];
@@ -734,6 +740,11 @@ async function handleEvent(
   // Key/window resolved per-event (incident.opened keys by kind+scope) — see
   // rateLimitFor().
   const rl = rateLimitFor(eventType, payload);
+  // Hoisted so the delivery-failure paths below can CLEAR the window: the stamp
+  // is written before send (to gate concurrent calls), so if nothing is actually
+  // delivered we must release it or the next same-key event is wrongly suppressed
+  // for the full window (codex review 2026-07-05).
+  const activeRateLimitKey = rl ? rl.key : null;
   if (rl) {
     const rateLimitWindow = rl.window;
     const rateLimitKey = rl.key;
@@ -772,7 +783,9 @@ async function handleEvent(
   // Get chat_id
   const chatId = await env.BWM_TELEGRAM_KV.get(KV_CHAT_ID_KEY);
   if (!chatId) {
-    // No chat registered yet — log but return 200 to not block projector
+    // No chat registered yet — log but return 200 to not block projector.
+    // Release the rate-limit window: nothing was delivered.
+    if (activeRateLimitKey) await env.BWM_TELEGRAM_KV.delete(activeRateLimitKey);
     console.warn(JSON.stringify({ where: "handleEvent", warn: "no chat_id captured yet", event_type: eventType }));
     await createOutboundLog(env, {
       sourceRoute: "/event",
@@ -808,6 +821,9 @@ async function handleEvent(
         botToken = await mintToken(env, "TELEGRAM_BOT_TOKEN");
       } catch (e) {
         console.error(JSON.stringify({ where: "handleEvent.mintToken", error: String(e) }));
+        // Nothing delivered — release the rate-limit window so the next same-key
+        // incident isn't suppressed behind a send that never happened.
+        if (activeRateLimitKey) await env.BWM_TELEGRAM_KV.delete(activeRateLimitKey);
         await updateOutboundLog(env, outboundId, {
           status: "failed",
           error: `token_mint_failed: ${String(e).slice(0, 200)}`,
@@ -823,6 +839,9 @@ async function handleEvent(
         const plainResult = await sendTelegramMessage(botToken, chatId, `[${eventType}] ${JSON.stringify(payload).slice(0, 400)}`);
         if (!plainResult.ok) {
           console.error(JSON.stringify({ where: "handleEvent.send.plain", error: plainResult.error }));
+          // Both MarkdownV2 and plain sends failed — nothing delivered, so
+          // release the rate-limit window.
+          if (activeRateLimitKey) await env.BWM_TELEGRAM_KV.delete(activeRateLimitKey);
           await updateOutboundLog(env, outboundId, {
             status: "failed",
             error: plainResult.error ?? result.error ?? "telegram_send_failed",
