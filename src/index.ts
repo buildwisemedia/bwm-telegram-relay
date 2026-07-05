@@ -137,6 +137,29 @@ function shouldSend(eventType: string, payload: EventPayload): boolean {
   return false;
 }
 
+// Resolve the Telegram-surface rate-limit for an event: a { window, key } or null.
+// The event row is ALWAYS persisted upstream (Brain/operational_events has the
+// record); this ONLY throttles the Telegram surface so a storm stays scannable.
+//
+// incident.opened is keyed by (kind, scope) with a 1h window rather than by bare
+// event_type: a repeated security-lane storm (e.g. a watcher emitting one
+// unauthorized-secret-write per file — 2026-07-05, 3000+/day) coalesces to ONE
+// Telegram alert/hour, while the FIRST incident of any distinct kind still fires
+// immediately (first-of-kind always surfaces). This preserves migration 118's
+// intent — real P0 secret events must not be buried — while killing the flood.
+function rateLimitFor(
+  eventType: string,
+  payload: EventPayload,
+): { window: number; key: string } | null {
+  if (eventType === "incident.opened") {
+    const kind = String(payload["kind"] ?? payload["symptom"] ?? "unknown");
+    const scope = String(payload["scope"] ?? "");
+    return { window: 3600, key: `ratelimit:incident.opened:${kind}:${scope}` };
+  }
+  const window = RATE_LIMIT_SECONDS[eventType];
+  return window ? { window, key: `ratelimit:${eventType}` } : null;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Message formatting (Markdown V2)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -688,13 +711,15 @@ async function handleEvent(
     }
   }
 
-  // Per-event-type rate limit (separate from per-event_id dedup).
-  // Suppresses repeats of high-volume event types so the channel stays scannable.
-  // Suppressed events still INSERT into operational_events; only the Telegram
-  // surface is rate-limited.
-  const rateLimitWindow = RATE_LIMIT_SECONDS[eventType];
-  if (rateLimitWindow) {
-    const rateLimitKey = `ratelimit:${eventType}`;
+  // Rate limit (separate from per-event_id dedup). Suppresses repeats of
+  // high-volume events so the channel stays scannable. Suppressed events still
+  // INSERT into operational_events; only the Telegram surface is rate-limited.
+  // Key/window resolved per-event (incident.opened keys by kind+scope) — see
+  // rateLimitFor().
+  const rl = rateLimitFor(eventType, payload);
+  if (rl) {
+    const rateLimitWindow = rl.window;
+    const rateLimitKey = rl.key;
     const lastFiredStr = await env.BWM_TELEGRAM_KV.get(rateLimitKey);
     if (lastFiredStr) {
       const elapsedMs = Date.now() - parseInt(lastFiredStr, 10);
