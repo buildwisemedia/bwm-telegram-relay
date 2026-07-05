@@ -147,12 +147,25 @@ function shouldSend(eventType: string, payload: EventPayload): boolean {
 // Telegram alert/hour, while the FIRST incident of any distinct kind still fires
 // immediately (first-of-kind always surfaces). This preserves migration 118's
 // intent — real P0 secret events must not be buried — while killing the flood.
-// Small synchronous non-crypto string hash (djb2 → 8 hex chars). Used only to
-// bound rate-limit KV keys; not security-sensitive.
+// Synchronous non-crypto 64-bit string digest (djb2 ⊕ sdbm → 16 hex chars). Used
+// only to bound rate-limit KV keys to a fixed, UTF-8-safe length. 64 bits keeps
+// accidental collisions negligible at incident volume (a 32-bit hash collides
+// around ~77k keys); a collision would put two distinct incidents in one bucket
+// and suppress the later one. Two independent hashes so a collision needs both to
+// collide at once. Not security-grade — incident emitters are internal/authed —
+// but wide enough that a same-bucket suppression won't happen by accident.
 function shortHash(s: string): string {
-  let h = 5381;
-  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
-  return (h >>> 0).toString(16).padStart(8, "0");
+  let h1 = 5381;
+  let h2 = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = ((h1 << 5) + h1 + c) | 0; // djb2
+    h2 = (c + (h2 << 6) + (h2 << 16) - h2) | 0; // sdbm
+  }
+  return (
+    (h1 >>> 0).toString(16).padStart(8, "0") +
+    (h2 >>> 0).toString(16).padStart(8, "0")
+  );
 }
 
 function rateLimitFor(
