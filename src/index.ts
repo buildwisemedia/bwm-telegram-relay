@@ -158,6 +158,7 @@ function shortHash(s: string): string {
 function rateLimitFor(
   eventType: string,
   payload: EventPayload,
+  clientId?: string | null,
 ): { window: number; key: string } | null {
   if (eventType === "incident.opened") {
     // kind falls back to symptom, which can be long free-form text (the emitter
@@ -171,12 +172,17 @@ function rateLimitFor(
     // at a lower severity within the window is NOT buried — it hashes to a
     // different key and surfaces immediately. The same-severity storm (e.g. the
     // all-P0 secret-write flood) still coalesces to one alert/window.
+    // client is part of the key so a per-client incident is never suppressed by a
+    // matching incident from a different client (client_id is a TOP-LEVEL event
+    // field; also accept a payload copy). null/absent client = the workspace lane
+    // (e.g. the secret-write storm), which coalesces among itself.
+    const client = String(clientId ?? payload["client_id"] ?? "");
     const severity = String(payload["severity"] ?? "");
     const kind = String(payload["kind"] ?? payload["symptom"] ?? "unknown");
     const scope = String(payload["scope"] ?? "");
     return {
       window: 3600,
-      key: `ratelimit:incident.opened:${shortHash(`${severity}\x00${kind}\x00${scope}`)}`,
+      key: `ratelimit:incident.opened:${shortHash(`${client}\x00${severity}\x00${kind}\x00${scope}`)}`,
     };
   }
   const window = RATE_LIMIT_SECONDS[eventType];
@@ -739,7 +745,7 @@ async function handleEvent(
   // INSERT into operational_events; only the Telegram surface is rate-limited.
   // Key/window resolved per-event (incident.opened keys by kind+scope) — see
   // rateLimitFor().
-  const rl = rateLimitFor(eventType, payload);
+  const rl = rateLimitFor(eventType, payload, event.client_id);
   // Hoisted so the delivery-failure paths below can CLEAR the window: the stamp
   // is written before send (to gate concurrent calls), so if nothing is actually
   // delivered we must release it or the next same-key event is wrongly suppressed
