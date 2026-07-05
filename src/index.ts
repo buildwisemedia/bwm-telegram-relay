@@ -816,63 +816,72 @@ async function handleEvent(
   // Mint token and send — fire-and-forget via waitUntil to not block response
   ctx.waitUntil(
     (async () => {
-      let botToken: string;
+      // `delivered` gates the rate-limit window: it was stamped BEFORE delivery
+      // (to gate concurrent calls), so unless a Telegram message actually went
+      // out we must release it in `finally` — this covers non-ok returns AND
+      // thrown fetch/network failures on mint or either send (codex review
+      // 2026-07-05). If it stayed set, the next same-key incident would be
+      // suppressed for the full window with nothing delivered.
+      let delivered = false;
       try {
-        botToken = await mintToken(env, "TELEGRAM_BOT_TOKEN");
-      } catch (e) {
-        console.error(JSON.stringify({ where: "handleEvent.mintToken", error: String(e) }));
-        // Nothing delivered — release the rate-limit window so the next same-key
-        // incident isn't suppressed behind a send that never happened.
-        if (activeRateLimitKey) await env.BWM_TELEGRAM_KV.delete(activeRateLimitKey);
-        await updateOutboundLog(env, outboundId, {
-          status: "failed",
-          error: `token_mint_failed: ${String(e).slice(0, 200)}`,
-        });
-        return;
-      }
-
-      const result = await sendTelegramMessage(botToken, chatId, text, "MarkdownV2");
-
-      if (!result.ok) {
-        // If MarkdownV2 formatting caused a parse error, retry as plain text
-        console.warn(JSON.stringify({ where: "handleEvent.send", warn: "MarkdownV2 failed, retrying plain", error: result.error }));
-        const plainResult = await sendTelegramMessage(botToken, chatId, `[${eventType}] ${JSON.stringify(payload).slice(0, 400)}`);
-        if (!plainResult.ok) {
-          console.error(JSON.stringify({ where: "handleEvent.send.plain", error: plainResult.error }));
-          // Both MarkdownV2 and plain sends failed — nothing delivered, so
-          // release the rate-limit window.
-          if (activeRateLimitKey) await env.BWM_TELEGRAM_KV.delete(activeRateLimitKey);
+        let botToken: string;
+        try {
+          botToken = await mintToken(env, "TELEGRAM_BOT_TOKEN");
+        } catch (e) {
+          console.error(JSON.stringify({ where: "handleEvent.mintToken", error: String(e) }));
           await updateOutboundLog(env, outboundId, {
             status: "failed",
-            error: plainResult.error ?? result.error ?? "telegram_send_failed",
-            telegramResponse: { markdown: result.response, plain: plainResult.response },
-            metadata: { fallback: "plain_failed" },
+            error: `token_mint_failed: ${String(e).slice(0, 200)}`,
           });
           return;
         }
-        await updateOutboundLog(env, outboundId, {
-          status: "sent",
-          telegramMessageId: plainResult.telegramMessageId,
-          telegramResponse: plainResult.response,
-          error: null,
-          metadata: { fallback: "plain" },
-        });
-      } else {
-        await updateOutboundLog(env, outboundId, {
-          status: "sent",
-          telegramMessageId: result.telegramMessageId,
-          telegramResponse: result.response,
-          error: null,
-        });
-      }
 
-      // Mark as sent in dedup store
-      if (eventId) {
-        await env.BWM_TELEGRAM_KV.put(`${KV_DEDUP_PREFIX}${eventId}`, "1", {
-          expirationTtl: DEDUP_TTL_SECONDS,
-        });
+        const result = await sendTelegramMessage(botToken, chatId, text, "MarkdownV2");
+
+        if (!result.ok) {
+          // If MarkdownV2 formatting caused a parse error, retry as plain text
+          console.warn(JSON.stringify({ where: "handleEvent.send", warn: "MarkdownV2 failed, retrying plain", error: result.error }));
+          const plainResult = await sendTelegramMessage(botToken, chatId, `[${eventType}] ${JSON.stringify(payload).slice(0, 400)}`);
+          if (!plainResult.ok) {
+            console.error(JSON.stringify({ where: "handleEvent.send.plain", error: plainResult.error }));
+            await updateOutboundLog(env, outboundId, {
+              status: "failed",
+              error: plainResult.error ?? result.error ?? "telegram_send_failed",
+              telegramResponse: { markdown: result.response, plain: plainResult.response },
+              metadata: { fallback: "plain_failed" },
+            });
+            return;
+          }
+          await updateOutboundLog(env, outboundId, {
+            status: "sent",
+            telegramMessageId: plainResult.telegramMessageId,
+            telegramResponse: plainResult.response,
+            error: null,
+            metadata: { fallback: "plain" },
+          });
+          delivered = true;
+        } else {
+          await updateOutboundLog(env, outboundId, {
+            status: "sent",
+            telegramMessageId: result.telegramMessageId,
+            telegramResponse: result.response,
+            error: null,
+          });
+          delivered = true;
+        }
+
+        // Mark as sent in dedup store
+        if (eventId) {
+          await env.BWM_TELEGRAM_KV.put(`${KV_DEDUP_PREFIX}${eventId}`, "1", {
+            expirationTtl: DEDUP_TTL_SECONDS,
+          });
+        }
+        await env.BWM_TELEGRAM_KV.put(KV_LAST_SEND_AT_KEY, new Date().toISOString());
+      } finally {
+        if (!delivered && activeRateLimitKey) {
+          await env.BWM_TELEGRAM_KV.delete(activeRateLimitKey);
+        }
       }
-      await env.BWM_TELEGRAM_KV.put(KV_LAST_SEND_AT_KEY, new Date().toISOString());
     })(),
   );
 
