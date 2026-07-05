@@ -137,6 +137,71 @@ function shouldSend(eventType: string, payload: EventPayload): boolean {
   return false;
 }
 
+// Resolve the Telegram-surface rate-limit for an event: a { window, key } or null.
+// The event row is ALWAYS persisted upstream (Brain/operational_events has the
+// record); this ONLY throttles the Telegram surface so a storm stays scannable.
+//
+// incident.opened is keyed by (kind, scope) with a 1h window rather than by bare
+// event_type: a repeated security-lane storm (e.g. a watcher emitting one
+// unauthorized-secret-write per file — 2026-07-05, 3000+/day) coalesces to ONE
+// Telegram alert/hour, while the FIRST incident of any distinct kind still fires
+// immediately (first-of-kind always surfaces). This preserves migration 118's
+// intent — real P0 secret events must not be buried — while killing the flood.
+// Synchronous non-crypto 64-bit string digest (djb2 ⊕ sdbm → 16 hex chars). Used
+// only to bound rate-limit KV keys to a fixed, UTF-8-safe length. 64 bits keeps
+// accidental collisions negligible at incident volume (a 32-bit hash collides
+// around ~77k keys); a collision would put two distinct incidents in one bucket
+// and suppress the later one. Two independent hashes so a collision needs both to
+// collide at once. Not security-grade — incident emitters are internal/authed —
+// but wide enough that a same-bucket suppression won't happen by accident.
+function shortHash(s: string): string {
+  let h1 = 5381;
+  let h2 = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = ((h1 << 5) + h1 + c) | 0; // djb2
+    h2 = (c + (h2 << 6) + (h2 << 16) - h2) | 0; // sdbm
+  }
+  return (
+    (h1 >>> 0).toString(16).padStart(8, "0") +
+    (h2 >>> 0).toString(16).padStart(8, "0")
+  );
+}
+
+function rateLimitFor(
+  eventType: string,
+  payload: EventPayload,
+  clientId?: string | null,
+): { window: number; key: string } | null {
+  if (eventType === "incident.opened") {
+    // kind falls back to symptom, which can be long free-form text (the emitter
+    // truncates symptom to 1500 chars) — and scope is free-form too. Workers KV
+    // keys are capped at 512 bytes, so hash the discriminator to keep the key
+    // bounded; an oversized key would make KV.get/put THROW and fail the alert
+    // before it is logged or sent (codex review 2026-07-05). Same discriminator →
+    // same hash → coalesces; a distinct one → distinct hash → still fires.
+    //
+    // SEVERITY is part of the key so a P0 escalation of a kind that already fired
+    // at a lower severity within the window is NOT buried — it hashes to a
+    // different key and surfaces immediately. The same-severity storm (e.g. the
+    // all-P0 secret-write flood) still coalesces to one alert/window.
+    // client is part of the key so a per-client incident is never suppressed by a
+    // matching incident from a different client (client_id is a TOP-LEVEL event
+    // field; also accept a payload copy). null/absent client = the workspace lane
+    // (e.g. the secret-write storm), which coalesces among itself.
+    const client = String(clientId ?? payload["client_id"] ?? "");
+    const severity = String(payload["severity"] ?? "");
+    const kind = String(payload["kind"] ?? payload["symptom"] ?? "unknown");
+    const scope = String(payload["scope"] ?? "");
+    return {
+      window: 3600,
+      key: `ratelimit:incident.opened:${shortHash(`${client}\x00${severity}\x00${kind}\x00${scope}`)}`,
+    };
+  }
+  const window = RATE_LIMIT_SECONDS[eventType];
+  return window ? { window, key: `ratelimit:${eventType}` } : null;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Message formatting (Markdown V2)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -688,13 +753,28 @@ async function handleEvent(
     }
   }
 
-  // Per-event-type rate limit (separate from per-event_id dedup).
-  // Suppresses repeats of high-volume event types so the channel stays scannable.
-  // Suppressed events still INSERT into operational_events; only the Telegram
-  // surface is rate-limited.
-  const rateLimitWindow = RATE_LIMIT_SECONDS[eventType];
-  if (rateLimitWindow) {
-    const rateLimitKey = `ratelimit:${eventType}`;
+  // Rate limit (separate from per-event_id dedup). Suppresses repeats of
+  // high-volume events so the channel stays scannable. Suppressed events still
+  // INSERT into operational_events; only the Telegram surface is rate-limited.
+  // Key/window resolved per-event (incident.opened keys by kind+scope) — see
+  // rateLimitFor().
+  const rl = rateLimitFor(eventType, payload, event.client_id);
+  // Hoisted so the delivery-failure paths below can CLEAR the window: the stamp
+  // is written before send (to gate concurrent calls), so if nothing is actually
+  // delivered we must release it or the next same-key event is wrongly suppressed
+  // for the full window (codex review 2026-07-05).
+  const activeRateLimitKey = rl ? rl.key : null;
+  if (rl) {
+    // NOTE (known limitation): this is a best-effort check-then-set on Workers KV,
+    // which has no atomic compare-and-set. A truly concurrent same-key burst could
+    // all read no-stamp before any put lands and each send once. We accept that:
+    // the real storms this coalesces (file-watcher / startup) arrive SEQUENTIALLY
+    // (~1-2/sec via the DB fanout), so the race window (KV get→put latency) is far
+    // smaller than the gap between events, and worst case is a small burst instead
+    // of an unbounded flood. An atomic claim would require a Durable Object —
+    // disproportionate for a best-effort alert throttle (codex review 2026-07-05).
+    const rateLimitWindow = rl.window;
+    const rateLimitKey = rl.key;
     const lastFiredStr = await env.BWM_TELEGRAM_KV.get(rateLimitKey);
     if (lastFiredStr) {
       const elapsedMs = Date.now() - parseInt(lastFiredStr, 10);
@@ -730,7 +810,9 @@ async function handleEvent(
   // Get chat_id
   const chatId = await env.BWM_TELEGRAM_KV.get(KV_CHAT_ID_KEY);
   if (!chatId) {
-    // No chat registered yet — log but return 200 to not block projector
+    // No chat registered yet — log but return 200 to not block projector.
+    // Release the rate-limit window: nothing was delivered.
+    if (activeRateLimitKey) await env.BWM_TELEGRAM_KV.delete(activeRateLimitKey);
     console.warn(JSON.stringify({ where: "handleEvent", warn: "no chat_id captured yet", event_type: eventType }));
     await createOutboundLog(env, {
       sourceRoute: "/event",
@@ -761,57 +843,72 @@ async function handleEvent(
   // Mint token and send — fire-and-forget via waitUntil to not block response
   ctx.waitUntil(
     (async () => {
-      let botToken: string;
+      // `delivered` gates the rate-limit window: it was stamped BEFORE delivery
+      // (to gate concurrent calls), so unless a Telegram message actually went
+      // out we must release it in `finally` — this covers non-ok returns AND
+      // thrown fetch/network failures on mint or either send (codex review
+      // 2026-07-05). If it stayed set, the next same-key incident would be
+      // suppressed for the full window with nothing delivered.
+      let delivered = false;
       try {
-        botToken = await mintToken(env, "TELEGRAM_BOT_TOKEN");
-      } catch (e) {
-        console.error(JSON.stringify({ where: "handleEvent.mintToken", error: String(e) }));
-        await updateOutboundLog(env, outboundId, {
-          status: "failed",
-          error: `token_mint_failed: ${String(e).slice(0, 200)}`,
-        });
-        return;
-      }
-
-      const result = await sendTelegramMessage(botToken, chatId, text, "MarkdownV2");
-
-      if (!result.ok) {
-        // If MarkdownV2 formatting caused a parse error, retry as plain text
-        console.warn(JSON.stringify({ where: "handleEvent.send", warn: "MarkdownV2 failed, retrying plain", error: result.error }));
-        const plainResult = await sendTelegramMessage(botToken, chatId, `[${eventType}] ${JSON.stringify(payload).slice(0, 400)}`);
-        if (!plainResult.ok) {
-          console.error(JSON.stringify({ where: "handleEvent.send.plain", error: plainResult.error }));
+        let botToken: string;
+        try {
+          botToken = await mintToken(env, "TELEGRAM_BOT_TOKEN");
+        } catch (e) {
+          console.error(JSON.stringify({ where: "handleEvent.mintToken", error: String(e) }));
           await updateOutboundLog(env, outboundId, {
             status: "failed",
-            error: plainResult.error ?? result.error ?? "telegram_send_failed",
-            telegramResponse: { markdown: result.response, plain: plainResult.response },
-            metadata: { fallback: "plain_failed" },
+            error: `token_mint_failed: ${String(e).slice(0, 200)}`,
           });
           return;
         }
-        await updateOutboundLog(env, outboundId, {
-          status: "sent",
-          telegramMessageId: plainResult.telegramMessageId,
-          telegramResponse: plainResult.response,
-          error: null,
-          metadata: { fallback: "plain" },
-        });
-      } else {
-        await updateOutboundLog(env, outboundId, {
-          status: "sent",
-          telegramMessageId: result.telegramMessageId,
-          telegramResponse: result.response,
-          error: null,
-        });
-      }
 
-      // Mark as sent in dedup store
-      if (eventId) {
-        await env.BWM_TELEGRAM_KV.put(`${KV_DEDUP_PREFIX}${eventId}`, "1", {
-          expirationTtl: DEDUP_TTL_SECONDS,
-        });
+        const result = await sendTelegramMessage(botToken, chatId, text, "MarkdownV2");
+
+        if (!result.ok) {
+          // If MarkdownV2 formatting caused a parse error, retry as plain text
+          console.warn(JSON.stringify({ where: "handleEvent.send", warn: "MarkdownV2 failed, retrying plain", error: result.error }));
+          const plainResult = await sendTelegramMessage(botToken, chatId, `[${eventType}] ${JSON.stringify(payload).slice(0, 400)}`);
+          if (!plainResult.ok) {
+            console.error(JSON.stringify({ where: "handleEvent.send.plain", error: plainResult.error }));
+            await updateOutboundLog(env, outboundId, {
+              status: "failed",
+              error: plainResult.error ?? result.error ?? "telegram_send_failed",
+              telegramResponse: { markdown: result.response, plain: plainResult.response },
+              metadata: { fallback: "plain_failed" },
+            });
+            return;
+          }
+          await updateOutboundLog(env, outboundId, {
+            status: "sent",
+            telegramMessageId: plainResult.telegramMessageId,
+            telegramResponse: plainResult.response,
+            error: null,
+            metadata: { fallback: "plain" },
+          });
+          delivered = true;
+        } else {
+          await updateOutboundLog(env, outboundId, {
+            status: "sent",
+            telegramMessageId: result.telegramMessageId,
+            telegramResponse: result.response,
+            error: null,
+          });
+          delivered = true;
+        }
+
+        // Mark as sent in dedup store
+        if (eventId) {
+          await env.BWM_TELEGRAM_KV.put(`${KV_DEDUP_PREFIX}${eventId}`, "1", {
+            expirationTtl: DEDUP_TTL_SECONDS,
+          });
+        }
+        await env.BWM_TELEGRAM_KV.put(KV_LAST_SEND_AT_KEY, new Date().toISOString());
+      } finally {
+        if (!delivered && activeRateLimitKey) {
+          await env.BWM_TELEGRAM_KV.delete(activeRateLimitKey);
+        }
       }
-      await env.BWM_TELEGRAM_KV.put(KV_LAST_SEND_AT_KEY, new Date().toISOString());
     })(),
   );
 
