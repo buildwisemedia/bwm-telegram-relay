@@ -3072,6 +3072,17 @@ async function emitWireTaskResolved(
       return;
     }
     id = rows[0]?.id ?? null;
+    if (id) {
+      // Fallback is for the TTL-expiry case ONLY. A follow-up reply to an
+      // already-ANSWERED ref also lands here (registry gone) — without this
+      // status check every follow-up would emit a duplicate task.resolved
+      // and pollute completion analytics (codex r4).
+      const mirror = await fetchRows<{ status: string }>(
+        env,
+        `command_tasks?select=status&source_event_id=eq.${encodeURIComponent(id)}&limit=1`,
+      );
+      if (mirror === null || mirror[0]?.status !== "queued") return;
+    }
   }
   if (!id) return; // never went live — no mirror to close
   const ok = await emitOperationalEvent(env, "task.resolved", {
@@ -3566,9 +3577,13 @@ async function expireOrphanedWireMirrors(env: Env): Promise<void> {
       const created = Date.parse(row.created_at);
       if (!Number.isFinite(created) || created > cutoffMs) continue;
       if (!row.source_event_id) continue;
+      // outcome=cancelled, not done: the decision was never answered — done
+      // would count it as finished work in outcome analytics (codex r4). The
+      // fanout maps any non-blocked outcome to status=done, which still
+      // closes the board row.
       await emitOperationalEvent(env, "task.resolved", {
         task_id: row.source_event_id,
-        outcome: "done",
+        outcome: "cancelled",
         resolution: `expired unanswered — wire registry TTL (7d); ${m[1]} is no longer answerable by ref`,
         source: "bwm-telegram-relay wire-mirror-expiry",
       }, "daemon:bwm-telegram-relay");
@@ -3632,6 +3647,15 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
     `ea_drafts?select=gmail_thread_id&sent_message_id=is.null&resolved_at=is.null` +
     `&created_at=gte.${encodeURIComponent(since7d)}&limit=50`,
   );
+  // Overdue waiting-on rows (Sarah's "you owe a reply" tracker) — part of her
+  // retired morning brief's needs-you surface; without it an owed reply that
+  // is neither a recent escalation nor a handoff would vanish from Telegram
+  // (codex r4 P1). Same filter as ea/waiting_on.fetch_overdue().
+  const overdue = await fetchRows<{ sender_email: string | null; subject: string | null; direction: string | null; due_at: string | null }>(
+    env,
+    `ea_waiting_on?select=sender_email,subject,direction,due_at&resolved_at=is.null` +
+    `&due_at=lt.${encodeURIComponent(new Date().toISOString())}&order=due_at.asc&limit=8`,
+  );
   // one-wire mirrors are excluded IN the query — a JS filter after limit=50
   // could starve the plan once enough mirrors accumulate (codex r2). The
   // or-clause keeps NULL created_by rows (neq alone drops SQL NULLs).
@@ -3674,7 +3698,7 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
   // "Clear" is claimed ONLY when BOTH sources loaded and are empty — a
   // one-source failure renders what we have and says so (codex r2 P1;
   // verify-before-claiming).
-  if (needsThreads === null && escalations === null) {
+  if (needsThreads === null && escalations === null && overdue === null) {
     lines.push("<b>Inbox needs you:</b> (data unavailable)");
   } else {
     const inboxLines: string[] = [];
@@ -3685,16 +3709,22 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
     for (const e of escalations ?? []) {
       inboxLines.push(`• ${escapeHtml((e.sender_email ?? "unknown").slice(0, 40))} — ${escapeHtml((e.sarah_reason ?? e.scope ?? "handoff").slice(0, 60))} <i>(with Bob)</i>`);
     }
-    const partial = needsThreads === null || escalations === null;
+    for (const w of overdue ?? []) {
+      const label = w.direction === "owed_by_us" ? "you owe a reply" : "awaiting their reply";
+      const since = String(w.due_at ?? "").slice(0, 10);
+      inboxLines.push(`• ${escapeHtml((w.sender_email ?? "unknown").slice(0, 40))} — ${escapeHtml((w.subject ?? "(no subject)").slice(0, 60))} <i>(${label}${since ? ` since ${escapeHtml(since)}` : ""})</i>`);
+    }
+    const failedSources = [needsThreads, escalations, overdue].filter((s) => s === null).length;
+    const partial = failedSources > 0;
     if (inboxLines.length === 0) {
       lines.push(partial
-        ? "<b>Inbox needs you:</b> (one source unavailable this run — nothing visible in the other)"
+        ? `<b>Inbox needs you:</b> (${failedSources} source${failedSources === 1 ? "" : "s"} unavailable this run — nothing visible in the rest)`
         : "<b>Inbox needs you:</b> nothing — Sarah's lanes are clear.");
     } else {
       lines.push(`<b>Inbox needs you (${inboxLines.length}${partial ? "+?" : ""}):</b>`);
-      lines.push(...inboxLines.slice(0, 6));
-      if (inboxLines.length > 6) lines.push(`…+${inboxLines.length - 6} more`);
-      if (partial) lines.push("<i>(one inbox source unavailable this run)</i>");
+      lines.push(...inboxLines.slice(0, 8));
+      if (inboxLines.length > 8) lines.push(`…+${inboxLines.length - 8} more`);
+      if (partial) lines.push(`<i>(${failedSources} inbox source${failedSources === 1 ? "" : "s"} unavailable this run)</i>`);
     }
   }
   // Drafts render independently of the inbox sources (codex r3): a working
@@ -3728,23 +3758,27 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
   lines.push(...waitingOnYouLines(openItems));
   if (redelivered > 0) lines.push(`<i>${redelivered} deferred decision${redelivered === 1 ? "" : "s"} just redelivered above.</i>`);
 
-  // Overnight (Sarah's log, data-derived from her real dispositions)
+  // Overnight (Sarah's log, data-derived from her real dispositions).
+  // "Handled" counts only her AUTONOMOUS filings (archive/label/spam — the
+  // same set her retired brief called handled); escalate/halt are needs-you
+  // items this digest lists above, and counting them as handled would claim
+  // work Robert still owes (codex r4).
   if (overnight === null) {
     lines.push("<b>Overnight:</b> (data unavailable)");
   } else {
+    const HANDLED_ACTIONS = new Set(["archive", "label", "spam"]);
     const counts = new Map<string, number>();
     for (const r of overnight) {
       const a = r.action_taken ?? "";
-      if (!a) continue;
+      if (!HANDLED_ACTIONS.has(a)) continue;
       counts.set(a, (counts.get(a) ?? 0) + 1);
     }
     const total = [...counts.values()].reduce((a, b) => a + b, 0);
     if (total === 0) {
-      lines.push("<b>Overnight:</b> quiet — nothing needed handling.");
+      lines.push("<b>Overnight:</b> quiet — nothing needed auto-handling.");
     } else {
       const breakdown = [...counts.entries()]
         .sort((a, b) => b[1] - a[1])
-        .slice(0, 4)
         .map(([k, v]) => `${v} ${k}`)
         .join(" · ");
       lines.push(`<b>Overnight:</b> Sarah handled ${total} (${escapeHtml(breakdown)}) — full brief on file.`);
