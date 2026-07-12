@@ -3549,8 +3549,13 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
     }
   }
 
-  // Inbox needs-you (Sarah's escalate/halt lanes + open Sarah→Bob handoffs)
-  if (needsThreads === null && escalations === null) {
+  // Inbox needs-you (Sarah's escalate/halt lanes + open Sarah→Bob handoffs).
+  // A HALT that went out live as a CALL can also appear here via its
+  // ea_escalations row — accepted double-render: halts are the rare
+  // highest-stakes lane and the two lines carry different affordances
+  // (thread context here, answer-by-ref under Waiting on you).
+  const inboxOk = !(needsThreads === null && escalations === null);
+  if (!inboxOk) {
     lines.push("<b>Inbox needs you:</b> (data unavailable)");
   } else {
     const inboxLines: string[] = [];
@@ -3617,8 +3622,19 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
   }
 
   // Overnight notes (fyis queued since Day Done) — flush-on-render, same
-  // length-budget semantics as Day Done.
-  const qItems = await listDigestNotes(env);
+  // length-budget semantics as Day Done. Sarah-triage fyis are rendered BY
+  // PROXY through "Inbox needs you" (same threads, from ea_threads /
+  // ea_escalations) — listing them under notes too would double-render (EA
+  // codex review). They count as delivered with the digest — but only when
+  // the inbox section actually loaded; on a substrate failure they stay in
+  // the notes flow so nothing is flushed unseen.
+  const qItemsAll = await listDigestNotes(env);
+  const sarahNoteKeys = inboxOk
+    ? qItemsAll.filter((it) => String(it["origin"] ?? "") === "sarah-triage").map((it) => it.key)
+    : [];
+  const qItems = inboxOk
+    ? qItemsAll.filter((it) => String(it["origin"] ?? "") !== "sarah-triage")
+    : qItemsAll;
   const renderedNoteKeys = appendNotesSection(lines, qItems, "Overnight notes");
 
   if (BOARD_URL) lines.push(`<i>Detail: ${escapeHtml(BOARD_URL)}</i>`);
@@ -3651,8 +3667,9 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
     status: "sent", telegramMessageId: result.telegramMessageId, telegramResponse: result.response, error: null,
   });
   await env.BWM_TELEGRAM_KV.put(KV_LAST_SEND_AT_KEY, new Date().toISOString());
-  // Flush ONLY the notes that made it into the delivered message (codex r6).
-  await Promise.all(renderedNoteKeys.map((k) => env.BWM_TELEGRAM_KV.delete(k)));
+  // Flush the notes that made it into the delivered message (codex r6) plus
+  // the Sarah-triage notes the inbox section rendered by proxy.
+  await Promise.all([...renderedNoteKeys, ...sarahNoteKeys].map((k) => env.BWM_TELEGRAM_KV.delete(k)));
   return { ok: true, action: "sent", redelivered, items: qItems.length };
 }
 
