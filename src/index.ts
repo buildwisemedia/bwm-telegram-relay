@@ -1618,7 +1618,7 @@ async function processTelegramReply(
     `&select=origin_event_id,origin_event_type,metadata&order=queued_at.desc&limit=1`;
   let originEventId = "";
   let originEventType = "";
-  let wireMeta: { type?: string; ref?: string } | null = null;
+  let wireMeta: { type?: string; ref?: string; task_event_id?: string } | null = null;
 
   try {
     const resp = await fetch(lookupUrl, {
@@ -1644,7 +1644,7 @@ async function processTelegramReply(
     originEventId = data[0].origin_event_id ?? "";
     originEventType = data[0].origin_event_type ?? "";
     const metaWire = (data[0].metadata ?? {})["wire"];
-    if (metaWire && typeof metaWire === "object") wireMeta = metaWire as { type?: string; ref?: string };
+    if (metaWire && typeof metaWire === "object") wireMeta = metaWire as { type?: string; ref?: string; task_event_id?: string };
   } catch (err) {
     console.error("processTelegramReply: query threw", err);
     return false;
@@ -1787,8 +1787,8 @@ async function processTelegramReply(
     // reply to an already-answered decision is a follow-up, not a new decision.
     const openRawReply = await env.BWM_TELEGRAM_KV.get(`${KV_WIRE_OPEN_PREFIX}${wireMeta.ref}`);
     const stillOpen = openRawReply !== null;
-    let replyTaskEventId: string | null = null;
-    if (openRawReply) {
+    let replyTaskEventId: string | null = wireMeta.task_event_id ?? null;
+    if (openRawReply && !replyTaskEventId) {
       try {
         replyTaskEventId = (JSON.parse(openRawReply) as { task_event_id?: string | null }).task_event_id ?? null;
       } catch { /* pre-Phase-2 registry rows have no task mirror */ }
@@ -1796,9 +1796,10 @@ async function processTelegramReply(
     if (!stillOpen) {
       // The registry entry may have EXPIRED (7-day TTL) rather than been
       // answered — the mirrored command_tasks row outlives KV state (codex
-      // Phase 2). Best-effort close via the wire_ref fallback so a late
-      // answer doesn't strand an "Answer <ref>" task in Robert's queue.
-      await emitWireTaskResolved(env, null, wireMeta.ref, text.trim(), `telegram-reply-${inboundEventId}`);
+      // Phase 2). Best-effort close so a late answer doesn't strand an
+      // "Answer <ref>" task in Robert's queue. Prefer the exact id stamped on
+      // the outbound row over the wire_ref fallback (codex r6, ref reuse).
+      await emitWireTaskResolved(env, wireMeta.task_event_id ?? null, wireMeta.ref, text.trim(), `telegram-reply-${inboundEventId}`);
       try {
         await sendTelegramMessage(botToken, chatId,
           `ℹ️ ${wireMeta.ref} was already answered — treating this as a follow-up note.`,
@@ -2992,6 +2993,16 @@ async function dispatchWire(
       task_event_id: taskEventId,
       input, ts: new Date().toISOString(),
     }), { expirationTtl: WIRE_OPEN_TTL_SECONDS });
+    if (taskEventId) {
+      // Stamp the mirror's EXACT event id on the outbound row: a late reply
+      // (post-TTL) then resolves this task by identity, not by a
+      // newest-by-ref guess — 5-char refs can collide over the service
+      // lifetime (codex r6).
+      await updateOutboundLog(env, outboundId, {
+        status: "sent",
+        metadata: { wire: { type: input.type, ref, key: input.key ?? null, origin: input.origin ?? null, task_event_id: taskEventId } },
+      });
+    }
     // Budget slot was reserved before the send (see releaseBudget for the
     // failure path); nothing further to count here.
   }
@@ -3054,10 +3065,17 @@ async function emitWireTaskResolved(
 ): Promise<void> {
   let id = taskEventId ?? null;
   if (!id) {
+    // 14-day bound: refs carry 25 bits of randomness and can repeat over the
+    // service lifetime — an unbounded newest-by-ref lookup could resolve a
+    // NEWER unrelated task after a collision (codex r6). Within 14 days the
+    // collision odds are negligible and the window comfortably covers the
+    // 7-day registry TTL this fallback exists for.
+    const refSince = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
     const rows = await fetchRows<{ id: string }>(
       env,
       `operational_events?select=id&event_type=eq.task.queued` +
-      `&payload->>wire_ref=eq.${encodeURIComponent(ref)}&order=occurred_at.desc&limit=1`,
+      `&payload->>wire_ref=eq.${encodeURIComponent(ref)}` +
+      `&occurred_at=gte.${encodeURIComponent(refSince)}&order=occurred_at.desc&limit=1`,
     );
     if (rows === null) {
       // Lookup UNAVAILABLE ≠ no mirror (codex r2): park a ref-only retry —
@@ -3135,11 +3153,14 @@ async function retryPendingTaskResolves(env: Env): Promise<void> {
       if (!parsed.task_event_id) {
         // Ref-only marker: the mirror lookup was unavailable at decision time
         // (codex r2) — re-run it now. Still unavailable → keep the marker for
-        // the next sweep; genuinely no mirror → drop it.
+        // the next sweep; genuinely no mirror → drop it. Same 14-day bound as
+        // emitWireTaskResolved (codex r6, ref reuse).
+        const refSince = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
         const rows = await fetchRows<{ id: string }>(
           env,
           `operational_events?select=id&event_type=eq.task.queued` +
-          `&payload->>wire_ref=eq.${encodeURIComponent(ref)}&order=occurred_at.desc&limit=1`,
+          `&payload->>wire_ref=eq.${encodeURIComponent(ref)}` +
+          `&occurred_at=gte.${encodeURIComponent(refSince)}&order=occurred_at.desc&limit=1`,
         );
         if (rows === null) continue;
         if (!rows[0]?.id) {
@@ -3348,13 +3369,11 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
   // "nothing new" only when the query SUCCEEDED — an unreachable source renders
   // as unavailable, never as a false zero (codex r3; verify-before-claiming).
   lines.push(`<b>Shipped (last 24h):</b> ${!shippedOk ? "(data unavailable)" : shippedCount === 0 ? "nothing new" : `${shippedCount}${shippedTitles.length ? ` — ${escapeHtml(shippedTitles.join(" · "))}` : ""}`}`);
-  lines.push(...waitingOnYouLines(openItems));
   // Friday scorecard (Phase 2): the weekly comms SLO rides the Day Done digest
   // + lands as narrative kind=comms-slo so the trend is queryable. Fail-soft:
   // an unavailable substrate renders as unavailable, never a false zero.
-  // Appended BEFORE the length-budgeted notes so a busy Friday can't truncate
-  // it off the end — notes roll forward, the weekly scorecard doesn't
-  // (codex r5).
+  // Placed BEFORE the variable-length waiting list AND the length-budgeted
+  // notes: it is 3 fixed lines and must survive a busy Friday (codex r5+r6).
   if (etNow().weekday === "Fri") {
     const sc = await computeCommsScorecard(env);
     if (sc) {
@@ -3364,6 +3383,7 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
       lines.push("<b>Comms scorecard:</b> (data unavailable)");
     }
   }
+  lines.push(...waitingOnYouLines(openItems));
   const renderedNoteKeys = appendNotesSection(lines, qItems, "Notes");
   if (BOARD_URL) lines.push(`<i>Detail: ${escapeHtml(BOARD_URL)}</i>`);
   lines.push(`<i>Reply to anything by ref ("C-003: go") — or just type what you want.</i>`);
@@ -3548,10 +3568,12 @@ async function redeliverDeferredDecisions(env: Env, chatId: string): Promise<num
     // its KV update, emitting again would orphan a duplicate task (codex r3).
     let taskEventId = (entry["task_event_id"] as string | null | undefined) ?? null;
     if (!taskEventId) {
+      const refSince = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
       const prior = await fetchRows<{ id: string }>(
         env,
         `operational_events?select=id&event_type=eq.task.queued` +
-        `&payload->>wire_ref=eq.${encodeURIComponent(entry.ref)}&order=occurred_at.desc&limit=1`,
+        `&payload->>wire_ref=eq.${encodeURIComponent(entry.ref)}` +
+        `&occurred_at=gte.${encodeURIComponent(refSince)}&order=occurred_at.desc&limit=1`,
       );
       taskEventId = prior?.[0]?.id ?? null;
     }
@@ -3699,36 +3721,39 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
     `ea_threads?select=action_taken&classified_at=gte.${encodeURIComponent(since24h)}&limit=1000`,
   );
 
-  const lines: string[] = [];
-  lines.push(`🌅 <b>DAY AHEAD — ${escapeHtml(et.label)}</b>`);
+  // ── Build each section into its own array, then assemble by PRIORITY with
+  // a running length budget (codex r6 P1): decisions render first and always
+  // in full; a lower-priority section that would blow the budget is replaced
+  // by an explicit one-line omission — never silently truncated off the end.
 
-  // Calendar
+  // Calendar section
+  const calSection: string[] = [];
   if (cal === null) {
-    lines.push("<b>Calendar:</b> (data unavailable)");
+    calSection.push("<b>Calendar:</b> (data unavailable)");
   } else {
     const events = cal.filter((r) => (r.status ?? "").toLowerCase() !== "cancelled");
     if (events.length === 0) {
-      lines.push("<b>Calendar:</b> clear.");
+      calSection.push("<b>Calendar:</b> clear.");
     } else {
-      lines.push(`<b>Calendar (${events.length}):</b>`);
+      calSection.push(`<b>Calendar (${events.length}):</b>`);
       for (const ev of events.slice(0, 8)) {
         const when = ev.all_day ? "all day" : etTimeShort(ev.start_at);
-        lines.push(`• ${escapeHtml(when)} — ${escapeHtml((ev.summary ?? "(no title)").slice(0, 70))}`);
+        calSection.push(`• ${escapeHtml(when)} — ${escapeHtml((ev.summary ?? "(no title)").slice(0, 70))}`);
       }
-      if (events.length > 8) lines.push(`…+${events.length - 8} more`);
+      if (events.length > 8) calSection.push(`…+${events.length - 8} more`);
     }
   }
 
-  // Inbox needs-you (Sarah's escalate/halt lanes + open Sarah→Bob handoffs).
-  // A HALT that went out live as a CALL can also appear here via its
-  // ea_escalations row — accepted double-render: halts are the rare
-  // highest-stakes lane and the two lines carry different affordances
-  // (thread context here, answer-by-ref under Waiting on you).
-  // "Clear" is claimed ONLY when BOTH sources loaded and are empty — a
-  // one-source failure renders what we have and says so (codex r2 P1;
-  // verify-before-claiming).
+  // Inbox needs-you section (Sarah's escalate/halt lanes + open Sarah→Bob
+  // handoffs + overdue waiting-on rows). A HALT that went out live as a CALL
+  // can also appear here via its ea_escalations row — accepted double-render:
+  // halts are the rare highest-stakes lane and the two lines carry different
+  // affordances (thread context here, answer-by-ref under Waiting on you).
+  // "Clear" is claimed ONLY when ALL sources loaded and are empty (codex r2
+  // P1; verify-before-claiming).
+  const inboxSection: string[] = [];
   if (needsThreads === null && escalations === null && overdue === null) {
-    lines.push("<b>Inbox needs you:</b> (data unavailable)");
+    inboxSection.push("<b>Inbox needs you:</b> (data unavailable)");
   } else {
     const inboxLines: string[] = [];
     for (const t of needsThreads ?? []) {
@@ -3746,54 +3771,48 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
     const failedSources = [needsThreads, escalations, overdue].filter((s) => s === null).length;
     const partial = failedSources > 0;
     if (inboxLines.length === 0) {
-      lines.push(partial
+      inboxSection.push(partial
         ? `<b>Inbox needs you:</b> (${failedSources} source${failedSources === 1 ? "" : "s"} unavailable this run — nothing visible in the rest)`
         : "<b>Inbox needs you:</b> nothing — Sarah's lanes are clear.");
     } else {
-      lines.push(`<b>Inbox needs you (${inboxLines.length}${partial ? "+?" : ""}):</b>`);
-      lines.push(...inboxLines.slice(0, 8));
-      if (inboxLines.length > 8) lines.push(`…+${inboxLines.length - 8} more`);
-      if (partial) lines.push(`<i>(${failedSources} inbox source${failedSources === 1 ? "" : "s"} unavailable this run)</i>`);
+      inboxSection.push(`<b>Inbox needs you (${inboxLines.length}${partial ? "+?" : ""}):</b>`);
+      inboxSection.push(...inboxLines.slice(0, 8));
+      if (inboxLines.length > 8) inboxSection.push(`…+${inboxLines.length - 8} more`);
+      if (partial) inboxSection.push(`<i>(${failedSources} inbox source${failedSources === 1 ? "" : "s"} unavailable this run)</i>`);
     }
   }
   // Drafts render independently of the inbox sources (codex r3): a working
   // ea_drafts read must show even when both inbox lanes are down, and a
   // failed one gets an honest marker. Zero drafts = no line (non-signal).
   if (drafts === null) {
-    lines.push("✍️ Drafts: (data unavailable)");
+    inboxSection.push("✍️ Drafts: (data unavailable)");
   } else if (drafts.length > 0) {
-    lines.push(`✍️ Drafts ready to send: ${drafts.length}`);
+    inboxSection.push(`✍️ Drafts ready to send: ${drafts.length}`);
   }
 
-  // Today's plan (command queue) — wire-mirror rows are excluded in the
-  // query because the same asks render as refs under "Waiting on you" below.
+  // Plan section (command queue) — wire-mirror rows are excluded in the query
+  // because the same asks render as refs under Waiting on you.
+  const planSection: string[] = [];
   if (plan === null) {
-    lines.push("<b>Plan:</b> (data unavailable)");
+    planSection.push("<b>Plan:</b> (data unavailable)");
+  } else if (plan.length === 0) {
+    planSection.push("<b>Plan:</b> queue is empty.");
   } else {
-    const planRows = plan;
-    if (planRows.length === 0) {
-      lines.push("<b>Plan:</b> queue is empty.");
-    } else {
-      lines.push(`<b>Plan (${planRows.length} queued):</b>`);
-      for (const p of planRows.slice(0, 6)) {
-        lines.push(`• ${escapeHtml((p.priority ?? "P2").slice(0, 3))} · ${escapeHtml((p.title ?? "(untitled)").slice(0, 70))}`);
-      }
-      if (planRows.length > 6) lines.push(`…+${planRows.length - 6} more`);
+    planSection.push(`<b>Plan (${plan.length} queued):</b>`);
+    for (const p of plan.slice(0, 6)) {
+      planSection.push(`• ${escapeHtml((p.priority ?? "P2").slice(0, 3))} · ${escapeHtml((p.title ?? "(untitled)").slice(0, 70))}`);
     }
+    if (plan.length > 6) planSection.push(`…+${plan.length - 6} more`);
   }
 
-  // Waiting on you — fresh read AFTER redelivery so held-flags are current.
-  const openItems = await listOpenWireItems(env);
-  lines.push(...waitingOnYouLines(openItems));
-  if (redelivered > 0) lines.push(`<i>${redelivered} deferred decision${redelivered === 1 ? "" : "s"} just redelivered above.</i>`);
-
-  // Overnight (Sarah's log, data-derived from her real dispositions).
+  // Overnight section (Sarah's log, data-derived from her real dispositions).
   // "Handled" counts only her AUTONOMOUS filings (archive/label/spam — the
-  // same set her retired brief called handled); escalate/halt are needs-you
-  // items this digest lists above, and counting them as handled would claim
-  // work Robert still owes (codex r4).
+  // set her retired brief called handled); escalate/halt are needs-you items
+  // listed above, and counting them as handled would claim work Robert still
+  // owes (codex r4).
+  const overnightSection: string[] = [];
   if (overnight === null) {
-    lines.push("<b>Overnight:</b> (data unavailable)");
+    overnightSection.push("<b>Overnight:</b> (data unavailable)");
   } else {
     const HANDLED_ACTIONS = new Set(["archive", "label", "spam"]);
     const counts = new Map<string, number>();
@@ -3804,15 +3823,42 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
     }
     const total = [...counts.values()].reduce((a, b) => a + b, 0);
     if (total === 0) {
-      lines.push("<b>Overnight:</b> quiet — nothing needed auto-handling.");
+      overnightSection.push("<b>Overnight:</b> quiet — nothing needed auto-handling.");
     } else {
       const breakdown = [...counts.entries()]
         .sort((a, b) => b[1] - a[1])
         .map(([k, v]) => `${v} ${k}`)
         .join(" · ");
-      lines.push(`<b>Overnight:</b> Sarah handled ${total} (${escapeHtml(breakdown)}) — full brief on file.`);
+      overnightSection.push(`<b>Overnight:</b> Sarah handled ${total} (${escapeHtml(breakdown)}) — full brief on file.`);
     }
   }
+
+  // ── Assemble: header → decisions (always full) → sections by priority ──
+  const lines: string[] = [];
+  lines.push(`🌅 <b>DAY AHEAD — ${escapeHtml(et.label)}</b>`);
+
+  // Waiting on you — fresh read AFTER redelivery so held-flags are current.
+  // Highest priority: the decision list is the point of One Wire and is never
+  // squeezed out by informational sections.
+  const openItems = await listOpenWireItems(env);
+  lines.push(...waitingOnYouLines(openItems));
+  if (redelivered > 0) lines.push(`<i>${redelivered} deferred decision${redelivered === 1 ? "" : "s"} just redelivered above.</i>`);
+
+  const SECTION_CEILING = 3450; // leaves room for notes budget + footer
+  const pushSection = (section: string[], label: string) => {
+    if (section.length === 0) return;
+    const used = lines.reduce((n, l) => n + l.length + 1, 0);
+    const add = section.reduce((n, l) => n + l.length + 1, 0);
+    if (used + add > SECTION_CEILING) {
+      lines.push(`<i>${label}: over length budget this run — detail on the Board.</i>`);
+      return;
+    }
+    lines.push(...section);
+  };
+  pushSection(calSection, "Calendar");
+  pushSection(inboxSection, "Inbox needs you");
+  pushSection(planSection, "Plan");
+  pushSection(overnightSection, "Overnight");
 
   // Overnight notes (fyis queued since Day Done) — flush-on-render, same
   // length-budget semantics as Day Done. Sarah-triage fyis STAY in the notes
