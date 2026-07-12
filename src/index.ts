@@ -1642,7 +1642,11 @@ async function processTelegramReply(
   // Captured here, deleted ONLY after the resolution event persists (codex r3
   // — a Supabase outage must not vanish an unresolved fire from the digest).
   let fireRegistryKeyToClear: string | null = null;
-  if (wireMeta?.type === "fire" && RESOLVE_CMDS.has(text.trim().toLowerCase())) {
+  if (wireMeta?.type === "fire") {
+    // Captured for ANY reply to a fire — resolve commands AND directives
+    // ("you handle this") both end in an incident-resolved emit, and both must
+    // clear the registry on success (codex r4). Non-resolving replies never
+    // reach the gated delete.
     const fireRawKey = (wireMeta as { key?: string }).key;
     if (fireRawKey) fireRegistryKeyToClear = `${KV_WIRE_FIRE_PREFIX}${shortHash(fireRawKey)}`;
   }
@@ -1828,6 +1832,13 @@ async function processTelegramReply(
         sessionId,
       );
       actionTaken = ok;
+      if (ok && fireRegistryKeyToClear) {
+        try {
+          await env.BWM_TELEGRAM_KV.delete(fireRegistryKeyToClear);
+        } catch (e) {
+          console.error(JSON.stringify({ where: "processTelegramReply.fireRegistryClear.directive", error: String(e) }));
+        }
+      }
       confirmationLines.push(
         "\u2705 *Directive applied*",
         `Brain rule added: \`${originEventType}\` \u2192 silent\\_handle`,
@@ -2465,6 +2476,22 @@ function escapeHtml(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+/** Truncate rendered Telegram HTML without cutting inside an entity or leaving
+ *  a <b>/<i> unclosed — a mid-entity slice makes Telegram REJECT the message
+ *  (codex r4). Only <b>/<i> are used by the wire renderer. */
+function safeHtmlTruncate(text: string, max: number): string {
+  if (text.length <= max) return text;
+  let cut = text.slice(0, max);
+  cut = cut.replace(/&[a-zA-Z]{0,6}$/, ""); // trailing partial entity
+  cut = cut.replace(/<\/?[bi]?$/, ""); // trailing partial tag
+  for (const tag of ["b", "i"] as const) {
+    const opens = (cut.match(new RegExp(`<${tag}>`, "g")) ?? []).length;
+    const closes = (cut.match(new RegExp(`</${tag}>`, "g")) ?? []).length;
+    if (opens > closes) cut += `</${tag}>`.repeat(opens - closes);
+  }
+  return `${cut}…`;
+}
+
 /** Current time in Robert's timezone (America/New_York). Digest labels, quiet
  *  hours, the Wednesday rule, and the daily budget key all run on ET. */
 function etNow(d = new Date()): { date: string; hour: number; weekday: string; label: string; hhmm: string } {
@@ -2521,7 +2548,7 @@ function parseWireInput(raw: Record<string, unknown>): { ok: true; input: WireIn
   if (Array.isArray(rawOpts)) {
     options = rawOpts
       .map((o) => (typeof o === "string" ? o : String((o as Record<string, unknown>)?.["label"] ?? "")))
-      .map((s) => s.trim())
+      .map((s) => s.trim().slice(0, 80))
       .filter(Boolean)
       .slice(0, 4);
     if (options.length === 0) options = undefined;
@@ -2584,8 +2611,7 @@ function renderWire(input: WireInput, ref: string, updates: string[] = []): stri
       lines.push("<i>Updates will edit this message — no re-pings.</i>");
     }
   }
-  const text = lines.join("\n");
-  return text.length > 3800 ? `${text.slice(0, 3800)}…` : text;
+  return safeHtmlTruncate(lines.join("\n"), 3800);
 }
 
 async function editTelegramMessage(
@@ -2729,6 +2755,7 @@ async function dispatchWire(
   }
 
   // FIRE edit-in-place: same key within 24h updates the existing message.
+  let fireClaimKey: string | null = null;
   if (input.type === "fire") {
     const fireKey = `${KV_WIRE_FIRE_PREFIX}${shortHash(input.key ?? input.punchline)}`;
     const existingRaw = await env.BWM_TELEGRAM_KV.get(fireKey);
@@ -2736,9 +2763,19 @@ async function dispatchWire(
       try {
         const reg = JSON.parse(existingRaw) as {
           message_id: number; ref: string; base: WireInput; updates: string[]; count: number; first_at: string;
+          pending?: boolean;
         };
+        if (reg.pending) {
+          await createOutboundLog(env, {
+            sourceRoute, originEventId: origin?.originEventId ?? null, originEventType: origin?.originEventType ?? null,
+            originSessionId: input.session_id ?? null, parseMode: "HTML",
+            text: renderWire(input, reg.ref ?? "F-?"), status: "skipped",
+            metadata: { reason: "fire_claim_pending", wire: { type: "fire", key: input.key ?? input.punchline } },
+          });
+          return { ok: true, action: "skipped_claim_pending", ref: reg.ref };
+        }
         reg.count += 1;
-        const updateLine = `↻ ${et.hhmm} ET — ${input.punchline === reg.base.punchline ? (input.stakes ?? `repeat ×${reg.count}`) : input.punchline}`;
+        const updateLine = `↻ ${et.hhmm} ET — ${(input.punchline === reg.base.punchline ? (input.stakes ?? `repeat ×${reg.count}`) : input.punchline).slice(0, 150)}`;
         reg.updates = [...reg.updates, updateLine].slice(-WIRE_FIRE_MAX_UPDATES);
         const text = renderWire(reg.base, reg.ref, reg.updates);
         const edit = await editTelegramMessage(botToken, chatId, reg.message_id, text);
@@ -2771,6 +2808,16 @@ async function dispatchWire(
   }
 
   const ref = nextWireRef(input.type);
+  if (input.type === "fire") {
+    // First send of this key: claim BEFORE Telegram I/O so a concurrent
+    // same-key request skips instead of double-pinging (matches the old
+    // pre-send rate-limit stamp semantics); released on failure. Short TTL —
+    // the post-send registry write replaces it.
+    fireClaimKey = `${KV_WIRE_FIRE_PREFIX}${shortHash(input.key ?? input.punchline)}`;
+    await env.BWM_TELEGRAM_KV.put(fireClaimKey, JSON.stringify({ pending: true, ref, ts: new Date().toISOString() }), {
+      expirationTtl: 120,
+    });
+  }
   const text = renderWire(input, ref);
   const outboundId = await createOutboundLog(env, {
     sourceRoute,
@@ -2790,6 +2837,7 @@ async function dispatchWire(
       status: "failed", error: `telegram_send_threw: ${String(e).slice(0, 200)}`,
     });
     await releaseBudget();
+    if (fireClaimKey) await env.BWM_TELEGRAM_KV.delete(fireClaimKey).catch(() => undefined);
     return { ok: false, action: "failed", ref, error: String(e).slice(0, 200) };
   }
   if (!result.ok) {
@@ -2797,6 +2845,7 @@ async function dispatchWire(
       status: "failed", error: result.error ?? "telegram_send_failed", telegramResponse: result.response,
     });
     await releaseBudget();
+    if (fireClaimKey) await env.BWM_TELEGRAM_KV.delete(fireClaimKey).catch(() => undefined);
     return { ok: false, action: "failed", ref, error: result.error };
   }
   await updateOutboundLog(env, outboundId, {
@@ -2910,7 +2959,9 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
   const lines: string[] = [];
   lines.push(`🌙 <b>DAY DONE — ${escapeHtml(et.label)}</b>`);
   if (fireItems.length > 0) {
-    lines.push(`<b>Open fires (${fireItems.length}):</b>`);
+    // The registry is the 24h edit/coalesce window, NOT the incident system of
+    // record (command_alerts owns lifecycle) — label to match (codex r4).
+    lines.push(`<b>Fires (last 24h) (${fireItems.length}):</b>`);
     for (const f of fireItems.slice(0, 5)) {
       lines.push(`• ${escapeHtml(f.ref)} — ${escapeHtml(f.base.punchline.slice(0, 80))}${f.count > 1 ? ` (×${f.count})` : ""}`);
     }
@@ -2920,7 +2971,10 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
   lines.push(`<b>Shipped (last 24h):</b> ${!shippedOk ? "(data unavailable)" : shippedCount === 0 ? "nothing new" : `${shippedCount}${shippedTitles.length ? ` — ${escapeHtml(shippedTitles.join(" · "))}` : ""}`}`);
   if (openItems.length > 0) {
     lines.push(`<b>Waiting on you (${openItems.length}):</b>`);
-    for (const o of openItems.slice(0, 6)) {
+    // 10 oldest shown; a standing backlog past that is a budget/scorecard
+    // failure the Friday line exposes — not something to hide in rendering
+    // (codex r4; rotation considered, rejected as confusing).
+    for (const o of openItems.slice(0, 10)) {
       const rec = String(o["rec"] ?? "").slice(0, 60);
       const deferred = String(o["deferred"] ?? "");
       lines.push(
@@ -2929,7 +2983,7 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
         (deferred ? ` <i>(held: ${escapeHtml(deferred)})</i>` : ""),
       );
     }
-    if (openItems.length > 6) lines.push(`…+${openItems.length - 6} more`);
+    if (openItems.length > 10) lines.push(`…+${openItems.length - 10} more`);
   } else {
     lines.push("<b>Waiting on you:</b> nothing — all clear.");
   }
@@ -2942,8 +2996,7 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
   }
   if (BOARD_URL) lines.push(`<i>Detail: ${escapeHtml(BOARD_URL)}</i>`);
   lines.push(`<i>Reply to anything by ref ("C-003: go") — or just type what you want.</i>`);
-  let text = lines.join("\n");
-  if (text.length > 3900) text = `${text.slice(0, 3900)}…`;
+  const text = safeHtmlTruncate(lines.join("\n"), 3900);
 
   let botToken: string;
   try {
