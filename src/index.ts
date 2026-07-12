@@ -1638,17 +1638,13 @@ async function processTelegramReply(
   }
 
   // A resolve-reply on a FIRE clears its edit-in-place registry so the incident
-  // leaves "Open fires" and a later same-key event starts a fresh message
-  // (codex r2). Falls through — the legacy path below emits incident-resolved.
+  // leaves "Open fires" and a later same-key event starts a fresh message.
+  // Captured here, deleted ONLY after the resolution event persists (codex r3
+  // — a Supabase outage must not vanish an unresolved fire from the digest).
+  let fireRegistryKeyToClear: string | null = null;
   if (wireMeta?.type === "fire" && RESOLVE_CMDS.has(text.trim().toLowerCase())) {
     const fireRawKey = (wireMeta as { key?: string }).key;
-    if (fireRawKey) {
-      try {
-        await env.BWM_TELEGRAM_KV.delete(`${KV_WIRE_FIRE_PREFIX}${shortHash(fireRawKey)}`);
-      } catch (e) {
-        console.error(JSON.stringify({ where: "processTelegramReply.fireRegistryClear", error: String(e) }));
-      }
-    }
+    if (fireRawKey) fireRegistryKeyToClear = `${KV_WIRE_FIRE_PREFIX}${shortHash(fireRawKey)}`;
   }
 
   // ── ONE WIRE DECISION PATH ─────────────────────────────────────────────────
@@ -1664,6 +1660,39 @@ async function processTelegramReply(
     if (m) {
       const ref = m[1].toUpperCase();
       const answer = (m[2] || "").trim();
+      // FIRE refs live in the fire registry, not wire:open (codex r3): find by
+      // ref, persist the resolution, then clear the registry.
+      if (ref.startsWith("F-")) {
+        const fireList = await env.BWM_TELEGRAM_KV.list({ prefix: KV_WIRE_FIRE_PREFIX, limit: 50 });
+        let cleared = false;
+        for (const k of fireList.keys) {
+          const raw = await env.BWM_TELEGRAM_KV.get(k.name);
+          if (!raw) continue;
+          try {
+            const reg = JSON.parse(raw) as { ref?: string; base?: { origin?: string } };
+            if (reg.ref !== ref) continue;
+            const originStr = reg.base?.origin ?? "";
+            const idMatch = /^event:incident\.opened:(.+)$/.exec(originStr);
+            const logged = await emitOperationalEvent(env, "narrative", {
+              source: "telegram-reply",
+              kind: idMatch ? "incident-resolved" : "wire-decision",
+              ...(idMatch ? { closes_incident_id: idMatch[1] } : { wire_ref: ref, wire_type: "fire", choice_raw: answer.slice(0, 200) }),
+              note: `Robert resolved ${ref} via digest reply: "${answer.slice(0, 200)}"`,
+            }, `telegram-reply-${inboundEventId}`);
+            if (logged) {
+              await env.BWM_TELEGRAM_KV.delete(k.name);
+              cleared = true;
+            }
+            break;
+          } catch { /* skip malformed */ }
+        }
+        try {
+          await sendTelegramMessage(botToken, chatId,
+            cleared ? `✅ ${ref} resolved.` : `⚠️ Couldn't resolve ${ref} just now — try again in a minute.`,
+            undefined, message.message_id);
+        } catch { /* fail-soft */ }
+        return false;
+      }
       const openRaw = await env.BWM_TELEGRAM_KV.get(`${KV_WIRE_OPEN_PREFIX}${ref}`);
       if (openRaw) {
         let openType = "call";
@@ -1870,6 +1899,13 @@ async function processTelegramReply(
         sessionId,
       );
       actionTaken = ok;
+      if (ok && fireRegistryKeyToClear) {
+        try {
+          await env.BWM_TELEGRAM_KV.delete(fireRegistryKeyToClear);
+        } catch (e) {
+          console.error(JSON.stringify({ where: "processTelegramReply.fireRegistryClear", error: String(e) }));
+        }
+      }
       confirmationLines.push("\u2705 Incident resolved successfully\\.");
     } else if (originEventType === "task.queued") {
       const ok = await emitOperationalEvent(
@@ -2652,6 +2688,11 @@ async function dispatchWire(
       // Reserve the interrupt-budget slot BEFORE the send (KV has no CAS; the
       // stamp-then-release pattern matches the rate limiter — codex r2). The
       // slot is released on mint/send failure below.
+      // ACCEPTED TRADEOFF (codex r3 re-flag, rejected): true atomicity needs a
+      // Durable Object. Callers are sequential crons/CLIs at ≤5 live sends/day;
+      // the worst concurrent race yields cap+1 — bounded and harmless next to
+      // the 33/day baseline this gate replaces. Same reasoning the 2026-07-05
+      // review accepted for the incident rate limiter.
       await env.BWM_TELEGRAM_KV.put(budgetKey, String(spent + 1), { expirationTtl: WIRE_BUDGET_TTL_SECONDS });
       budgetReservedKey = budgetKey;
     }
@@ -2711,7 +2752,7 @@ async function dispatchWire(
             originEventType: origin?.originEventType ?? null,
             originSessionId: input.session_id ?? null, chatId, parseMode: "HTML", text,
             status: "sent",
-            metadata: { wire: { type: "fire", ref: reg.ref, action: "edited", count: reg.count, key: input.key ?? null } },
+            metadata: { wire: { type: "fire", ref: reg.ref, action: "edited", count: reg.count, key: input.key ?? input.punchline } },
           });
           // Stamp the edited row with the message_id so reply lookup (newest-
           // first) resolves the LATEST coalesced incident (codex r2).
@@ -2736,10 +2777,21 @@ async function dispatchWire(
     originEventId: origin?.originEventId ?? null,
     originEventType: origin?.originEventType ?? null,
     originSessionId: input.session_id ?? null, chatId, parseMode: "HTML", text, status: "queued",
-    metadata: { wire: { type: input.type, ref, key: input.key ?? null, origin: input.origin ?? null } },
+    metadata: { wire: { type: input.type, ref, key: input.type === "fire" ? (input.key ?? input.punchline) : (input.key ?? null), origin: input.origin ?? null } },
   });
 
-  const result = await sendTelegramMessage(botToken, chatId, text, "HTML");
+  let result: TelegramSendResult;
+  try {
+    result = await sendTelegramMessage(botToken, chatId, text, "HTML");
+  } catch (e) {
+    // Network-level throw (not a non-OK response) — release the reserved
+    // budget slot before reporting the failure (codex r3).
+    await updateOutboundLog(env, outboundId, {
+      status: "failed", error: `telegram_send_threw: ${String(e).slice(0, 200)}`,
+    });
+    await releaseBudget();
+    return { ok: false, action: "failed", ref, error: String(e).slice(0, 200) };
+  }
   if (!result.ok) {
     await updateOutboundLog(env, outboundId, {
       status: "failed", error: result.error ?? "telegram_send_failed", telegramResponse: result.response,
@@ -2749,7 +2801,7 @@ async function dispatchWire(
   }
   await updateOutboundLog(env, outboundId, {
     status: "sent", telegramMessageId: result.telegramMessageId, telegramResponse: result.response, error: null,
-    metadata: { wire: { type: input.type, ref, key: input.key ?? null, origin: input.origin ?? null } },
+    metadata: { wire: { type: input.type, ref, key: input.type === "fire" ? (input.key ?? input.punchline) : (input.key ?? null), origin: input.origin ?? null } },
   });
   await env.BWM_TELEGRAM_KV.put(KV_LAST_SEND_AT_KEY, new Date().toISOString());
 
@@ -2818,7 +2870,9 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
       return { ref: k.name.slice(KV_WIRE_OPEN_PREFIX.length), ...(JSON.parse(raw) as Record<string, unknown>) };
     } catch { return null; }
   }))).filter((x): x is Record<string, unknown> & { ref: string } => !!x)
-    .sort((a, b) => a.ref.localeCompare(b.ref));
+    // Oldest first by enqueue time — refs carry random suffixes, so a ref sort
+    // could hide an old item behind the display cap forever (codex r3).
+    .sort((a, b) => String(a["ts"] ?? "").localeCompare(String(b["ts"] ?? "")));
 
   // Open fires
   const fireList = await env.BWM_TELEGRAM_KV.list({ prefix: KV_WIRE_FIRE_PREFIX, limit: 50 });
@@ -2830,6 +2884,7 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
 
   // Shipped — rolling 24h from operational_events
   let shippedCount = 0;
+  let shippedOk = false;
   const shippedTitles: string[] = [];
   if (supabaseConfigured(env)) {
     try {
@@ -2838,6 +2893,7 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
         `&select=payload,client_id&order=occurred_at.desc&limit=50`;
       const resp = await fetch(supabaseRestUrl(env, q), { headers: supabaseHeaders(env) });
       if (resp.ok) {
+        shippedOk = true;
         const rows = (await resp.json()) as Array<{ payload: Record<string, unknown> | null; client_id: string | null }>;
         shippedCount = rows.length;
         for (const r of rows.slice(0, 3)) {
@@ -2859,7 +2915,9 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
       lines.push(`• ${escapeHtml(f.ref)} — ${escapeHtml(f.base.punchline.slice(0, 80))}${f.count > 1 ? ` (×${f.count})` : ""}`);
     }
   }
-  lines.push(`<b>Shipped (last 24h):</b> ${shippedCount === 0 ? "nothing new" : `${shippedCount}${shippedTitles.length ? ` — ${escapeHtml(shippedTitles.join(" · "))}` : ""}`}`);
+  // "nothing new" only when the query SUCCEEDED — an unreachable source renders
+  // as unavailable, never as a false zero (codex r3; verify-before-claiming).
+  lines.push(`<b>Shipped (last 24h):</b> ${!shippedOk ? "(data unavailable)" : shippedCount === 0 ? "nothing new" : `${shippedCount}${shippedTitles.length ? ` — ${escapeHtml(shippedTitles.join(" · "))}` : ""}`}`);
   if (openItems.length > 0) {
     lines.push(`<b>Waiting on you (${openItems.length}):</b>`);
     for (const o of openItems.slice(0, 6)) {
