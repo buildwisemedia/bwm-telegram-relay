@@ -9,6 +9,10 @@
  *                           quiet-hours/Wednesday/budget gates. fire → edit-in-place
  *                           per key. Attention-Routing-Spec v2.0.0.
  *   POST /digest/flush    — compose + send the Day Done digest now (internal-key).
+ *   POST /digest/day-ahead — compose + send the Day Ahead morning digest now
+ *                           (internal-key). Redelivers deferred decisions first.
+ *   POST /scorecard/run   — compute the 7-day comms scorecard, emit narrative
+ *                           kind=comms-slo, return metrics (internal-key).
  *   POST /event           — accepts operational_events payload from bwm-event-projector.
  *                           Filters per TELEGRAM_PRIORITY_EVENTS rules below. Sends to
  *                           Telegram if matches; incident.opened routes through the
@@ -70,7 +74,7 @@ export interface Env {
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-const VERSION = "2.2.0";
+const VERSION = "2.3.0";
 const BROKER_INTERNAL_URL = "https://internal/mint";
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 const KV_CHAT_ID_KEY = "robert_chat_id";
@@ -1535,13 +1539,18 @@ async function appendDirectiveOverride(
 // Shared Supabase emit helper
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Insert one operational event. Returns the event's ULID on success (Phase 2:
+ *  task.queued fan-out rows are keyed by source_event_id = this id, so callers
+ *  that later emit task.resolved need it back), or null on failure — truthiness
+ *  is unchanged from the old boolean contract. */
 async function emitOperationalEvent(
   env: Env,
   eventType: string,
   payload: Record<string, unknown>,
   sessionId: string,
-): Promise<boolean> {
+): Promise<string | null> {
   try {
+    const id = ulid();
     const resp = await fetch(`${env.SUPABASE_URL.replace(/\/+$/, "")}/rest/v1/operational_events`, {
       method: "POST",
       headers: {
@@ -1551,7 +1560,7 @@ async function emitOperationalEvent(
         Prefer: "return=minimal",
       },
       body: JSON.stringify({
-        id: ulid(),
+        id,
         event_type: eventType,
         client_id: null,
         payload,
@@ -1559,9 +1568,9 @@ async function emitOperationalEvent(
         session_id: sessionId,
       }),
     });
-    return resp.ok;
+    return resp.ok ? id : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -1677,7 +1686,7 @@ async function processTelegramReply(
           logged ? "✅ Resolved." : "⚠️ Couldn't log that — try again in a minute.",
           undefined, message.message_id);
       } catch { /* fail-soft */ }
-      return logged;
+      return logged !== null;
     }
   }
 
@@ -1730,7 +1739,12 @@ async function processTelegramReply(
       const openRaw = await env.BWM_TELEGRAM_KV.get(`${KV_WIRE_OPEN_PREFIX}${ref}`);
       if (openRaw) {
         let openType = "call";
-        try { openType = String((JSON.parse(openRaw) as Record<string, unknown>)["type"] ?? "call"); } catch { /* default */ }
+        let digestTaskEventId: string | null = null;
+        try {
+          const openReg = JSON.parse(openRaw) as Record<string, unknown>;
+          openType = String(openReg["type"] ?? "call");
+          digestTaskEventId = (openReg["task_event_id"] as string | null | undefined) ?? null;
+        } catch { /* default */ }
         const choiceNum = /^([1-9])\b/.exec(answer)?.[1] ?? null;
         const logged = await emitOperationalEvent(env, "narrative", {
           source: "telegram-reply",
@@ -1742,7 +1756,10 @@ async function processTelegramReply(
           inbound_event_id: inboundEventId,
           note: `Robert answered ${ref} via digest reply${choiceNum ? ` with option ${choiceNum}` : ""}: "${answer.slice(0, 200)}"`,
         }, `telegram-reply-${inboundEventId}`);
-        if (logged) await env.BWM_TELEGRAM_KV.delete(`${KV_WIRE_OPEN_PREFIX}${ref}`);
+        if (logged) {
+          await env.BWM_TELEGRAM_KV.delete(`${KV_WIRE_OPEN_PREFIX}${ref}`);
+          await emitWireTaskResolved(env, digestTaskEventId, ref, answer || "(ack)", `telegram-reply-${inboundEventId}`);
+        }
         try {
           await sendTelegramMessage(botToken, chatId,
             logged ? `✅ ${ref} logged. On it.` : `⚠️ Couldn't log ${ref} just now — it stays on your list; try again in a minute.`,
@@ -1763,7 +1780,14 @@ async function processTelegramReply(
   if (wireMeta?.ref && (wireMeta.type === "call" || wireMeta.type === "signoff")) {
     // Idempotency parity with the reaction + digest paths (codex r5): a second
     // reply to an already-answered decision is a follow-up, not a new decision.
-    const stillOpen = (await env.BWM_TELEGRAM_KV.get(`${KV_WIRE_OPEN_PREFIX}${wireMeta.ref}`)) !== null;
+    const openRawReply = await env.BWM_TELEGRAM_KV.get(`${KV_WIRE_OPEN_PREFIX}${wireMeta.ref}`);
+    const stillOpen = openRawReply !== null;
+    let replyTaskEventId: string | null = null;
+    if (openRawReply) {
+      try {
+        replyTaskEventId = (JSON.parse(openRawReply) as { task_event_id?: string | null }).task_event_id ?? null;
+      } catch { /* pre-Phase-2 registry rows have no task mirror */ }
+    }
     if (!stillOpen) {
       try {
         await sendTelegramMessage(botToken, chatId,
@@ -1798,6 +1822,7 @@ async function processTelegramReply(
       } catch (e) {
         console.error(JSON.stringify({ where: "processTelegramReply.wireClear", error: String(e) }));
       }
+      await emitWireTaskResolved(env, replyTaskEventId, wireMeta.ref, text.trim(), `telegram-reply-${inboundEventId}`);
     }
     try {
       await sendTelegramMessage(
@@ -1872,7 +1897,7 @@ async function processTelegramReply(
         },
         sessionId,
       );
-      actionTaken = ok;
+      actionTaken = ok !== null;
       if (ok && fireRegistryKeyToClear) {
         try {
           await env.BWM_TELEGRAM_KV.delete(fireRegistryKeyToClear);
@@ -1898,7 +1923,7 @@ async function processTelegramReply(
         },
         sessionId,
       );
-      actionTaken = ok;
+      actionTaken = ok !== null;
       confirmationLines.push(
         "\u2705 *Directive applied*",
         `Brain rule added: \`${originEventType}\` \u2192 silent\\_handle`,
@@ -1918,7 +1943,7 @@ async function processTelegramReply(
         },
         sessionId,
       );
-      actionTaken = ok;
+      actionTaken = ok !== null;
       confirmationLines.push(
         "\u2705 *Directive applied*",
         `Brain rule added: \`${originEventType}\` \u2192 silent\\_handle`,
@@ -1950,7 +1975,7 @@ async function processTelegramReply(
         },
         sessionId,
       );
-      actionTaken = ok;
+      actionTaken = ok !== null;
       if (ok && fireRegistryKeyToClear) {
         try {
           await env.BWM_TELEGRAM_KV.delete(fireRegistryKeyToClear);
@@ -1970,7 +1995,7 @@ async function processTelegramReply(
         },
         sessionId,
       );
-      actionTaken = ok;
+      actionTaken = ok !== null;
       confirmationLines.push("\u2705 Task resolved successfully\\.");
     }
   }
@@ -2224,9 +2249,16 @@ async function handleReactionUpdate(env: Env, update: TelegramUpdate): Promise<v
   // waiting-on-you entry is cleared only after it persists, so a Supabase
   // outage never silently swallows a decision.
   const wireOnAck = (origin?.metadata ?? {})["wire"] as { type?: string; ref?: string } | undefined;
-  const ackRefStillOpen = wireOnAck?.ref
-    ? (await env.BWM_TELEGRAM_KV.get(`${KV_WIRE_OPEN_PREFIX}${wireOnAck.ref}`)) !== null
-    : false;
+  const ackOpenRaw = wireOnAck?.ref
+    ? await env.BWM_TELEGRAM_KV.get(`${KV_WIRE_OPEN_PREFIX}${wireOnAck.ref}`)
+    : null;
+  const ackRefStillOpen = ackOpenRaw !== null;
+  let ackTaskEventId: string | null = null;
+  if (ackOpenRaw) {
+    try {
+      ackTaskEventId = (JSON.parse(ackOpenRaw) as { task_event_id?: string | null }).task_event_id ?? null;
+    } catch { /* pre-Phase-2 registry rows have no task mirror */ }
+  }
   // Only an OPEN ref accepts a reaction-decision — a late/accidental 👍 on an
   // already-answered item stays a plain ack (codex r2, idempotency).
   if (wireOnAck?.ref && (wireOnAck.type === "call" || wireOnAck.type === "signoff") && emojis.includes("👍") && ackRefStillOpen) {
@@ -2265,6 +2297,7 @@ async function handleReactionUpdate(env: Env, update: TelegramUpdate): Promise<v
       } catch (e) {
         console.error(JSON.stringify({ where: "handleReactionUpdate.wireClear", error: String(e) }));
       }
+      await emitWireTaskResolved(env, ackTaskEventId, wireOnAck.ref, "👍 take the rec", "daemon:bwm-telegram-relay");
     } else {
       console.error(JSON.stringify({
         where: "handleReactionUpdate.wireDecision",
@@ -2927,10 +2960,16 @@ async function dispatchWire(
   }
 
   if (input.type === "call" || input.type === "signoff") {
+    // Phase 2 (Close the Loop): a live decision on the wire IS a task Robert
+    // owes — mirror it into command_tasks via task.queued fan-out. §12: only
+    // wire call/signoff flows may create assignee=robert tasks. The answer
+    // resolves it (task.resolved rides the wire-decision paths).
+    const taskEventId = await emitWireTaskQueued(env, input, ref, false);
     await env.BWM_TELEGRAM_KV.put(`${KV_WIRE_OPEN_PREFIX}${ref}`, JSON.stringify({
       type: input.type, punchline: input.punchline, rec: input.rec ?? null,
       link: input.link ?? null, options: input.options ?? null,
       message_id: result.telegramMessageId ?? null, outbound_id: outboundId,
+      task_event_id: taskEventId,
       input, ts: new Date().toISOString(),
     }), { expirationTtl: WIRE_OPEN_TTL_SECONDS });
     // Budget slot was reserved before the send (see releaseBudget for the
@@ -2938,6 +2977,58 @@ async function dispatchWire(
   }
 
   return { ok: true, action: "sent", ref };
+}
+
+/** task.queued emit for a live call/signoff — command_tasks row lands via the
+ *  operational_events fan-out trigger (source_event_id = returned ULID). A
+ *  null return means the mirror failed; the wire item still works, it just
+ *  won't appear on the task board (fail-soft, decision > bookkeeping). */
+async function emitWireTaskQueued(
+  env: Env,
+  input: WireInput,
+  ref: string,
+  redelivered: boolean,
+): Promise<string | null> {
+  return emitOperationalEvent(env, "task.queued", {
+    title: `Answer ${ref} — ${input.punchline}`.slice(0, 200),
+    description: [
+      input.stakes ? `Stakes: ${input.stakes}` : null,
+      input.rec ? `Rec: ${input.rec}` : null,
+      input.options && input.options.length > 0
+        ? `Options: ${input.options.map((o, i) => `${i + 1}=${o}`).join(" · ")}`
+        : null,
+      input.link ?? null,
+    ].filter(Boolean).join("\n").slice(0, 1000) || `Wire ${input.type} awaiting Robert's answer.`,
+    priority: "P1",
+    assignee: "robert",
+    created_by: "one-wire",
+    source: "bwm-telegram-relay dispatchWire",
+    wire_ref: ref,
+    wire_type: input.type,
+    ...(redelivered ? { redelivered: true } : {}),
+  }, input.session_id ?? "daemon:bwm-telegram-relay");
+}
+
+/** task.resolved emit when a wire-decision lands — closes the command_tasks
+ *  row the live send queued. No-op when the item never went live (no task
+ *  was queued) or the mirror emit failed at send time. */
+async function emitWireTaskResolved(
+  env: Env,
+  taskEventId: string | null | undefined,
+  ref: string,
+  choiceRaw: string,
+  sessionId: string,
+): Promise<void> {
+  if (!taskEventId) return;
+  const ok = await emitOperationalEvent(env, "task.resolved", {
+    task_id: taskEventId,
+    outcome: "done",
+    resolution: `wire-decision ${ref}: "${choiceRaw.slice(0, 200)}"`,
+    source: "bwm-telegram-relay wire-decision",
+  }, sessionId);
+  if (!ok) {
+    console.error(JSON.stringify({ where: "emitWireTaskResolved", warn: "task_resolved_emit_failed", ref, task_event_id: taskEventId }));
+  }
 }
 
 async function handleNotify(request: Request, env: Env): Promise<Response> {
@@ -2957,6 +3048,99 @@ async function handleNotify(request: Request, env: Env): Promise<Response> {
   return json(result, result.ok ? 200 : 502);
 }
 
+/** Read + parse every wire:open registry entry, oldest first by enqueue time —
+ *  refs carry random suffixes, so a ref sort could hide an old item behind the
+ *  display cap forever (codex r3). Shared by Day Done, Day Ahead, redelivery. */
+async function listOpenWireItems(env: Env): Promise<Array<Record<string, unknown> & { ref: string }>> {
+  const openList = await env.BWM_TELEGRAM_KV.list({ prefix: KV_WIRE_OPEN_PREFIX, limit: 100 });
+  return (await Promise.all(openList.keys.map(async (k) => {
+    const raw = await env.BWM_TELEGRAM_KV.get(k.name);
+    if (!raw) return null;
+    try {
+      return { ref: k.name.slice(KV_WIRE_OPEN_PREFIX.length), ...(JSON.parse(raw) as Record<string, unknown>) };
+    } catch { return null; }
+  }))).filter((x): x is Record<string, unknown> & { ref: string } => !!x)
+    .sort((a, b) => String(a["ts"] ?? "").localeCompare(String(b["ts"] ?? "")));
+}
+
+/** Render the "Waiting on you" bullet list (shared: Day Done + Day Ahead).
+ *  10 oldest shown; a standing backlog past that is a budget/scorecard failure
+ *  the Friday line exposes — not something to hide in rendering (codex r4). */
+function waitingOnYouLines(openItems: Array<Record<string, unknown> & { ref: string }>): string[] {
+  const lines: string[] = [];
+  if (openItems.length === 0) {
+    lines.push("<b>Waiting on you:</b> nothing — all clear.");
+    return lines;
+  }
+  lines.push(`<b>Waiting on you (${openItems.length}):</b>`);
+  for (const o of openItems.slice(0, 10)) {
+    const rec = String(o["rec"] ?? "").slice(0, 60);
+    const deferred = String(o["deferred"] ?? "");
+    const opts = Array.isArray(o["options"])
+      ? (o["options"] as unknown[]).map((v, i) => `${i + 1}=${String(v).slice(0, 24)}`).join(" · ").slice(0, 90)
+      : "";
+    // Full href, short label — a truncated URL is worse than none (codex r6).
+    const linkRaw = String(o["link"] ?? "");
+    const link = linkRaw
+      ? `<a href="${linkRaw.replace(/&/g, "&amp;").replace(/"/g, "&quot;")}">open</a>`
+      : "";
+    lines.push(
+      `• ${escapeHtml(o.ref)} — ${escapeHtml(String(o["punchline"] ?? "").slice(0, 80))}` +
+      (rec ? ` · <b>rec:</b> ${escapeHtml(rec)}` : "") +
+      (opts ? ` · ${escapeHtml(opts)}` : "") +
+      (link ? ` · ${link}` : "") +
+      (deferred ? ` <i>(held: ${escapeHtml(deferred)})</i>` : ""),
+    );
+  }
+  if (openItems.length > 10) lines.push(`…+${openItems.length - 10} more`);
+  return lines;
+}
+
+/** Append the queued-notes section under an explicit LENGTH budget: only notes
+ *  that actually fit the message get flushed; the rest roll to the next digest.
+ *  Deleting a note the truncation swallowed would silently discard it (codex
+ *  r6). Returns the KV keys of the notes actually rendered — the caller deletes
+ *  them ONLY after the digest send succeeds. Shared: Day Done + Day Ahead. */
+function appendNotesSection(
+  lines: string[],
+  qItems: Array<Record<string, unknown> & { key: string }>,
+  header: string,
+): string[] {
+  const renderedNoteKeys: string[] = [];
+  if (qItems.length === 0) return renderedNoteKeys;
+  const headerIdx = lines.length;
+  lines.push("");
+  let used = lines.reduce((n, l) => n + l.length + 1, 0);
+  for (const it of qItems) {
+    if (renderedNoteKeys.length >= 12) break;
+    const noteLinkRaw = String(it["link"] ?? "");
+    const noteLink = noteLinkRaw
+      ? ` — <a href="${noteLinkRaw.replace(/&/g, "&amp;").replace(/"/g, "&quot;")}">open</a>`
+      : "";
+    const line = `• ${escapeHtml(String(it["punchline"] ?? "").slice(0, 90))}${noteLink}`;
+    if (used + line.length > 3600) break; // leave room for the footer
+    lines.push(line);
+    used += line.length + 1;
+    renderedNoteKeys.push(it.key);
+  }
+  lines[headerIdx] = `<b>${header} (${qItems.length}):</b>`;
+  if (qItems.length > renderedNoteKeys.length) {
+    lines.push(`…+${qItems.length - renderedNoteKeys.length} more (next digest)`);
+  }
+  return renderedNoteKeys;
+}
+
+/** Read + parse the digest note queue, oldest first. Shared by both digests. */
+async function listDigestNotes(env: Env): Promise<Array<Record<string, unknown> & { key: string }>> {
+  const qList = await env.BWM_TELEGRAM_KV.list({ prefix: KV_WIRE_DIGESTQ_PREFIX, limit: 1000 });
+  return (await Promise.all(qList.keys.map(async (k) => {
+    const raw = await env.BWM_TELEGRAM_KV.get(k.name);
+    if (!raw) return null;
+    try { return { key: k.name, ...(JSON.parse(raw) as Record<string, unknown>) }; } catch { return null; }
+  }))).filter((x): x is Record<string, unknown> & { key: string } => !!x)
+    .sort((a, b) => String(a["ts"] ?? "").localeCompare(String(b["ts"] ?? "")));
+}
+
 /** Compose + send the Day Done digest: open fires, shipped (last 24h rolling —
  *  avoids DST math), waiting-on-you, queued notes. Always sends, even on a
  *  quiet day — the empty digest is the trust signal that silence = nothing. */
@@ -2966,26 +3150,10 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
   const et = etNow();
 
   // Queued notes
-  const qList = await env.BWM_TELEGRAM_KV.list({ prefix: KV_WIRE_DIGESTQ_PREFIX, limit: 1000 });
-  const qItems = (await Promise.all(qList.keys.map(async (k) => {
-    const raw = await env.BWM_TELEGRAM_KV.get(k.name);
-    if (!raw) return null;
-    try { return { key: k.name, ...(JSON.parse(raw) as Record<string, unknown>) }; } catch { return null; }
-  }))).filter((x): x is Record<string, unknown> & { key: string } => !!x)
-    .sort((a, b) => String(a["ts"] ?? "").localeCompare(String(b["ts"] ?? "")));
+  const qItems = await listDigestNotes(env);
 
   // Waiting on you
-  const openList = await env.BWM_TELEGRAM_KV.list({ prefix: KV_WIRE_OPEN_PREFIX, limit: 100 });
-  const openItems = (await Promise.all(openList.keys.map(async (k) => {
-    const raw = await env.BWM_TELEGRAM_KV.get(k.name);
-    if (!raw) return null;
-    try {
-      return { ref: k.name.slice(KV_WIRE_OPEN_PREFIX.length), ...(JSON.parse(raw) as Record<string, unknown>) };
-    } catch { return null; }
-  }))).filter((x): x is Record<string, unknown> & { ref: string } => !!x)
-    // Oldest first by enqueue time — refs carry random suffixes, so a ref sort
-    // could hide an old item behind the display cap forever (codex r3).
-    .sort((a, b) => String(a["ts"] ?? "").localeCompare(String(b["ts"] ?? "")));
+  const openItems = await listOpenWireItems(env);
 
   // Open fires
   const fireList = await env.BWM_TELEGRAM_KV.list({ prefix: KV_WIRE_FIRE_PREFIX, limit: 50 });
@@ -3036,57 +3204,18 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
   // "nothing new" only when the query SUCCEEDED — an unreachable source renders
   // as unavailable, never as a false zero (codex r3; verify-before-claiming).
   lines.push(`<b>Shipped (last 24h):</b> ${!shippedOk ? "(data unavailable)" : shippedCount === 0 ? "nothing new" : `${shippedCount}${shippedTitles.length ? ` — ${escapeHtml(shippedTitles.join(" · "))}` : ""}`}`);
-  if (openItems.length > 0) {
-    lines.push(`<b>Waiting on you (${openItems.length}):</b>`);
-    // 10 oldest shown; a standing backlog past that is a budget/scorecard
-    // failure the Friday line exposes — not something to hide in rendering
-    // (codex r4; rotation considered, rejected as confusing).
-    for (const o of openItems.slice(0, 10)) {
-      const rec = String(o["rec"] ?? "").slice(0, 60);
-      const deferred = String(o["deferred"] ?? "");
-      const opts = Array.isArray(o["options"])
-        ? (o["options"] as unknown[]).map((v, i) => `${i + 1}=${String(v).slice(0, 24)}`).join(" · ").slice(0, 90)
-        : "";
-      // Full href, short label — a truncated URL is worse than none (codex r6).
-      const linkRaw = String(o["link"] ?? "");
-      const link = linkRaw
-        ? `<a href="${linkRaw.replace(/&/g, "&amp;").replace(/"/g, "&quot;")}">open</a>`
-        : "";
-      lines.push(
-        `• ${escapeHtml(o.ref)} — ${escapeHtml(String(o["punchline"] ?? "").slice(0, 80))}` +
-        (rec ? ` · <b>rec:</b> ${escapeHtml(rec)}` : "") +
-        (opts ? ` · ${escapeHtml(opts)}` : "") +
-        (link ? ` · ${link}` : "") +
-        (deferred ? ` <i>(held: ${escapeHtml(deferred)})</i>` : ""),
-      );
-    }
-    if (openItems.length > 10) lines.push(`…+${openItems.length - 10} more`);
-  } else {
-    lines.push("<b>Waiting on you:</b> nothing — all clear.");
-  }
-  // Notes render under an explicit LENGTH budget: only notes that actually fit
-  // the message get flushed; the rest roll to the next digest. Deleting a note
-  // the truncation swallowed would silently discard it (codex r6).
-  const renderedNoteKeys: string[] = [];
-  if (qItems.length > 0) {
-    const headerIdx = lines.length;
-    lines.push("");
-    let used = lines.reduce((n, l) => n + l.length + 1, 0);
-    for (const it of qItems) {
-      if (renderedNoteKeys.length >= 12) break;
-      const noteLinkRaw = String(it["link"] ?? "");
-      const noteLink = noteLinkRaw
-        ? ` — <a href="${noteLinkRaw.replace(/&/g, "&amp;").replace(/"/g, "&quot;")}">open</a>`
-        : "";
-      const line = `• ${escapeHtml(String(it["punchline"] ?? "").slice(0, 90))}${noteLink}`;
-      if (used + line.length > 3600) break; // leave room for the footer
-      lines.push(line);
-      used += line.length + 1;
-      renderedNoteKeys.push(it.key);
-    }
-    lines[headerIdx] = `<b>Notes (${qItems.length}):</b>`;
-    if (qItems.length > renderedNoteKeys.length) {
-      lines.push(`…+${qItems.length - renderedNoteKeys.length} more (next digest)`);
+  lines.push(...waitingOnYouLines(openItems));
+  const renderedNoteKeys = appendNotesSection(lines, qItems, "Notes");
+  // Friday scorecard (Phase 2): the weekly comms SLO rides the Day Done digest
+  // + lands as narrative kind=comms-slo so the trend is queryable. Fail-soft:
+  // an unavailable substrate renders as unavailable, never a false zero.
+  if (etNow().weekday === "Fri") {
+    const sc = await computeCommsScorecard(env);
+    if (sc) {
+      lines.push(...scorecardLines(sc));
+      await emitCommsSlo(env, sc);
+    } else {
+      lines.push("<b>Comms scorecard:</b> (data unavailable)");
     }
   }
   if (BOARD_URL) lines.push(`<i>Detail: ${escapeHtml(BOARD_URL)}</i>`);
@@ -3130,6 +3259,441 @@ async function handleDigestFlush(request: Request, env: Env): Promise<Response> 
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// One Wire Phase 2 — Day Ahead digest, deferred redelivery, comms scorecard
+// (Close the Loop; Attention-Routing-Spec v2.0.0 § 12, PROJ-ONE-WIRE-001)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Read-only Supabase REST fetch. null = source UNAVAILABLE (render "(data
+ *  unavailable)", never a false zero — verify-before-claiming); [] = healthy
+ *  empty. */
+async function fetchRows<T>(env: Env, query: string): Promise<T[] | null> {
+  if (!supabaseConfigured(env)) return null;
+  try {
+    const resp = await fetch(supabaseRestUrl(env, query), { headers: supabaseHeaders(env) });
+    if (!resp.ok) {
+      console.error(JSON.stringify({ where: "fetchRows", status: resp.status, query: query.slice(0, 100) }));
+      return null;
+    }
+    return (await resp.json()) as T[];
+  } catch (e) {
+    console.error(JSON.stringify({ where: "fetchRows", query: query.slice(0, 100), error: String(e) }));
+    return null;
+  }
+}
+
+/** UTC instants of today's ET midnight → tomorrow's ET midnight. Offset comes
+ *  from Intl longOffset so EDT/EST both resolve; on a parse failure fall back
+ *  to -05:00 (worst case: the calendar window shifts an hour — a digest-grade
+ *  imprecision, not a correctness gate). */
+function etDayRangeUtc(): { startIso: string; endIso: string } {
+  const et = etNow();
+  const offPart = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", timeZoneName: "longOffset" })
+    .formatToParts(new Date()).find((p) => p.type === "timeZoneName")?.value ?? "";
+  const m = /GMT([+-])(\d{1,2})(?::(\d{2}))?/.exec(offPart);
+  const sign = m?.[1] ?? "-";
+  const hh = (m?.[2] ?? "5").padStart(2, "0");
+  const mm = m?.[3] ?? "00";
+  const start = new Date(`${et.date}T00:00:00${sign}${hh}:${mm}`);
+  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+  return { startIso: start.toISOString(), endIso: end.toISOString() };
+}
+
+function etTimeShort(iso: string | null): string {
+  if (!iso) return "";
+  try {
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York", hour: "numeric", minute: "2-digit",
+    }).format(new Date(iso));
+  } catch { return String(iso); }
+}
+
+/** Redeliver decisions that were deferred at send time (quiet hours /
+ *  Wednesday / budget) as LIVE interrupts — "redelivery at the first in-hours
+ *  digest". 09:00 ET is in-hours by construction (quiet ends 08:00). Budget-
+ *  aware: oldest first, stops at the hard cap; what doesn't fit stays in
+ *  waiting-on-you. Wednesday still holds non-expiring items (digest+fire
+ *  only). Returns the number redelivered. */
+async function redeliverDeferredDecisions(env: Env, chatId: string): Promise<number> {
+  const et = etNow();
+  const openEntries = await listOpenWireItems(env);
+  const deferredEntries = openEntries.filter((e) =>
+    e["deferred"] && !e["message_id"] && e["input"] && typeof e["input"] === "object");
+  if (deferredEntries.length === 0) return 0;
+
+  const budgetKey = `${KV_WIRE_BUDGET_PREFIX}${et.date}`;
+  let spent = parseInt((await env.BWM_TELEGRAM_KV.get(budgetKey)) ?? "0", 10) || 0;
+  let botToken: string | null = null;
+  let redelivered = 0;
+
+  for (const entry of deferredEntries) {
+    if (spent >= WIRE_INTERRUPT_HARD_CAP) break;
+    const input = entry["input"] as WireInput;
+    const expiresToday = (input.expires_at ?? "").slice(0, 10) === et.date;
+    if (et.weekday === "Wed" && !expiresToday) continue;
+    if (!botToken) {
+      try {
+        botToken = await mintToken(env, "TELEGRAM_BOT_TOKEN");
+      } catch (e) {
+        console.error(JSON.stringify({ where: "redeliverDeferred.mint", error: String(e).slice(0, 200) }));
+        return redelivered;
+      }
+    }
+    // Reserve the budget slot BEFORE the send (stamp-then-release, same
+    // accepted-tradeoff as dispatchWire — KV has no CAS).
+    spent += 1;
+    await env.BWM_TELEGRAM_KV.put(budgetKey, String(spent), { expirationTtl: WIRE_BUDGET_TTL_SECONDS });
+    const text = renderWire(input, entry.ref);
+    const outboundId = await createOutboundLog(env, {
+      sourceRoute: "/digest/day-ahead",
+      originSessionId: input.session_id ?? null, chatId, parseMode: "HTML", text, status: "queued",
+      metadata: { wire: { type: input.type, ref: entry.ref, action: "redelivered", origin: input.origin ?? null } },
+    });
+    let result: TelegramSendResult;
+    try {
+      result = await sendTelegramMessage(botToken, chatId, text, "HTML");
+    } catch (e) {
+      spent = Math.max(0, spent - 1);
+      await env.BWM_TELEGRAM_KV.put(budgetKey, String(spent), { expirationTtl: WIRE_BUDGET_TTL_SECONDS });
+      await updateOutboundLog(env, outboundId, { status: "failed", error: `telegram_send_threw: ${String(e).slice(0, 200)}` });
+      continue; // stays deferred; next digest retries
+    }
+    if (!result.ok) {
+      spent = Math.max(0, spent - 1);
+      await env.BWM_TELEGRAM_KV.put(budgetKey, String(spent), { expirationTtl: WIRE_BUDGET_TTL_SECONDS });
+      await updateOutboundLog(env, outboundId, {
+        status: "failed", error: result.error ?? "telegram_send_failed", telegramResponse: result.response,
+      });
+      continue;
+    }
+    await updateOutboundLog(env, outboundId, {
+      status: "sent", telegramMessageId: result.telegramMessageId, telegramResponse: result.response, error: null,
+    });
+    // Now live → it's a task Robert owes (same mirror as a live dispatch).
+    let taskEventId = (entry["task_event_id"] as string | null | undefined) ?? null;
+    if (!taskEventId) taskEventId = await emitWireTaskQueued(env, input, entry.ref, true);
+    const { ref: _ref, deferred: _deferred, ...regRest } = entry;
+    await env.BWM_TELEGRAM_KV.put(`${KV_WIRE_OPEN_PREFIX}${entry.ref}`, JSON.stringify({
+      ...regRest,
+      message_id: result.telegramMessageId ?? null,
+      outbound_id: outboundId,
+      task_event_id: taskEventId,
+      redelivered_at: new Date().toISOString(),
+    }), { expirationTtl: WIRE_OPEN_TTL_SECONDS });
+    redelivered += 1;
+  }
+  return redelivered;
+}
+
+/** Compose + send the Day Ahead morning digest (09:00 ET): redelivered
+ *  decisions, today's calendar, inbox needs-you, the command queue, open
+ *  decisions, and Sarah's overnight log — absorbed from the same substrate
+ *  tables her standalone 07:00 Telegram brief used to render (ea_threads /
+ *  ea_escalations / ea_drafts / ea_calendar_events; the full brief text stays
+ *  in ea_briefs + the Board). Every section renders "(data unavailable)" on a
+ *  source failure, never a false zero. */
+async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireResult & { redelivered?: number; items?: number }> {
+  const chatId = await env.BWM_TELEGRAM_KV.get(KV_CHAT_ID_KEY);
+  if (!chatId) return { ok: false, action: "skipped_no_chat_id" };
+  const et = etNow();
+
+  const redelivered = await redeliverDeferredDecisions(env, chatId);
+
+  const { startIso, endIso } = etDayRangeUtc();
+  const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  const since7d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+
+  const cal = await fetchRows<{ summary: string | null; start_at: string | null; all_day: boolean | null; status: string | null }>(
+    env,
+    `ea_calendar_events?select=summary,start_at,all_day,status` +
+    `&start_at=gte.${encodeURIComponent(startIso)}&start_at=lt.${encodeURIComponent(endIso)}&order=start_at.asc&limit=20`,
+  );
+  const needsThreads = await fetchRows<{ sender_email: string | null; subject: string | null; action_taken: string | null }>(
+    env,
+    `ea_threads?select=sender_email,subject,action_taken&action_taken=in.(escalate,halt)` +
+    `&classified_at=gte.${encodeURIComponent(since24h)}&order=classified_at.desc&limit=8`,
+  );
+  const escalations = await fetchRows<{ sender_email: string | null; sarah_reason: string | null; scope: string | null }>(
+    env,
+    `ea_escalations?select=sender_email,sarah_reason,scope&status=eq.open&order=opened_at.desc&limit=8`,
+  );
+  const drafts = await fetchRows<{ gmail_thread_id: string | null }>(
+    env,
+    `ea_drafts?select=gmail_thread_id&sent_message_id=is.null&resolved_at=is.null` +
+    `&created_at=gte.${encodeURIComponent(since7d)}&limit=50`,
+  );
+  const plan = await fetchRows<{ title: string | null; priority: string | null; created_by: string | null }>(
+    env,
+    `command_tasks?select=title,priority,created_by&assignee=eq.robert&status=eq.queued` +
+    `&order=priority.asc,created_at.asc&limit=50`,
+  );
+  const overnight = await fetchRows<{ action_taken: string | null }>(
+    env,
+    `ea_threads?select=action_taken&classified_at=gte.${encodeURIComponent(since24h)}&limit=1000`,
+  );
+
+  const lines: string[] = [];
+  lines.push(`🌅 <b>DAY AHEAD — ${escapeHtml(et.label)}</b>`);
+
+  // Calendar
+  if (cal === null) {
+    lines.push("<b>Calendar:</b> (data unavailable)");
+  } else {
+    const events = cal.filter((r) => (r.status ?? "").toLowerCase() !== "cancelled");
+    if (events.length === 0) {
+      lines.push("<b>Calendar:</b> clear.");
+    } else {
+      lines.push(`<b>Calendar (${events.length}):</b>`);
+      for (const ev of events.slice(0, 8)) {
+        const when = ev.all_day ? "all day" : etTimeShort(ev.start_at);
+        lines.push(`• ${escapeHtml(when)} — ${escapeHtml((ev.summary ?? "(no title)").slice(0, 70))}`);
+      }
+      if (events.length > 8) lines.push(`…+${events.length - 8} more`);
+    }
+  }
+
+  // Inbox needs-you (Sarah's escalate/halt lanes + open Sarah→Bob handoffs)
+  if (needsThreads === null && escalations === null) {
+    lines.push("<b>Inbox needs you:</b> (data unavailable)");
+  } else {
+    const inboxLines: string[] = [];
+    for (const t of needsThreads ?? []) {
+      const verb = t.action_taken === "halt" ? "halted — needs you" : "escalated";
+      inboxLines.push(`• ${escapeHtml((t.sender_email ?? "unknown").slice(0, 40))} — ${escapeHtml((t.subject ?? "(no subject)").slice(0, 60))} <i>(${verb})</i>`);
+    }
+    for (const e of escalations ?? []) {
+      inboxLines.push(`• ${escapeHtml((e.sender_email ?? "unknown").slice(0, 40))} — ${escapeHtml((e.sarah_reason ?? e.scope ?? "handoff").slice(0, 60))} <i>(with Bob)</i>`);
+    }
+    if (inboxLines.length === 0) {
+      lines.push("<b>Inbox needs you:</b> nothing — Sarah's lanes are clear.");
+    } else {
+      lines.push(`<b>Inbox needs you (${inboxLines.length}):</b>`);
+      lines.push(...inboxLines.slice(0, 6));
+      if (inboxLines.length > 6) lines.push(`…+${inboxLines.length - 6} more`);
+    }
+    if (drafts !== null && drafts.length > 0) lines.push(`✍️ Drafts ready to send: ${drafts.length}`);
+  }
+
+  // Today's plan (command queue) — wire-mirror rows are skipped here because
+  // the same asks render as refs under "Waiting on you" just below.
+  if (plan === null) {
+    lines.push("<b>Plan:</b> (data unavailable)");
+  } else {
+    const planRows = plan.filter((p) => p.created_by !== "one-wire");
+    if (planRows.length === 0) {
+      lines.push("<b>Plan:</b> queue is empty.");
+    } else {
+      lines.push(`<b>Plan (${planRows.length} queued):</b>`);
+      for (const p of planRows.slice(0, 6)) {
+        lines.push(`• ${escapeHtml((p.priority ?? "P2").slice(0, 3))} · ${escapeHtml((p.title ?? "(untitled)").slice(0, 70))}`);
+      }
+      if (planRows.length > 6) lines.push(`…+${planRows.length - 6} more`);
+    }
+  }
+
+  // Waiting on you — fresh read AFTER redelivery so held-flags are current.
+  const openItems = await listOpenWireItems(env);
+  lines.push(...waitingOnYouLines(openItems));
+  if (redelivered > 0) lines.push(`<i>${redelivered} deferred decision${redelivered === 1 ? "" : "s"} just redelivered above.</i>`);
+
+  // Overnight (Sarah's log, data-derived from her real dispositions)
+  if (overnight === null) {
+    lines.push("<b>Overnight:</b> (data unavailable)");
+  } else {
+    const counts = new Map<string, number>();
+    for (const r of overnight) {
+      const a = r.action_taken ?? "";
+      if (!a) continue;
+      counts.set(a, (counts.get(a) ?? 0) + 1);
+    }
+    const total = [...counts.values()].reduce((a, b) => a + b, 0);
+    if (total === 0) {
+      lines.push("<b>Overnight:</b> quiet — nothing needed handling.");
+    } else {
+      const breakdown = [...counts.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 4)
+        .map(([k, v]) => `${v} ${k}`)
+        .join(" · ");
+      lines.push(`<b>Overnight:</b> Sarah handled ${total} (${escapeHtml(breakdown)}) — full brief on file.`);
+    }
+  }
+
+  // Overnight notes (fyis queued since Day Done) — flush-on-render, same
+  // length-budget semantics as Day Done.
+  const qItems = await listDigestNotes(env);
+  const renderedNoteKeys = appendNotesSection(lines, qItems, "Overnight notes");
+
+  if (BOARD_URL) lines.push(`<i>Detail: ${escapeHtml(BOARD_URL)}</i>`);
+  lines.push(`<i>Reply to anything by ref ("C-003: go") — or just type what you want.</i>`);
+  const text = safeHtmlTruncate(lines.join("\n"), 3900);
+
+  let botToken: string;
+  try {
+    botToken = await mintToken(env, "TELEGRAM_BOT_TOKEN");
+  } catch (e) {
+    return { ok: false, action: "failed", error: `token_mint_failed: ${String(e).slice(0, 200)}`, redelivered };
+  }
+  const outboundId = await createOutboundLog(env, {
+    sourceRoute: "/digest", chatId, parseMode: "HTML", text, status: "queued",
+    metadata: {
+      wire: {
+        type: "digest", kind: "day-ahead", trigger,
+        redelivered, notes: qItems.length, waiting: openItems.length,
+      },
+    },
+  });
+  const result = await sendTelegramMessage(botToken, chatId, text, "HTML");
+  if (!result.ok) {
+    await updateOutboundLog(env, outboundId, {
+      status: "failed", error: result.error ?? "telegram_send_failed", telegramResponse: result.response,
+    });
+    return { ok: false, action: "failed", error: result.error, redelivered };
+  }
+  await updateOutboundLog(env, outboundId, {
+    status: "sent", telegramMessageId: result.telegramMessageId, telegramResponse: result.response, error: null,
+  });
+  await env.BWM_TELEGRAM_KV.put(KV_LAST_SEND_AT_KEY, new Date().toISOString());
+  // Flush ONLY the notes that made it into the delivered message (codex r6).
+  await Promise.all(renderedNoteKeys.map((k) => env.BWM_TELEGRAM_KV.delete(k)));
+  return { ok: true, action: "sent", redelivered, items: qItems.length };
+}
+
+async function handleDayAheadTrigger(request: Request, env: Env): Promise<Response> {
+  const key = request.headers.get("X-BWM-Internal-Key") ?? "";
+  if (!env.BWM_INTERNAL_KEY || key !== env.BWM_INTERNAL_KEY) {
+    return json({ ok: false, error: "unauthorized" }, 401);
+  }
+  const result = await composeAndSendDayAhead(env, "manual_flush");
+  return json(result, result.ok ? 200 : 502);
+}
+
+// ── Comms scorecard (Friday Day Done + POST /scorecard/run) ─────────────────
+
+interface CommsScorecard {
+  window_days: number;
+  sends_total: number;
+  sends_per_day: number;
+  live_interrupts_total: number;
+  interrupts_per_day: number;
+  digests_total: number;
+  decisions_total: number;
+  median_call_response_hours: number | null;
+  unanswered_refs: number;
+  computed_at: string;
+}
+
+/** 7-day comms telemetry over telegram_outbound.metadata.wire + wire-decision
+ *  narratives. Returns null when EITHER substrate read fails — an honest
+ *  "unavailable" beats a scorecard silently missing half its inputs. */
+async function computeCommsScorecard(env: Env): Promise<CommsScorecard | null> {
+  const windowDays = 7;
+  const since = new Date(Date.now() - windowDays * 24 * 60 * 60 * 1000).toISOString();
+  // 1000-row cap ≈ 4× the pre-One-Wire worst week; if volume ever exceeds it
+  // the window silently shortens — revisit before that (log flags it).
+  const outb = await fetchRows<{ queued_at: string; status: string; metadata: Record<string, unknown> | null }>(
+    env,
+    `telegram_outbound?select=queued_at,status,metadata&queued_at=gte.${encodeURIComponent(since)}&order=queued_at.desc&limit=1000`,
+  );
+  if (outb === null) return null;
+  if (outb.length === 1000) console.warn(JSON.stringify({ where: "computeCommsScorecard", warn: "row_cap_hit_window_truncated" }));
+  const decisions = await fetchRows<{ payload: Record<string, unknown> | null; occurred_at: string }>(
+    env,
+    `operational_events?select=payload,occurred_at&event_type=eq.narrative` +
+    `&payload->>kind=eq.wire-decision&occurred_at=gte.${encodeURIComponent(since)}&limit=500`,
+  );
+  if (decisions === null) return null;
+
+  const wireOf = (r: { metadata: Record<string, unknown> | null }) =>
+    (r.metadata ?? {})["wire"] as { type?: string; ref?: string; action?: string } | undefined;
+  const sent = outb.filter((r) => r.status === "sent");
+  // A FIRE edit updates in place (no ping) and a digest is the anti-interrupt
+  // — neither counts against the ≤3/day interrupt target.
+  const liveInterrupts = sent.filter((r) => {
+    const w = wireOf(r);
+    return !!w && ["fire", "call", "signoff"].includes(w.type ?? "") && w.action !== "edited";
+  });
+  const digests = sent.filter((r) => wireOf(r)?.type === "digest");
+
+  const firstQueuedByRef = new Map<string, number>();
+  for (const r of outb) {
+    const w = wireOf(r);
+    if (!w?.ref) continue;
+    const t = Date.parse(r.queued_at);
+    if (!Number.isFinite(t)) continue;
+    const prev = firstQueuedByRef.get(w.ref);
+    if (prev === undefined || t < prev) firstQueuedByRef.set(w.ref, t);
+  }
+  const latencies: number[] = [];
+  for (const d of decisions) {
+    const p = d.payload ?? {};
+    const ref = String(p["wire_ref"] ?? "");
+    const wt = String(p["wire_type"] ?? "");
+    if (!ref || (wt !== "call" && wt !== "signoff")) continue;
+    const q = firstQueuedByRef.get(ref);
+    if (q === undefined) continue;
+    const dt = Date.parse(d.occurred_at) - q;
+    if (Number.isFinite(dt) && dt >= 0) latencies.push(dt);
+  }
+  latencies.sort((a, b) => a - b);
+  const medianMs = latencies.length > 0 ? latencies[Math.floor(latencies.length / 2)] : null;
+
+  let unanswered = 0;
+  try {
+    unanswered = (await env.BWM_TELEGRAM_KV.list({ prefix: KV_WIRE_OPEN_PREFIX, limit: 100 })).keys.length;
+  } catch (e) {
+    console.error(JSON.stringify({ where: "computeCommsScorecard.unanswered", error: String(e) }));
+  }
+
+  return {
+    window_days: windowDays,
+    sends_total: sent.length,
+    sends_per_day: sent.length / windowDays,
+    live_interrupts_total: liveInterrupts.length,
+    interrupts_per_day: liveInterrupts.length / windowDays,
+    digests_total: digests.length,
+    decisions_total: latencies.length,
+    median_call_response_hours: medianMs === null ? null : medianMs / 3_600_000,
+    unanswered_refs: unanswered,
+    computed_at: new Date().toISOString(),
+  };
+}
+
+function scorecardLines(sc: CommsScorecard): string[] {
+  const med = sc.median_call_response_hours;
+  return [
+    `📊 <b>Comms scorecard (${sc.window_days}d):</b>`,
+    `• ${sc.sends_per_day.toFixed(1)} sends/day · ${sc.interrupts_per_day.toFixed(1)} live interrupts/day (target ≤3)`,
+    `• CALL response: ${med !== null ? `median ${med.toFixed(1)}h over ${sc.decisions_total}` : "no answered calls this week"} · ${sc.unanswered_refs} unanswered ref${sc.unanswered_refs === 1 ? "" : "s"}`,
+  ];
+}
+
+async function emitCommsSlo(env: Env, sc: CommsScorecard): Promise<string | null> {
+  const id = await emitOperationalEvent(env, "narrative", {
+    kind: "comms-slo",
+    source: "bwm-telegram-relay scorecard",
+    body:
+      `Comms SLO ${sc.window_days}d: ${sc.sends_per_day.toFixed(1)} sends/day, ` +
+      `${sc.interrupts_per_day.toFixed(1)} live interrupts/day, ` +
+      `${sc.median_call_response_hours !== null ? `median CALL response ${sc.median_call_response_hours.toFixed(1)}h (n=${sc.decisions_total})` : "no answered calls"}, ` +
+      `${sc.unanswered_refs} unanswered refs.`,
+    metrics: sc as unknown as Record<string, unknown>,
+  }, "daemon:bwm-telegram-relay");
+  if (!id) console.error(JSON.stringify({ where: "emitCommsSlo", warn: "comms_slo_emit_failed" }));
+  return id;
+}
+
+async function handleScorecardRun(request: Request, env: Env): Promise<Response> {
+  const key = request.headers.get("X-BWM-Internal-Key") ?? "";
+  if (!env.BWM_INTERNAL_KEY || key !== env.BWM_INTERNAL_KEY) {
+    return json({ ok: false, error: "unauthorized" }, 401);
+  }
+  const sc = await computeCommsScorecard(env);
+  if (!sc) return json({ ok: false, error: "substrate_unavailable" }, 502);
+  const eventId = await emitCommsSlo(env, sc);
+  return json({ ok: eventId !== null, event_id: eventId, scorecard: sc }, eventId !== null ? 200 : 502);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Worker export
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -3154,6 +3718,12 @@ export default {
       }
       if (method === "POST" && path === "/digest/flush") {
         return handleDigestFlush(request, env);
+      }
+      if (method === "POST" && path === "/digest/day-ahead") {
+        return handleDayAheadTrigger(request, env);
+      }
+      if (method === "POST" && path === "/scorecard/run") {
+        return handleScorecardRun(request, env);
       }
       if (method === "POST" && path === "/test") {
         return handleTest(request, env);
@@ -3189,6 +3759,16 @@ export default {
       ctx.waitUntil(
         composeAndSendDayDone(env, "cron").catch((e) =>
           console.error("scheduled digest failed:", (e as Error)?.message ?? e),
+        ),
+      );
+      return;
+    }
+    // One Wire Day Ahead digest — 13:00 UTC (09:00 EDT). Redelivers deferred
+    // decisions first (Phase 2, Close the Loop).
+    if (event.cron === "0 13 * * *") {
+      ctx.waitUntil(
+        composeAndSendDayAhead(env, "cron").catch((e) =>
+          console.error("scheduled day-ahead failed:", (e as Error)?.message ?? e),
         ),
       );
       return;
