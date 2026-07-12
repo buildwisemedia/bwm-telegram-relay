@@ -3076,12 +3076,25 @@ async function emitWireTaskResolved(
       // Fallback is for the TTL-expiry case ONLY. A follow-up reply to an
       // already-ANSWERED ref also lands here (registry gone) — without this
       // status check every follow-up would emit a duplicate task.resolved
-      // and pollute completion analytics (codex r4).
+      // and pollute completion analytics (codex r4). An UNAVAILABLE status
+      // read is retryable, not a verdict — park the marker so a real
+      // resolution can't be lost to a transient outage (codex r5); the sweep
+      // re-checks status before replaying.
       const mirror = await fetchRows<{ status: string }>(
         env,
         `command_tasks?select=status&source_event_id=eq.${encodeURIComponent(id)}&limit=1`,
       );
-      if (mirror === null || mirror[0]?.status !== "queued") return;
+      if (mirror === null) {
+        try {
+          await env.BWM_TELEGRAM_KV.put(`${KV_WIRE_TASKRETRY_PREFIX}${ref}`, JSON.stringify({
+            task_event_id: id, choice: choiceRaw.slice(0, 200), ts: new Date().toISOString(),
+          }), { expirationTtl: WIRE_TASKRETRY_TTL_SECONDS });
+        } catch (e) {
+          console.error(JSON.stringify({ where: "emitWireTaskResolved.statusRetryMarker", error: String(e) }));
+        }
+        return;
+      }
+      if (mirror[0]?.status !== "queued") return;
     }
   }
   if (!id) return; // never went live — no mirror to close
@@ -3134,6 +3147,19 @@ async function retryPendingTaskResolves(env: Env): Promise<void> {
           continue;
         }
         parsed.task_event_id = rows[0].id;
+      }
+      // Status guard before EVERY replay (codex r5): the mirror may have been
+      // resolved by another path (late-reply fallback, expiry sweep) while
+      // this marker sat parked — replaying then would double-resolve. An
+      // unavailable read keeps the marker for the next sweep.
+      const mirror = await fetchRows<{ status: string }>(
+        env,
+        `command_tasks?select=status&source_event_id=eq.${encodeURIComponent(parsed.task_event_id)}&limit=1`,
+      );
+      if (mirror === null) continue;
+      if (mirror[0]?.status !== "queued") {
+        await env.BWM_TELEGRAM_KV.delete(k.name);
+        continue;
       }
       const ok = await emitOperationalEvent(env, "task.resolved", {
         task_id: parsed.task_event_id,
@@ -3323,10 +3349,12 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
   // as unavailable, never as a false zero (codex r3; verify-before-claiming).
   lines.push(`<b>Shipped (last 24h):</b> ${!shippedOk ? "(data unavailable)" : shippedCount === 0 ? "nothing new" : `${shippedCount}${shippedTitles.length ? ` — ${escapeHtml(shippedTitles.join(" · "))}` : ""}`}`);
   lines.push(...waitingOnYouLines(openItems));
-  const renderedNoteKeys = appendNotesSection(lines, qItems, "Notes");
   // Friday scorecard (Phase 2): the weekly comms SLO rides the Day Done digest
   // + lands as narrative kind=comms-slo so the trend is queryable. Fail-soft:
   // an unavailable substrate renders as unavailable, never a false zero.
+  // Appended BEFORE the length-budgeted notes so a busy Friday can't truncate
+  // it off the end — notes roll forward, the weekly scorecard doesn't
+  // (codex r5).
   if (etNow().weekday === "Fri") {
     const sc = await computeCommsScorecard(env);
     if (sc) {
@@ -3336,6 +3364,7 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
       lines.push("<b>Comms scorecard:</b> (data unavailable)");
     }
   }
+  const renderedNoteKeys = appendNotesSection(lines, qItems, "Notes");
   if (BOARD_URL) lines.push(`<i>Detail: ${escapeHtml(BOARD_URL)}</i>`);
   lines.push(`<i>Reply to anything by ref ("C-003: go") — or just type what you want.</i>`);
   const text = safeHtmlTruncate(lines.join("\n"), 3900);
