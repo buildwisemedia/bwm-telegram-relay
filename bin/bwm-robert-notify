@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# bwm-robert-notify — send Robert a typed One Wire message (Attention-Routing v2.0.0).
+#
+# Usage:
+#   bwm-robert-notify --type fire|call|signoff|fyi --punchline "one line" \
+#     [--stakes "what it means in $"] [--rec "my recommendation"] [--ask "the ask"] \
+#     [--option "label"] [--option "label"] [--link URL] [--key suppress-key] \
+#     [--expires YYYY-MM-DD] [--origin name] [--json '{...raw body...}']
+#
+# Types:
+#   fyi     — NEVER pings; queues into the Day Done digest.
+#   call    — a decision only Robert can make; include --rec + --option(s).
+#   signoff — client-facing HITL approval; include --link to the review page.
+#   fire    — client/business breakage; repeats with the same --key EDIT the
+#             original message instead of re-pinging.
+#
+# Auth: $BWM_INTERNAL_KEY (falls back to ~/.claude/settings.json env block).
+# Exit: 0 sent/queued · 64 bad args · 78 no key · 1 relay error.
+set -euo pipefail
+
+RELAY_URL="${BWM_TELEGRAM_RELAY_URL:-https://bwm-telegram-relay.robert-ba0.workers.dev}"
+
+if [ -z "${BWM_INTERNAL_KEY:-}" ]; then
+  BWM_INTERNAL_KEY=$(python3 - <<'PY'
+import json, os
+p = os.path.expanduser("~/.claude/settings.json")
+try:
+    print(json.load(open(p)).get("env", {}).get("BWM_INTERNAL_KEY", ""))
+except Exception:
+    print("")
+PY
+)
+fi
+if [ -z "$BWM_INTERNAL_KEY" ]; then
+  echo "bwm-robert-notify: BWM_INTERNAL_KEY not set (settings.json env or export)" >&2
+  exit 78
+fi
+
+TYPE="" PUNCHLINE="" STAKES="" REC="" ASK="" LINK="" KEY="" EXPIRES="" ORIGIN="" RAW_JSON=""
+OPTIONS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --type)      TYPE="$2"; shift 2;;
+    --punchline) PUNCHLINE="$2"; shift 2;;
+    --stakes)    STAKES="$2"; shift 2;;
+    --rec)       REC="$2"; shift 2;;
+    --ask)       ASK="$2"; shift 2;;
+    --option)    OPTIONS+=("$2"); shift 2;;
+    --link)      LINK="$2"; shift 2;;
+    --key)       KEY="$2"; shift 2;;
+    --expires)   EXPIRES="$2"; shift 2;;
+    --origin)    ORIGIN="$2"; shift 2;;
+    --json)      RAW_JSON="$2"; shift 2;;
+    -h|--help)   sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    *) echo "bwm-robert-notify: unknown arg: $1" >&2; exit 64;;
+  esac
+done
+
+if [ -n "$RAW_JSON" ]; then
+  BODY="$RAW_JSON"
+else
+  if [ -z "$TYPE" ] || [ -z "$PUNCHLINE" ]; then
+    echo "bwm-robert-notify: --type and --punchline are required (or --json)" >&2
+    exit 64
+  fi
+  BODY=$(
+    TYPE="$TYPE" PUNCHLINE="$PUNCHLINE" STAKES="$STAKES" REC="$REC" ASK="$ASK" \
+    LINK="$LINK" KEY="$KEY" EXPIRES="$EXPIRES" ORIGIN="${ORIGIN:-cli:$(whoami)}" \
+    python3 -c '
+import json, os, sys
+body = {"type": os.environ["TYPE"], "punchline": os.environ["PUNCHLINE"]}
+for arg, field in (("STAKES","stakes"),("REC","rec"),("ASK","ask"),("LINK","link"),
+                   ("KEY","key"),("EXPIRES","expires_at"),("ORIGIN","origin")):
+    v = os.environ.get(arg, "")
+    if v: body[field] = v
+opts = [o for o in sys.argv[1:] if o.strip()]
+if opts: body["options"] = opts
+print(json.dumps(body))
+' ${OPTIONS[@]+"${OPTIONS[@]}"}
+  )
+fi
+
+# curl, not python-urllib: Cloudflare blocks the python-urllib UA (error 1010).
+RESP=$(curl -sS -w $'\n%{http_code}' -X POST "$RELAY_URL/notify" \
+  -H "X-BWM-Internal-Key: $BWM_INTERNAL_KEY" \
+  -H "Content-Type: application/json" \
+  --data "$BODY")
+CODE=$(printf '%s' "$RESP" | tail -n1)
+PAYLOAD=$(printf '%s' "$RESP" | sed '$d')
+printf '%s\n' "$PAYLOAD"
+if [ "$CODE" != "200" ]; then
+  echo "bwm-robert-notify: relay returned HTTP $CODE" >&2
+  exit 1
+fi

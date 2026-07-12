@@ -6,7 +6,8 @@ workers_dev = true
 
 [triggers]
 # Heartbeat every 15 min — watchdog threshold is 2× interval = 30 min staleness max.
-crons = ["*/15 * * * *"]
+# 20:30 UTC = 16:30 EDT One Wire Day Done digest (15:30 EST in winter — acceptable drift).
+crons = ["*/15 * * * *", "30 20 * * *"]
 
 [[kv_namespaces]]
 binding = "BWM_TELEGRAM_KV"
