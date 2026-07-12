@@ -821,6 +821,10 @@ async function handleEvent(
           console.error(JSON.stringify({ where: "handleEvent.wireFire", error: r.error ?? r.action }));
           return;
         }
+        // A claim-pending skip is NOT a delivery: leave the dedup key unset so
+        // a projector retry can land after the winning send resolves (codex r5;
+        // the hourly incident cadence also re-surfaces open incidents).
+        if (r.action === "skipped_claim_pending") return;
         // Delivery succeeded — NOW mark the projector-retry dedup key.
         if (eventId) {
           await env.BWM_TELEGRAM_KV.put(`${KV_DEDUP_PREFIX}${eventId}`, "1", {
@@ -1731,6 +1735,17 @@ async function processTelegramReply(
   }
 
   if (wireMeta?.ref && (wireMeta.type === "call" || wireMeta.type === "signoff")) {
+    // Idempotency parity with the reaction + digest paths (codex r5): a second
+    // reply to an already-answered decision is a follow-up, not a new decision.
+    const stillOpen = (await env.BWM_TELEGRAM_KV.get(`${KV_WIRE_OPEN_PREFIX}${wireMeta.ref}`)) !== null;
+    if (!stillOpen) {
+      try {
+        await sendTelegramMessage(botToken, chatId,
+          `ℹ️ ${wireMeta.ref} was already answered — treating this as a follow-up note.`,
+          undefined, message.message_id);
+      } catch { /* fail-soft */ }
+      return false; // normal routing still delivers the text to the responder
+    }
     const choiceNum = /^\s*([1-9])\b/.exec(text)?.[1] ?? null;
     // Persist the decision FIRST; only then clear the waiting-on-you entry and
     // confirm. If the insert fails (Supabase outage) the item stays open and
@@ -2777,6 +2792,9 @@ async function dispatchWire(
         reg.count += 1;
         const updateLine = `↻ ${et.hhmm} ET — ${(input.punchline === reg.base.punchline ? (input.stakes ?? `repeat ×${reg.count}`) : input.punchline).slice(0, 150)}`;
         reg.updates = [...reg.updates, updateLine].slice(-WIRE_FIRE_MAX_UPDATES);
+        // Latest coalesced incident wins for BOTH resolve paths — digest
+        // (base.origin) and direct reply (outbound row) stay consistent (r5).
+        if (input.origin) reg.base.origin = input.origin;
         const text = renderWire(reg.base, reg.ref, reg.updates);
         const edit = await editTelegramMessage(botToken, chatId, reg.message_id, text);
         if (edit.ok) {
@@ -2799,7 +2817,22 @@ async function dispatchWire(
           });
           return { ok: true, action: "edited", ref: reg.ref };
         }
-        // Message gone/too old — fall through and send a fresh one.
+        // Only PERMANENT edit failures (message deleted / uneditable) fall
+        // through to a fresh send. Transient ones (429/5xx/network) return
+        // handled-with-warning — the event row is persisted and the next
+        // same-key occurrence retries the edit (codex r5: a storm of 429s
+        // must not recreate the re-ping flood).
+        const permanent = /message to edit not found|message can't be edited|MESSAGE_ID_INVALID/i.test(edit.error ?? "");
+        if (!permanent) {
+          console.warn(JSON.stringify({ where: "dispatchWire.fireEdit", warn: "transient_edit_failure", detail: edit.error, ref: reg.ref }));
+          await createOutboundLog(env, {
+            sourceRoute, originEventId: origin?.originEventId ?? null, originEventType: origin?.originEventType ?? null,
+            originSessionId: input.session_id ?? null, parseMode: "HTML", text, status: "failed",
+            error: `edit_transient: ${(edit.error ?? "").slice(0, 150)}`,
+            metadata: { wire: { type: "fire", ref: reg.ref, action: "edit_failed_transient", key: input.key ?? input.punchline } },
+          });
+          return { ok: false, action: "edit_failed_transient", ref: reg.ref, error: edit.error };
+        }
         console.warn(JSON.stringify({ where: "dispatchWire.fireEdit", warn: edit.error, ref: reg.ref }));
       } catch (e) {
         console.error(JSON.stringify({ where: "dispatchWire.fireRegistry", error: String(e) }));
@@ -2929,7 +2962,10 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
     const raw = await env.BWM_TELEGRAM_KV.get(k.name);
     if (!raw) return null;
     try { return JSON.parse(raw) as { ref: string; base: WireInput; count: number }; } catch { return null; }
-  }))).filter((x): x is { ref: string; base: WireInput; count: number } => !!x);
+  }))).filter((x): x is { ref: string; base: WireInput; count: number } =>
+    // Skip in-flight {pending:true} claims + malformed rows — rendering one
+    // would throw on base.punchline and abort the whole digest (codex r5).
+    !!x && !!(x as { base?: WireInput }).base && typeof (x as { base?: WireInput }).base?.punchline === "string");
 
   // Shipped — rolling 24h from operational_events
   let shippedCount = 0;
@@ -2977,9 +3013,15 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
     for (const o of openItems.slice(0, 10)) {
       const rec = String(o["rec"] ?? "").slice(0, 60);
       const deferred = String(o["deferred"] ?? "");
+      const opts = Array.isArray(o["options"])
+        ? (o["options"] as unknown[]).map((v, i) => `${i + 1}=${String(v).slice(0, 24)}`).join(" · ").slice(0, 90)
+        : "";
+      const link = String(o["link"] ?? "").slice(0, 120);
       lines.push(
         `• ${escapeHtml(o.ref)} — ${escapeHtml(String(o["punchline"] ?? "").slice(0, 80))}` +
         (rec ? ` · <b>rec:</b> ${escapeHtml(rec)}` : "") +
+        (opts ? ` · ${escapeHtml(opts)}` : "") +
+        (link ? ` · ${escapeHtml(link)}` : "") +
         (deferred ? ` <i>(held: ${escapeHtml(deferred)})</i>` : ""),
       );
     }
@@ -2990,7 +3032,8 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
   if (qItems.length > 0) {
     lines.push(`<b>Notes (${qItems.length}):</b>`);
     for (const it of qItems.slice(0, 12)) {
-      lines.push(`• ${escapeHtml(String(it["punchline"] ?? "").slice(0, 90))}`);
+      const noteLink = String(it["link"] ?? "").slice(0, 120);
+      lines.push(`• ${escapeHtml(String(it["punchline"] ?? "").slice(0, 90))}${noteLink ? ` — ${escapeHtml(noteLink)}` : ""}`);
     }
     if (qItems.length > 12) lines.push(`…+${qItems.length - 12} more`);
   }
