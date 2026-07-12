@@ -88,7 +88,6 @@ const OUTBOUND_TEXT_MAX = 4_000;
 // | fyi. fyi NEVER sends live — it queues for the daily digest. call/signoff
 // respect quiet hours, Wednesdays, and the daily interrupt budget. fire always
 // sends, and repeats with the same `key` EDIT the original message in place.
-const KV_WIRE_SEQ_PREFIX = "wire:seq:"; // wire:seq:F|C|S → last ref number
 const KV_WIRE_FIRE_PREFIX = "wire:fire:"; // wire:fire:<hash> → live incident msg
 const KV_WIRE_OPEN_PREFIX = "wire:open:"; // wire:open:<ref> → unanswered call/signoff
 const KV_WIRE_DIGESTQ_PREFIX = "wire:digestq:"; // wire:digestq:<ulid> → queued digest item
@@ -796,6 +795,13 @@ async function handleEvent(
         status: "skipped",
         metadata: { reason: "p7_digest", wire: { type: "fyi", queued: "digest" } },
       });
+      // Queued successfully — mark the retry dedup key so a projector re-send
+      // doesn't stack duplicate digest notes (codex review 2026-07-12 r2).
+      if (eventId) {
+        await env.BWM_TELEGRAM_KV.put(`${KV_DEDUP_PREFIX}${eventId}`, "1", {
+          expirationTtl: DEDUP_TTL_SECONDS,
+        });
+      }
       return json({ ok: true, action: "queued_digest_p7", event_type: eventType });
     }
     const fireInput: WireInput = {
@@ -1596,7 +1602,7 @@ async function processTelegramReply(
     `${env.SUPABASE_URL.replace(/\/+$/, "")}/rest/v1/telegram_outbound` +
     `?telegram_message_id=eq.${replyToMessageId}` +
     `&chat_id=eq.${encodeURIComponent(String(chatId))}` +
-    `&select=origin_event_id,origin_event_type,metadata&limit=1`;
+    `&select=origin_event_id,origin_event_type,metadata&order=queued_at.desc&limit=1`;
   let originEventId = "";
   let originEventType = "";
   let wireMeta: { type?: string; ref?: string } | null = null;
@@ -1631,12 +1637,66 @@ async function processTelegramReply(
     return false;
   }
 
+  // A resolve-reply on a FIRE clears its edit-in-place registry so the incident
+  // leaves "Open fires" and a later same-key event starts a fresh message
+  // (codex r2). Falls through — the legacy path below emits incident-resolved.
+  if (wireMeta?.type === "fire" && RESOLVE_CMDS.has(text.trim().toLowerCase())) {
+    const fireRawKey = (wireMeta as { key?: string }).key;
+    if (fireRawKey) {
+      try {
+        await env.BWM_TELEGRAM_KV.delete(`${KV_WIRE_FIRE_PREFIX}${shortHash(fireRawKey)}`);
+      } catch (e) {
+        console.error(JSON.stringify({ where: "processTelegramReply.fireRegistryClear", error: String(e) }));
+      }
+    }
+  }
+
   // ── ONE WIRE DECISION PATH ─────────────────────────────────────────────────
   // A reply to a CALL/SIGNOFF is Robert's decision: clear the waiting-on-you
   // registry, log the decision as a narrative (sessions + Bob read
   // operational_events), confirm receipt — then CONTINUE normal routing
   // (return false) so the responder pipeline still acts on free-text
   // instructions exactly like any other inbound message.
+  // Replying to the DIGEST with "C-8KQ2M: go" answers that ref — the only
+  // path for decisions that were deferred (never sent live) (codex r2).
+  if (wireMeta && (wireMeta as { type?: string }).type === "digest") {
+    const m = /^\s*([FCS]-[A-Z0-9]{3,6})\s*[:,-]?\s*(.*)$/i.exec(text.trim());
+    if (m) {
+      const ref = m[1].toUpperCase();
+      const answer = (m[2] || "").trim();
+      const openRaw = await env.BWM_TELEGRAM_KV.get(`${KV_WIRE_OPEN_PREFIX}${ref}`);
+      if (openRaw) {
+        let openType = "call";
+        try { openType = String((JSON.parse(openRaw) as Record<string, unknown>)["type"] ?? "call"); } catch { /* default */ }
+        const choiceNum = /^([1-9])\b/.exec(answer)?.[1] ?? null;
+        const logged = await emitOperationalEvent(env, "narrative", {
+          source: "telegram-reply",
+          kind: "wire-decision",
+          wire_ref: ref,
+          wire_type: openType,
+          option: choiceNum,
+          choice_raw: answer.slice(0, 500) || "(ack)",
+          inbound_event_id: inboundEventId,
+          note: `Robert answered ${ref} via digest reply${choiceNum ? ` with option ${choiceNum}` : ""}: "${answer.slice(0, 200)}"`,
+        }, `telegram-reply-${inboundEventId}`);
+        if (logged) await env.BWM_TELEGRAM_KV.delete(`${KV_WIRE_OPEN_PREFIX}${ref}`);
+        try {
+          await sendTelegramMessage(botToken, chatId,
+            logged ? `✅ ${ref} logged. On it.` : `⚠️ Couldn't log ${ref} just now — it stays on your list; try again in a minute.`,
+            undefined, message.message_id);
+        } catch (e) {
+          console.error(JSON.stringify({ where: "processTelegramReply.digestConfirm", error: String(e) }));
+        }
+      } else {
+        try {
+          await sendTelegramMessage(botToken, chatId, `${m[1].toUpperCase()} isn't open (already answered or expired).`, undefined, message.message_id);
+        } catch { /* fail-soft */ }
+      }
+      // Continue normal routing either way — responder still sees the text.
+      return false;
+    }
+  }
+
   if (wireMeta?.ref && (wireMeta.type === "call" || wireMeta.type === "signoff")) {
     const choiceNum = /^\s*([1-9])\b/.exec(text)?.[1] ?? null;
     // Persist the decision FIRST; only then clear the waiting-on-you entry and
@@ -2076,7 +2136,12 @@ async function handleReactionUpdate(env: Env, update: TelegramUpdate): Promise<v
   // waiting-on-you entry is cleared only after it persists, so a Supabase
   // outage never silently swallows a decision.
   const wireOnAck = (origin?.metadata ?? {})["wire"] as { type?: string; ref?: string } | undefined;
-  if (wireOnAck?.ref && (wireOnAck.type === "call" || wireOnAck.type === "signoff") && emojis.includes("👍")) {
+  const ackRefStillOpen = wireOnAck?.ref
+    ? (await env.BWM_TELEGRAM_KV.get(`${KV_WIRE_OPEN_PREFIX}${wireOnAck.ref}`)) !== null
+    : false;
+  // Only an OPEN ref accepts a reaction-decision — a late/accidental 👍 on an
+  // already-answered item stays a plain ack (codex r2, idempotency).
+  if (wireOnAck?.ref && (wireOnAck.type === "call" || wireOnAck.type === "signoff") && emojis.includes("👍") && ackRefStillOpen) {
     let decisionLogged = false;
     if (supabaseConfigured(env)) {
       try {
@@ -2443,27 +2508,15 @@ function parseWireInput(raw: Record<string, unknown>): { ok: true; input: WireIn
   };
 }
 
-/** Monotonic per-prefix ref counter (F-/C-/S-###). Workers KV has no atomic
- *  compare-and-set, so we write a nonce alongside the counter and read it back:
- *  seeing a foreign nonce means another writer raced us → retry with a bumped
- *  candidate. A duplicate ref would collide `wire:open:<ref>` state (codex
- *  review 2026-07-12), so after retries we fall back to a time-salted ref that
- *  is unique by construction (non-sequential, still short). */
-async function nextWireRef(env: Env, type: WireType): Promise<string> {
+/** Wire refs are unique BY CONSTRUCTION: prefix + the last 5 Crockford chars of
+ *  a fresh ULID (25 bits of randomness at millisecond granularity). Workers KV
+ *  has no compare-and-set, so any counter scheme can double-allocate under
+ *  concurrency and collide `wire:open:<ref>` state (codex review 2026-07-12,
+ *  twice) — random short refs end that class outright. Still short + typeable
+ *  ("C-8KQ2M"); sequence aesthetics traded for correctness. */
+function nextWireRef(type: WireType): string {
   const prefix = type === "fire" ? "F" : type === "call" ? "C" : "S";
-  const kvKey = `${KV_WIRE_SEQ_PREFIX}${prefix}`;
-  for (let attempt = 0; attempt < 4; attempt++) {
-    const raw = (await env.BWM_TELEGRAM_KV.get(kvKey)) ?? "0";
-    const current = parseInt(raw.split("|")[0] ?? "0", 10);
-    const next = (Number.isFinite(current) ? current : 0) + 1 + attempt;
-    const nonce = ulid().slice(-6);
-    await env.BWM_TELEGRAM_KV.put(kvKey, `${next}|${nonce}`);
-    const check = await env.BWM_TELEGRAM_KV.get(kvKey);
-    if (check === `${next}|${nonce}`) {
-      return `${prefix}-${String(next).padStart(3, "0")}`;
-    }
-  }
-  return `${prefix}-${ulid().slice(-4)}`;
+  return `${prefix}-${ulid().slice(-5)}`;
 }
 
 const WIRE_EMOJI: Record<WireType, string> = { fire: "🔴", call: "🟡", signoff: "🔵", fyi: "🟢" };
@@ -2554,6 +2607,18 @@ async function dispatchWire(
   origin?: { originEventId?: string | null; originEventType?: string | null },
 ): Promise<WireResult> {
   const et = etNow();
+  let budgetReservedKey: string | null = null;
+  const releaseBudget = async () => {
+    if (!budgetReservedKey) return;
+    try {
+      const n = parseInt((await env.BWM_TELEGRAM_KV.get(budgetReservedKey)) ?? "0", 10) || 0;
+      await env.BWM_TELEGRAM_KV.put(budgetReservedKey, String(Math.max(0, n - 1)), {
+        expirationTtl: WIRE_BUDGET_TTL_SECONDS,
+      });
+    } catch (e) {
+      console.error(JSON.stringify({ where: "dispatchWire.releaseBudget", error: String(e) }));
+    }
+  };
 
   // FYI never interrupts — straight to the digest queue.
   if (input.type === "fyi") {
@@ -2583,12 +2648,19 @@ async function dispatchWire(
     const budgetKey = `${KV_WIRE_BUDGET_PREFIX}${et.date}`;
     const spent = parseInt((await env.BWM_TELEGRAM_KV.get(budgetKey)) ?? "0", 10) || 0;
     if (!deferReason && spent >= WIRE_INTERRUPT_HARD_CAP) deferReason = "budget";
+    if (!deferReason) {
+      // Reserve the interrupt-budget slot BEFORE the send (KV has no CAS; the
+      // stamp-then-release pattern matches the rate limiter — codex r2). The
+      // slot is released on mint/send failure below.
+      await env.BWM_TELEGRAM_KV.put(budgetKey, String(spent + 1), { expirationTtl: WIRE_BUDGET_TTL_SECONDS });
+      budgetReservedKey = budgetKey;
+    }
     if (deferReason) {
       // A deferred decision stays a DECISION: allocate its ref now and register
       // the full input in wire:open so the digest lists it under "Waiting on
       // you" (answerable by ref) instead of flattening it to a note that gets
       // flushed and lost (codex review 2026-07-12).
-      const ref = await nextWireRef(env, input.type);
+      const ref = nextWireRef(input.type);
       await env.BWM_TELEGRAM_KV.put(`${KV_WIRE_OPEN_PREFIX}${ref}`, JSON.stringify({
         type: input.type, punchline: input.punchline, rec: input.rec ?? null,
         link: input.link ?? null, options: input.options ?? null,
@@ -2611,6 +2683,7 @@ async function dispatchWire(
   try {
     botToken = await mintToken(env, "TELEGRAM_BOT_TOKEN");
   } catch (e) {
+    await releaseBudget();
     return { ok: false, action: "failed", error: `token_mint_failed: ${String(e).slice(0, 200)}` };
   }
 
@@ -2632,13 +2705,19 @@ async function dispatchWire(
           await env.BWM_TELEGRAM_KV.put(fireKey, JSON.stringify({ ...reg, last_at: new Date().toISOString() }), {
             expirationTtl: WIRE_FIRE_TTL_SECONDS,
           });
-          await createOutboundLog(env, {
+          const editLogId = await createOutboundLog(env, {
             sourceRoute,
             originEventId: origin?.originEventId ?? null,
             originEventType: origin?.originEventType ?? null,
             originSessionId: input.session_id ?? null, chatId, parseMode: "HTML", text,
             status: "sent",
             metadata: { wire: { type: "fire", ref: reg.ref, action: "edited", count: reg.count, key: input.key ?? null } },
+          });
+          // Stamp the edited row with the message_id so reply lookup (newest-
+          // first) resolves the LATEST coalesced incident (codex r2).
+          await updateOutboundLog(env, editLogId, {
+            status: "sent",
+            telegramMessageId: reg.message_id,
           });
           return { ok: true, action: "edited", ref: reg.ref };
         }
@@ -2650,7 +2729,7 @@ async function dispatchWire(
     }
   }
 
-  const ref = await nextWireRef(env, input.type);
+  const ref = nextWireRef(input.type);
   const text = renderWire(input, ref);
   const outboundId = await createOutboundLog(env, {
     sourceRoute,
@@ -2665,6 +2744,7 @@ async function dispatchWire(
     await updateOutboundLog(env, outboundId, {
       status: "failed", error: result.error ?? "telegram_send_failed", telegramResponse: result.response,
     });
+    await releaseBudget();
     return { ok: false, action: "failed", ref, error: result.error };
   }
   await updateOutboundLog(env, outboundId, {
@@ -2683,13 +2763,13 @@ async function dispatchWire(
 
   if (input.type === "call" || input.type === "signoff") {
     await env.BWM_TELEGRAM_KV.put(`${KV_WIRE_OPEN_PREFIX}${ref}`, JSON.stringify({
-      type: input.type, punchline: input.punchline, link: input.link ?? null,
-      message_id: result.telegramMessageId ?? null, outbound_id: outboundId, ts: new Date().toISOString(),
+      type: input.type, punchline: input.punchline, rec: input.rec ?? null,
+      link: input.link ?? null, options: input.options ?? null,
+      message_id: result.telegramMessageId ?? null, outbound_id: outboundId,
+      input, ts: new Date().toISOString(),
     }), { expirationTtl: WIRE_OPEN_TTL_SECONDS });
-    // Live interrupt spent — count it (budget gates only call/signoff; fires are exempt).
-    const budgetKey = `${KV_WIRE_BUDGET_PREFIX}${et.date}`;
-    const spent = parseInt((await env.BWM_TELEGRAM_KV.get(budgetKey)) ?? "0", 10) || 0;
-    await env.BWM_TELEGRAM_KV.put(budgetKey, String(spent + 1), { expirationTtl: WIRE_BUDGET_TTL_SECONDS });
+    // Budget slot was reserved before the send (see releaseBudget for the
+    // failure path); nothing further to count here.
   }
 
   return { ok: true, action: "sent", ref };
