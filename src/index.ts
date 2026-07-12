@@ -1768,6 +1768,11 @@ async function processTelegramReply(
           console.error(JSON.stringify({ where: "processTelegramReply.digestConfirm", error: String(e) }));
         }
       } else {
+        // Same TTL-expiry hedge as the direct-reply path: close any surviving
+        // task mirror by wire_ref before shrugging (codex Phase 2).
+        if (!ref.startsWith("F-")) {
+          await emitWireTaskResolved(env, null, ref, answer || "(late answer)", `telegram-reply-${inboundEventId}`);
+        }
         try {
           await sendTelegramMessage(botToken, chatId, `${m[1].toUpperCase()} isn't open (already answered or expired).`, undefined, message.message_id);
         } catch { /* fail-soft */ }
@@ -1789,6 +1794,11 @@ async function processTelegramReply(
       } catch { /* pre-Phase-2 registry rows have no task mirror */ }
     }
     if (!stillOpen) {
+      // The registry entry may have EXPIRED (7-day TTL) rather than been
+      // answered — the mirrored command_tasks row outlives KV state (codex
+      // Phase 2). Best-effort close via the wire_ref fallback so a late
+      // answer doesn't strand an "Answer <ref>" task in Robert's queue.
+      await emitWireTaskResolved(env, null, wireMeta.ref, text.trim(), `telegram-reply-${inboundEventId}`);
       try {
         await sendTelegramMessage(botToken, chatId,
           `ℹ️ ${wireMeta.ref} was already answered — treating this as a follow-up note.`,
@@ -2550,19 +2560,29 @@ function escapeHtml(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-/** Truncate rendered Telegram HTML without cutting inside an entity or leaving
- *  a <b>/<i> unclosed — a mid-entity slice makes Telegram REJECT the message
- *  (codex r4). Only <b>/<i> are used by the wire renderer. */
+/** Truncate rendered Telegram HTML without cutting inside an entity or tag —
+ *  a mid-entity slice makes Telegram REJECT the message (codex r4). Handles
+ *  every tag the wire renderers produce (<b>/<i>/<a href>): strips a trailing
+ *  partial tag, then closes whatever the cut left open, innermost first
+ *  (Phase 2 codex review — a link cut mid-<a> was rejecting whole digests). */
 function safeHtmlTruncate(text: string, max: number): string {
   if (text.length <= max) return text;
   let cut = text.slice(0, max);
   cut = cut.replace(/&[a-zA-Z]{0,6}$/, ""); // trailing partial entity
-  cut = cut.replace(/<\/?[bi]?$/, ""); // trailing partial tag
-  for (const tag of ["b", "i"] as const) {
-    const opens = (cut.match(new RegExp(`<${tag}>`, "g")) ?? []).length;
-    const closes = (cut.match(new RegExp(`</${tag}>`, "g")) ?? []).length;
-    if (opens > closes) cut += `</${tag}>`.repeat(opens - closes);
+  cut = cut.replace(/<[^>]*$/, ""); // trailing partial tag (any)
+  const stack: string[] = [];
+  const tagRe = /<(\/?)(b|i|a)(?:\s[^>]*)?>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = tagRe.exec(cut)) !== null) {
+    const name = m[2].toLowerCase();
+    if (m[1]) {
+      const idx = stack.lastIndexOf(name);
+      if (idx !== -1) stack.splice(idx, 1);
+    } else {
+      stack.push(name);
+    }
   }
+  for (const name of stack.reverse()) cut += `</${name}>`;
   return `${cut}…`;
 }
 
@@ -3010,8 +3030,16 @@ async function emitWireTaskQueued(
 }
 
 /** task.resolved emit when a wire-decision lands — closes the command_tasks
- *  row the live send queued. No-op when the item never went live (no task
- *  was queued) or the mirror emit failed at send time. */
+ *  row the live send queued. Two hardenings from the Phase 2 codex review:
+ *  (a) a missing task_event_id (registry expired past its 7-day TTL, or a
+ *  pre-Phase-2 row) falls back to recovering the mirror's ULID by wire_ref
+ *  from operational_events — the command_tasks row outlives KV state;
+ *  (b) a transient emit failure parks a retry marker that the daily digest
+ *  composers sweep, so the mirrored task can't stay queued forever behind a
+ *  one-off Supabase blip. */
+const KV_WIRE_TASKRETRY_PREFIX = "wire:taskretry:";
+const WIRE_TASKRETRY_TTL_SECONDS = 7 * 24 * 60 * 60;
+
 async function emitWireTaskResolved(
   env: Env,
   taskEventId: string | null | undefined,
@@ -3019,15 +3047,60 @@ async function emitWireTaskResolved(
   choiceRaw: string,
   sessionId: string,
 ): Promise<void> {
-  if (!taskEventId) return;
+  let id = taskEventId ?? null;
+  if (!id) {
+    const rows = await fetchRows<{ id: string }>(
+      env,
+      `operational_events?select=id&event_type=eq.task.queued` +
+      `&payload->>wire_ref=eq.${encodeURIComponent(ref)}&order=occurred_at.desc&limit=1`,
+    );
+    id = rows?.[0]?.id ?? null;
+  }
+  if (!id) return; // never went live — no mirror to close
   const ok = await emitOperationalEvent(env, "task.resolved", {
-    task_id: taskEventId,
+    task_id: id,
     outcome: "done",
     resolution: `wire-decision ${ref}: "${choiceRaw.slice(0, 200)}"`,
     source: "bwm-telegram-relay wire-decision",
   }, sessionId);
   if (!ok) {
-    console.error(JSON.stringify({ where: "emitWireTaskResolved", warn: "task_resolved_emit_failed", ref, task_event_id: taskEventId }));
+    console.error(JSON.stringify({ where: "emitWireTaskResolved", warn: "task_resolved_emit_failed_parking_retry", ref, task_event_id: id }));
+    try {
+      await env.BWM_TELEGRAM_KV.put(`${KV_WIRE_TASKRETRY_PREFIX}${ref}`, JSON.stringify({
+        task_event_id: id, choice: choiceRaw.slice(0, 200), ts: new Date().toISOString(),
+      }), { expirationTtl: WIRE_TASKRETRY_TTL_SECONDS });
+    } catch (e) {
+      console.error(JSON.stringify({ where: "emitWireTaskResolved.retryMarker", error: String(e) }));
+    }
+  }
+}
+
+/** Sweep parked task-resolve retries (see emitWireTaskResolved). Runs at the
+ *  top of both daily digest composers — at most 50 markers/sweep, deleted only
+ *  after the emit succeeds. */
+async function retryPendingTaskResolves(env: Env): Promise<void> {
+  try {
+    const list = await env.BWM_TELEGRAM_KV.list({ prefix: KV_WIRE_TASKRETRY_PREFIX, limit: 50 });
+    for (const k of list.keys) {
+      const raw = await env.BWM_TELEGRAM_KV.get(k.name);
+      if (!raw) continue;
+      const ref = k.name.slice(KV_WIRE_TASKRETRY_PREFIX.length);
+      let parsed: { task_event_id?: string; choice?: string } | null = null;
+      try { parsed = JSON.parse(raw) as { task_event_id?: string; choice?: string }; } catch { /* malformed */ }
+      if (!parsed?.task_event_id) {
+        await env.BWM_TELEGRAM_KV.delete(k.name);
+        continue;
+      }
+      const ok = await emitOperationalEvent(env, "task.resolved", {
+        task_id: parsed.task_event_id,
+        outcome: "done",
+        resolution: `wire-decision ${ref}: "${(parsed.choice ?? "").slice(0, 200)}" (retried)`,
+        source: "bwm-telegram-relay wire-decision-retry",
+      }, "daemon:bwm-telegram-relay");
+      if (ok) await env.BWM_TELEGRAM_KV.delete(k.name);
+    }
+  } catch (e) {
+    console.error(JSON.stringify({ where: "retryPendingTaskResolves", error: String(e) }));
   }
 }
 
@@ -3147,6 +3220,7 @@ async function listDigestNotes(env: Env): Promise<Array<Record<string, unknown> 
 async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireResult & { items?: number }> {
   const chatId = await env.BWM_TELEGRAM_KV.get(KV_CHAT_ID_KEY);
   if (!chatId) return { ok: false, action: "skipped_no_chat_id" };
+  await retryPendingTaskResolves(env);
   const et = etNow();
 
   // Queued notes
@@ -3281,20 +3355,43 @@ async function fetchRows<T>(env: Env, query: string): Promise<T[] | null> {
   }
 }
 
-/** UTC instants of today's ET midnight → tomorrow's ET midnight. Offset comes
- *  from Intl longOffset so EDT/EST both resolve; on a parse failure fall back
- *  to -05:00 (worst case: the calendar window shifts an hour — a digest-grade
- *  imprecision, not a correctness gate). */
-function etDayRangeUtc(): { startIso: string; endIso: string } {
-  const et = etNow();
+/** ET offset ("-04:00" / "-05:00") at a given instant via Intl longOffset;
+ *  -05:00 fallback on parse failure (digest-grade imprecision, not a
+ *  correctness gate). */
+function etOffsetAt(d: Date): string {
   const offPart = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", timeZoneName: "longOffset" })
-    .formatToParts(new Date()).find((p) => p.type === "timeZoneName")?.value ?? "";
+    .formatToParts(d).find((p) => p.type === "timeZoneName")?.value ?? "";
   const m = /GMT([+-])(\d{1,2})(?::(\d{2}))?/.exec(offPart);
   const sign = m?.[1] ?? "-";
   const hh = (m?.[2] ?? "5").padStart(2, "0");
   const mm = m?.[3] ?? "00";
-  const start = new Date(`${et.date}T00:00:00${sign}${hh}:${mm}`);
-  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+  return `${sign}${hh}:${mm}`;
+}
+
+/** UTC instant of an ET date's local midnight. Two-pass: derive the offset at
+ *  a guessed instant, then re-derive at the refined instant — converges across
+ *  DST transitions. */
+function etMidnightUtc(etDate: string): Date {
+  let guess = new Date(`${etDate}T00:00:00-05:00`);
+  for (let i = 0; i < 2; i++) {
+    guess = new Date(`${etDate}T00:00:00${etOffsetAt(guess)}`);
+  }
+  return guess;
+}
+
+/** UTC instants of today's ET midnight → tomorrow's ET midnight. BOTH
+ *  boundaries derive their own offset (codex Phase 2): on DST transition days
+ *  a start-offset + 24h window would shift the New York calendar day by an
+ *  hour. */
+function etDayRangeUtc(): { startIso: string; endIso: string } {
+  const et = etNow();
+  const start = etMidnightUtc(et.date);
+  // 36h forward is safely inside the next ET day regardless of a 23/25h day.
+  const probe = new Date(start.getTime() + 36 * 60 * 60 * 1000);
+  const nextDate = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(probe);
+  const end = etMidnightUtc(nextDate);
   return { startIso: start.toISOString(), endIso: end.toISOString() };
 }
 
@@ -3394,6 +3491,7 @@ async function redeliverDeferredDecisions(env: Env, chatId: string): Promise<num
 async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireResult & { redelivered?: number; items?: number }> {
   const chatId = await env.BWM_TELEGRAM_KV.get(KV_CHAT_ID_KEY);
   if (!chatId) return { ok: false, action: "skipped_no_chat_id" };
+  await retryPendingTaskResolves(env);
   const et = etNow();
 
   const redelivered = await redeliverDeferredDecisions(env, chatId);
@@ -3635,13 +3733,24 @@ async function computeCommsScorecard(env: Env): Promise<CommsScorecard | null> {
     if (Number.isFinite(dt) && dt >= 0) latencies.push(dt);
   }
   latencies.sort((a, b) => a - b);
-  const medianMs = latencies.length > 0 ? latencies[Math.floor(latencies.length / 2)] : null;
+  // True median: average the two middle samples on even counts (codex Phase 2
+  // — floor(n/2) alone reports the upper-middle value).
+  const mid = Math.floor(latencies.length / 2);
+  const medianMs = latencies.length === 0
+    ? null
+    : latencies.length % 2 === 1
+      ? latencies[mid]
+      : (latencies[mid - 1] + latencies[mid]) / 2;
 
   let unanswered = 0;
   try {
     unanswered = (await env.BWM_TELEGRAM_KV.list({ prefix: KV_WIRE_OPEN_PREFIX, limit: 100 })).keys.length;
   } catch (e) {
+    // Same honesty bar as the Supabase reads: an unavailable substrate makes
+    // the WHOLE scorecard unavailable — never a false-zero metric (codex
+    // Phase 2).
     console.error(JSON.stringify({ where: "computeCommsScorecard.unanswered", error: String(e) }));
+    return null;
   }
 
   return {
