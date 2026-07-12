@@ -3018,6 +3018,7 @@ async function emitWireTaskQueued(
         ? `Options: ${input.options.map((o, i) => `${i + 1}=${o}`).join(" · ")}`
         : null,
       input.link ?? null,
+      "Human decision — Robert answers on the wire (reply or 👍 in Telegram); not agent-executable.",
     ].filter(Boolean).join("\n").slice(0, 1000) || `Wire ${input.type} awaiting Robert's answer.`,
     priority: "P1",
     assignee: "robert",
@@ -3025,6 +3026,10 @@ async function emitWireTaskQueued(
     source: "bwm-telegram-relay dispatchWire",
     wire_ref: ref,
     wire_type: input.type,
+    // Tertiary human-gate signal for text classifiers (the bridge excludes
+    // created_by=one-wire at fetch + classify; this phrase also matches its
+    // HUMAN_GATE_RE if a future consumer only reads text).
+    human_gate: "Robert answers on the wire — human decision, not agent-executable",
     ...(redelivered ? { redelivered: true } : {}),
   }, input.session_id ?? "daemon:bwm-telegram-relay");
 }
@@ -3499,19 +3504,78 @@ async function redeliverDeferredDecisions(env: Env, chatId: string): Promise<num
       status: "sent", telegramMessageId: result.telegramMessageId, telegramResponse: result.response, error: null,
     });
     // Now live → it's a task Robert owes (same mirror as a live dispatch).
+    // Lookup-first: if a PRIOR redelivery emitted the mirror and then lost
+    // its KV update, emitting again would orphan a duplicate task (codex r3).
     let taskEventId = (entry["task_event_id"] as string | null | undefined) ?? null;
+    if (!taskEventId) {
+      const prior = await fetchRows<{ id: string }>(
+        env,
+        `operational_events?select=id&event_type=eq.task.queued` +
+        `&payload->>wire_ref=eq.${encodeURIComponent(entry.ref)}&order=occurred_at.desc&limit=1`,
+      );
+      taskEventId = prior?.[0]?.id ?? null;
+    }
     if (!taskEventId) taskEventId = await emitWireTaskQueued(env, input, entry.ref, true);
     const { ref: _ref, deferred: _deferred, ...regRest } = entry;
-    await env.BWM_TELEGRAM_KV.put(`${KV_WIRE_OPEN_PREFIX}${entry.ref}`, JSON.stringify({
+    const updatedEntry = JSON.stringify({
       ...regRest,
       message_id: result.telegramMessageId ?? null,
       outbound_id: outboundId,
       task_event_id: taskEventId,
       redelivered_at: new Date().toISOString(),
-    }), { expirationTtl: WIRE_OPEN_TTL_SECONDS });
+    });
+    // This write is what stops tomorrow's run from re-sending — retry once
+    // on failure to shrink the duplicate-ping window (codex r3).
+    try {
+      await env.BWM_TELEGRAM_KV.put(`${KV_WIRE_OPEN_PREFIX}${entry.ref}`, updatedEntry, { expirationTtl: WIRE_OPEN_TTL_SECONDS });
+    } catch (e) {
+      console.error(JSON.stringify({ where: "redeliverDeferred.registryUpdate", error: String(e), ref: entry.ref }));
+      try {
+        await env.BWM_TELEGRAM_KV.put(`${KV_WIRE_OPEN_PREFIX}${entry.ref}`, updatedEntry, { expirationTtl: WIRE_OPEN_TTL_SECONDS });
+      } catch (e2) {
+        console.error(JSON.stringify({ where: "redeliverDeferred.registryUpdateRetry", error: String(e2), ref: entry.ref }));
+      }
+    }
     redelivered += 1;
   }
   return redelivered;
+}
+
+/** Close command_tasks mirrors whose wire:open registry entry expired
+ *  unanswered (7-day TTL): the ref is no longer answerable from Telegram and
+ *  the plan query excludes one-wire rows, so without this the obligation
+ *  vanishes from every surface while staying queued forever (codex r3).
+ *  Expiring mirrors match the registry lifecycle Phase 1 locked in. Runs
+ *  daily from the Day Ahead composer. */
+async function expireOrphanedWireMirrors(env: Env): Promise<void> {
+  try {
+    const rows = await fetchRows<{ source_event_id: string | null; title: string | null; created_at: string }>(
+      env,
+      `command_tasks?select=source_event_id,title,created_at&created_by=eq.one-wire&status=eq.queued&order=created_at.asc&limit=50`,
+    );
+    if (!rows || rows.length === 0) return;
+    const openList = await env.BWM_TELEGRAM_KV.list({ prefix: KV_WIRE_OPEN_PREFIX, limit: 100 });
+    const openRefs = new Set(openList.keys.map((k) => k.name.slice(KV_WIRE_OPEN_PREFIX.length)));
+    const cutoffMs = Date.now() - WIRE_OPEN_TTL_SECONDS * 1000;
+    for (const row of rows) {
+      const m = /^Answer ([FCS]-[A-Z0-9]{3,6}) /.exec(row.title ?? "");
+      if (!m || openRefs.has(m[1])) continue;
+      // Younger-than-TTL rows with no registry entry were ANSWERED (decision
+      // path deletes the entry; task.resolved rides it or the retry sweep) —
+      // only a full TTL age proves expiry.
+      const created = Date.parse(row.created_at);
+      if (!Number.isFinite(created) || created > cutoffMs) continue;
+      if (!row.source_event_id) continue;
+      await emitOperationalEvent(env, "task.resolved", {
+        task_id: row.source_event_id,
+        outcome: "done",
+        resolution: `expired unanswered — wire registry TTL (7d); ${m[1]} is no longer answerable by ref`,
+        source: "bwm-telegram-relay wire-mirror-expiry",
+      }, "daemon:bwm-telegram-relay");
+    }
+  } catch (e) {
+    console.error(JSON.stringify({ where: "expireOrphanedWireMirrors", error: String(e) }));
+  }
 }
 
 /** Compose + send the Day Ahead morning digest (09:00 ET): redelivered
@@ -3525,6 +3589,7 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
   const chatId = await env.BWM_TELEGRAM_KV.get(KV_CHAT_ID_KEY);
   if (!chatId) return { ok: false, action: "skipped_no_chat_id" };
   await retryPendingTaskResolves(env);
+  await expireOrphanedWireMirrors(env);
   const et = etNow();
 
   const redelivered = await redeliverDeferredDecisions(env, chatId);
@@ -3543,10 +3608,15 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
     `ea_calendar_events?select=summary,start_at,all_day,status` +
     `&start_at=gte.${encodeURIComponent(calWideStart)}&start_at=lt.${encodeURIComponent(endIso)}&order=start_at.asc&limit=40`,
   );
+  // Numeric compares: PostgREST may format offsets as +00:00 while startIso
+  // uses .000Z — a string compare drops boundary events (codex r3 P3).
+  const startMs = Date.parse(startIso);
+  const endMs = Date.parse(endIso);
   const cal = calRaw === null ? null : calRaw.filter((r) => {
     if (!r.start_at) return false;
     if (r.all_day) return r.start_at.slice(0, 10) === et.date;
-    return r.start_at >= startIso && r.start_at < endIso;
+    const t = Date.parse(r.start_at);
+    return Number.isFinite(t) && t >= startMs && t < endMs;
   });
   const needsThreads = await fetchRows<{ sender_email: string | null; subject: string | null; action_taken: string | null }>(
     env,
@@ -3626,7 +3696,14 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
       if (inboxLines.length > 6) lines.push(`…+${inboxLines.length - 6} more`);
       if (partial) lines.push("<i>(one inbox source unavailable this run)</i>");
     }
-    if (drafts !== null && drafts.length > 0) lines.push(`✍️ Drafts ready to send: ${drafts.length}`);
+  }
+  // Drafts render independently of the inbox sources (codex r3): a working
+  // ea_drafts read must show even when both inbox lanes are down, and a
+  // failed one gets an honest marker. Zero drafts = no line (non-signal).
+  if (drafts === null) {
+    lines.push("✍️ Drafts: (data unavailable)");
+  } else if (drafts.length > 0) {
+    lines.push(`✍️ Drafts ready to send: ${drafts.length}`);
   }
 
   // Today's plan (command queue) — wire-mirror rows are excluded in the
@@ -3789,7 +3866,10 @@ async function computeCommsScorecard(env: Env): Promise<CommsScorecard | null> {
     const p = d.payload ?? {};
     const ref = String(p["wire_ref"] ?? "");
     const wt = String(p["wire_type"] ?? "");
-    if (!ref || (wt !== "call" && wt !== "signoff")) continue;
+    // CALL only — the metric is named median_call_response and §12's success
+    // bar is about CALL response; mixing signoff samples would misreport it
+    // (codex r3).
+    if (!ref || wt !== "call") continue;
     const q = firstQueuedByRef.get(ref);
     if (q === undefined) continue;
     const dt = Date.parse(d.occurred_at) - q;
