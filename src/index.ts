@@ -3054,7 +3054,19 @@ async function emitWireTaskResolved(
       `operational_events?select=id&event_type=eq.task.queued` +
       `&payload->>wire_ref=eq.${encodeURIComponent(ref)}&order=occurred_at.desc&limit=1`,
     );
-    id = rows?.[0]?.id ?? null;
+    if (rows === null) {
+      // Lookup UNAVAILABLE ≠ no mirror (codex r2): park a ref-only retry —
+      // the digest sweep re-runs the lookup when the substrate is back.
+      try {
+        await env.BWM_TELEGRAM_KV.put(`${KV_WIRE_TASKRETRY_PREFIX}${ref}`, JSON.stringify({
+          task_event_id: null, choice: choiceRaw.slice(0, 200), ts: new Date().toISOString(),
+        }), { expirationTtl: WIRE_TASKRETRY_TTL_SECONDS });
+      } catch (e) {
+        console.error(JSON.stringify({ where: "emitWireTaskResolved.lookupRetryMarker", error: String(e) }));
+      }
+      return;
+    }
+    id = rows[0]?.id ?? null;
   }
   if (!id) return; // never went live — no mirror to close
   const ok = await emitOperationalEvent(env, "task.resolved", {
@@ -3085,11 +3097,27 @@ async function retryPendingTaskResolves(env: Env): Promise<void> {
       const raw = await env.BWM_TELEGRAM_KV.get(k.name);
       if (!raw) continue;
       const ref = k.name.slice(KV_WIRE_TASKRETRY_PREFIX.length);
-      let parsed: { task_event_id?: string; choice?: string } | null = null;
-      try { parsed = JSON.parse(raw) as { task_event_id?: string; choice?: string }; } catch { /* malformed */ }
-      if (!parsed?.task_event_id) {
+      let parsed: { task_event_id?: string | null; choice?: string } | null = null;
+      try { parsed = JSON.parse(raw) as { task_event_id?: string | null; choice?: string }; } catch { /* malformed */ }
+      if (!parsed) {
         await env.BWM_TELEGRAM_KV.delete(k.name);
         continue;
+      }
+      if (!parsed.task_event_id) {
+        // Ref-only marker: the mirror lookup was unavailable at decision time
+        // (codex r2) — re-run it now. Still unavailable → keep the marker for
+        // the next sweep; genuinely no mirror → drop it.
+        const rows = await fetchRows<{ id: string }>(
+          env,
+          `operational_events?select=id&event_type=eq.task.queued` +
+          `&payload->>wire_ref=eq.${encodeURIComponent(ref)}&order=occurred_at.desc&limit=1`,
+        );
+        if (rows === null) continue;
+        if (!rows[0]?.id) {
+          await env.BWM_TELEGRAM_KV.delete(k.name);
+          continue;
+        }
+        parsed.task_event_id = rows[0].id;
       }
       const ok = await emitOperationalEvent(env, "task.resolved", {
         task_id: parsed.task_event_id,
@@ -3412,6 +3440,11 @@ function etTimeShort(iso: string | null): string {
  *  only). Returns the number redelivered. */
 async function redeliverDeferredDecisions(env: Env, chatId: string): Promise<number> {
   const et = etNow();
+  // The 13:00 UTC cron is in-hours by construction, but the manual
+  // /digest/day-ahead endpoint can fire any time — redelivering at 02:00
+  // would bypass the exact quiet-hours gate that deferred these items
+  // (codex r2 P1). Quiet window → no redelivery; items stay held.
+  if (et.hour >= WIRE_QUIET_START_HOUR || et.hour < WIRE_QUIET_END_HOUR) return 0;
   const openEntries = await listOpenWireItems(env);
   const deferredEntries = openEntries.filter((e) =>
     e["deferred"] && !e["message_id"] && e["input"] && typeof e["input"] === "object");
@@ -3500,11 +3533,21 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
   const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   const since7d = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
 
-  const cal = await fetchRows<{ summary: string | null; start_at: string | null; all_day: boolean | null; status: string | null }>(
+  // Lower bound widened 24h: the calendar writer stores all-day events at
+  // 00:00:00Z, which is BEFORE ET midnight in UTC — a [startIso, endIso)
+  // query would drop every all-day event (codex r2). Timed rows re-check the
+  // exact window in JS below; all-day rows match by ET date.
+  const calWideStart = new Date(new Date(startIso).getTime() - 24 * 60 * 60 * 1000).toISOString();
+  const calRaw = await fetchRows<{ summary: string | null; start_at: string | null; all_day: boolean | null; status: string | null }>(
     env,
     `ea_calendar_events?select=summary,start_at,all_day,status` +
-    `&start_at=gte.${encodeURIComponent(startIso)}&start_at=lt.${encodeURIComponent(endIso)}&order=start_at.asc&limit=20`,
+    `&start_at=gte.${encodeURIComponent(calWideStart)}&start_at=lt.${encodeURIComponent(endIso)}&order=start_at.asc&limit=40`,
   );
+  const cal = calRaw === null ? null : calRaw.filter((r) => {
+    if (!r.start_at) return false;
+    if (r.all_day) return r.start_at.slice(0, 10) === et.date;
+    return r.start_at >= startIso && r.start_at < endIso;
+  });
   const needsThreads = await fetchRows<{ sender_email: string | null; subject: string | null; action_taken: string | null }>(
     env,
     `ea_threads?select=sender_email,subject,action_taken&action_taken=in.(escalate,halt)` +
@@ -3519,9 +3562,13 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
     `ea_drafts?select=gmail_thread_id&sent_message_id=is.null&resolved_at=is.null` +
     `&created_at=gte.${encodeURIComponent(since7d)}&limit=50`,
   );
-  const plan = await fetchRows<{ title: string | null; priority: string | null; created_by: string | null }>(
+  // one-wire mirrors are excluded IN the query — a JS filter after limit=50
+  // could starve the plan once enough mirrors accumulate (codex r2). The
+  // or-clause keeps NULL created_by rows (neq alone drops SQL NULLs).
+  const plan = await fetchRows<{ title: string | null; priority: string | null }>(
     env,
-    `command_tasks?select=title,priority,created_by&assignee=eq.robert&status=eq.queued` +
+    `command_tasks?select=title,priority&assignee=eq.robert&status=eq.queued` +
+    `&or=(created_by.is.null,created_by.neq.one-wire)` +
     `&order=priority.asc,created_at.asc&limit=50`,
   );
   const overnight = await fetchRows<{ action_taken: string | null }>(
@@ -3554,8 +3601,10 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
   // ea_escalations row — accepted double-render: halts are the rare
   // highest-stakes lane and the two lines carry different affordances
   // (thread context here, answer-by-ref under Waiting on you).
-  const inboxOk = !(needsThreads === null && escalations === null);
-  if (!inboxOk) {
+  // "Clear" is claimed ONLY when BOTH sources loaded and are empty — a
+  // one-source failure renders what we have and says so (codex r2 P1;
+  // verify-before-claiming).
+  if (needsThreads === null && escalations === null) {
     lines.push("<b>Inbox needs you:</b> (data unavailable)");
   } else {
     const inboxLines: string[] = [];
@@ -3566,22 +3615,26 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
     for (const e of escalations ?? []) {
       inboxLines.push(`• ${escapeHtml((e.sender_email ?? "unknown").slice(0, 40))} — ${escapeHtml((e.sarah_reason ?? e.scope ?? "handoff").slice(0, 60))} <i>(with Bob)</i>`);
     }
+    const partial = needsThreads === null || escalations === null;
     if (inboxLines.length === 0) {
-      lines.push("<b>Inbox needs you:</b> nothing — Sarah's lanes are clear.");
+      lines.push(partial
+        ? "<b>Inbox needs you:</b> (one source unavailable this run — nothing visible in the other)"
+        : "<b>Inbox needs you:</b> nothing — Sarah's lanes are clear.");
     } else {
-      lines.push(`<b>Inbox needs you (${inboxLines.length}):</b>`);
+      lines.push(`<b>Inbox needs you (${inboxLines.length}${partial ? "+?" : ""}):</b>`);
       lines.push(...inboxLines.slice(0, 6));
       if (inboxLines.length > 6) lines.push(`…+${inboxLines.length - 6} more`);
+      if (partial) lines.push("<i>(one inbox source unavailable this run)</i>");
     }
     if (drafts !== null && drafts.length > 0) lines.push(`✍️ Drafts ready to send: ${drafts.length}`);
   }
 
-  // Today's plan (command queue) — wire-mirror rows are skipped here because
-  // the same asks render as refs under "Waiting on you" just below.
+  // Today's plan (command queue) — wire-mirror rows are excluded in the
+  // query because the same asks render as refs under "Waiting on you" below.
   if (plan === null) {
     lines.push("<b>Plan:</b> (data unavailable)");
   } else {
-    const planRows = plan.filter((p) => p.created_by !== "one-wire");
+    const planRows = plan;
     if (planRows.length === 0) {
       lines.push("<b>Plan:</b> queue is empty.");
     } else {
@@ -3622,19 +3675,13 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
   }
 
   // Overnight notes (fyis queued since Day Done) — flush-on-render, same
-  // length-budget semantics as Day Done. Sarah-triage fyis are rendered BY
-  // PROXY through "Inbox needs you" (same threads, from ea_threads /
-  // ea_escalations) — listing them under notes too would double-render (EA
-  // codex review). They count as delivered with the digest — but only when
-  // the inbox section actually loaded; on a substrate failure they stay in
-  // the notes flow so nothing is flushed unseen.
-  const qItemsAll = await listDigestNotes(env);
-  const sarahNoteKeys = inboxOk
-    ? qItemsAll.filter((it) => String(it["origin"] ?? "") === "sarah-triage").map((it) => it.key)
-    : [];
-  const qItems = inboxOk
-    ? qItemsAll.filter((it) => String(it["origin"] ?? "") !== "sarah-triage")
-    : qItemsAll;
+  // length-budget semantics as Day Done. Sarah-triage fyis STAY in the notes
+  // flow even though escalate/halt threads also render under "Inbox needs
+  // you": proxy-flushing them was tried and reverted (codex r2 P1) — the
+  // origin also covers client-feedback fyis with no needs-you row, and a
+  // dropped note is data loss while the overlap is one duplicate line in one
+  // digest for the rare overnight escalation.
+  const qItems = await listDigestNotes(env);
   const renderedNoteKeys = appendNotesSection(lines, qItems, "Overnight notes");
 
   if (BOARD_URL) lines.push(`<i>Detail: ${escapeHtml(BOARD_URL)}</i>`);
@@ -3667,9 +3714,8 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
     status: "sent", telegramMessageId: result.telegramMessageId, telegramResponse: result.response, error: null,
   });
   await env.BWM_TELEGRAM_KV.put(KV_LAST_SEND_AT_KEY, new Date().toISOString());
-  // Flush the notes that made it into the delivered message (codex r6) plus
-  // the Sarah-triage notes the inbox section rendered by proxy.
-  await Promise.all([...renderedNoteKeys, ...sarahNoteKeys].map((k) => env.BWM_TELEGRAM_KV.delete(k)));
+  // Flush ONLY the notes that made it into the delivered message (codex r6).
+  await Promise.all(renderedNoteKeys.map((k) => env.BWM_TELEGRAM_KV.delete(k)));
   return { ok: true, action: "sent", redelivered, items: qItems.length };
 }
 
