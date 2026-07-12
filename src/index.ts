@@ -1653,6 +1653,32 @@ async function processTelegramReply(
     // reach the gated delete.
     const fireRawKey = (wireMeta as { key?: string }).key;
     if (fireRawKey) fireRegistryKeyToClear = `${KV_WIRE_FIRE_PREFIX}${shortHash(fireRawKey)}`;
+    // ORIGINLESS fires (created via /notify, no operational-event identity)
+    // would dead-end at the missing-origin guard below — resolve them inline
+    // (codex r6): persist the decision, clear the registry, confirm.
+    if (!originEventId && fireRegistryKeyToClear && RESOLVE_CMDS.has(text.trim().toLowerCase())) {
+      const logged = await emitOperationalEvent(env, "narrative", {
+        source: "telegram-reply",
+        kind: "wire-decision",
+        wire_ref: (wireMeta as { ref?: string }).ref ?? null,
+        wire_type: "fire",
+        choice_raw: text.trim().slice(0, 200),
+        note: `Robert resolved ${(wireMeta as { ref?: string }).ref ?? "a fire"} via direct reply: "${text.trim().slice(0, 120)}"`,
+      }, `telegram-reply-${inboundEventId}`);
+      if (logged) {
+        try {
+          await env.BWM_TELEGRAM_KV.delete(fireRegistryKeyToClear);
+        } catch (e) {
+          console.error(JSON.stringify({ where: "processTelegramReply.originlessFireClear", error: String(e) }));
+        }
+      }
+      try {
+        await sendTelegramMessage(botToken, chatId,
+          logged ? "✅ Resolved." : "⚠️ Couldn't log that — try again in a minute.",
+          undefined, message.message_id);
+      } catch { /* fail-soft */ }
+      return logged;
+    }
   }
 
   // ── ONE WIRE DECISION PATH ─────────────────────────────────────────────────
@@ -2835,7 +2861,12 @@ async function dispatchWire(
         }
         console.warn(JSON.stringify({ where: "dispatchWire.fireEdit", warn: edit.error, ref: reg.ref }));
       } catch (e) {
+        // A THROW anywhere in the edit path (network failure, or bookkeeping
+        // after Telegram already accepted the edit) is retryable — falling
+        // through to a fresh send here is exactly the duplicate-ping this
+        // branch exists to suppress (codex r6).
         console.error(JSON.stringify({ where: "dispatchWire.fireRegistry", error: String(e) }));
+        return { ok: false, action: "edit_failed_transient", error: String(e).slice(0, 200) };
       }
     }
   }
@@ -3016,12 +3047,16 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
       const opts = Array.isArray(o["options"])
         ? (o["options"] as unknown[]).map((v, i) => `${i + 1}=${String(v).slice(0, 24)}`).join(" · ").slice(0, 90)
         : "";
-      const link = String(o["link"] ?? "").slice(0, 120);
+      // Full href, short label — a truncated URL is worse than none (codex r6).
+      const linkRaw = String(o["link"] ?? "");
+      const link = linkRaw
+        ? `<a href="${linkRaw.replace(/&/g, "&amp;").replace(/"/g, "&quot;")}">open</a>`
+        : "";
       lines.push(
         `• ${escapeHtml(o.ref)} — ${escapeHtml(String(o["punchline"] ?? "").slice(0, 80))}` +
         (rec ? ` · <b>rec:</b> ${escapeHtml(rec)}` : "") +
         (opts ? ` · ${escapeHtml(opts)}` : "") +
-        (link ? ` · ${escapeHtml(link)}` : "") +
+        (link ? ` · ${link}` : "") +
         (deferred ? ` <i>(held: ${escapeHtml(deferred)})</i>` : ""),
       );
     }
@@ -3029,13 +3064,30 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
   } else {
     lines.push("<b>Waiting on you:</b> nothing — all clear.");
   }
+  // Notes render under an explicit LENGTH budget: only notes that actually fit
+  // the message get flushed; the rest roll to the next digest. Deleting a note
+  // the truncation swallowed would silently discard it (codex r6).
+  const renderedNoteKeys: string[] = [];
   if (qItems.length > 0) {
-    lines.push(`<b>Notes (${qItems.length}):</b>`);
-    for (const it of qItems.slice(0, 12)) {
-      const noteLink = String(it["link"] ?? "").slice(0, 120);
-      lines.push(`• ${escapeHtml(String(it["punchline"] ?? "").slice(0, 90))}${noteLink ? ` — ${escapeHtml(noteLink)}` : ""}`);
+    const headerIdx = lines.length;
+    lines.push("");
+    let used = lines.reduce((n, l) => n + l.length + 1, 0);
+    for (const it of qItems) {
+      if (renderedNoteKeys.length >= 12) break;
+      const noteLinkRaw = String(it["link"] ?? "");
+      const noteLink = noteLinkRaw
+        ? ` — <a href="${noteLinkRaw.replace(/&/g, "&amp;").replace(/"/g, "&quot;")}">open</a>`
+        : "";
+      const line = `• ${escapeHtml(String(it["punchline"] ?? "").slice(0, 90))}${noteLink}`;
+      if (used + line.length > 3600) break; // leave room for the footer
+      lines.push(line);
+      used += line.length + 1;
+      renderedNoteKeys.push(it.key);
     }
-    if (qItems.length > 12) lines.push(`…+${qItems.length - 12} more`);
+    lines[headerIdx] = `<b>Notes (${qItems.length}):</b>`;
+    if (qItems.length > renderedNoteKeys.length) {
+      lines.push(`…+${qItems.length - renderedNoteKeys.length} more (next digest)`);
+    }
   }
   if (BOARD_URL) lines.push(`<i>Detail: ${escapeHtml(BOARD_URL)}</i>`);
   lines.push(`<i>Reply to anything by ref ("C-003: go") — or just type what you want.</i>`);
@@ -3062,10 +3114,9 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
     status: "sent", telegramMessageId: result.telegramMessageId, telegramResponse: result.response, error: null,
   });
   await env.BWM_TELEGRAM_KV.put(KV_LAST_SEND_AT_KEY, new Date().toISOString());
-  // Flush ONLY the entries this digest actually rendered — overflow beyond the
-  // display cap rolls to the next digest instead of being silently discarded
-  // (codex review 2026-07-12); items queued mid-send also survive.
-  await Promise.all(qItems.slice(0, 12).map((it) => env.BWM_TELEGRAM_KV.delete(it.key)));
+  // Flush ONLY the notes that actually made it into the delivered message —
+  // overflow (count OR length) rolls to the next digest (codex r6).
+  await Promise.all(renderedNoteKeys.map((k) => env.BWM_TELEGRAM_KV.delete(k)));
   return { ok: true, action: "sent", items: qItems.length };
 }
 
