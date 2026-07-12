@@ -2,9 +2,17 @@
  * bwm-telegram-relay — Priority ops-event filter + Telegram notification bridge.
  *
  * Routes:
+ *   POST /notify          — One Wire typed gate (X-BWM-Internal-Key auth). Body:
+ *                           {type: fire|call|signoff|fyi, punchline, stakes?, rec?,
+ *                           ask?, options?, link?, key?, expires_at?, origin?}.
+ *                           fyi → Day Done digest queue (never live). call/signoff →
+ *                           quiet-hours/Wednesday/budget gates. fire → edit-in-place
+ *                           per key. Attention-Routing-Spec v2.0.0.
+ *   POST /digest/flush    — compose + send the Day Done digest now (internal-key).
  *   POST /event           — accepts operational_events payload from bwm-event-projector.
  *                           Filters per TELEGRAM_PRIORITY_EVENTS rules below. Sends to
- *                           Telegram if matches. Returns 200 even on filter-skip.
+ *                           Telegram if matches; incident.opened routes through the
+ *                           One Wire FIRE machinery (P-7 scopes → digest).
  *   POST /test            — admin-only (HMAC via TELEGRAM_RELAY_ADMIN_HMAC).
  *                           Sends "BWM Telegram Relay is live" test message.
  *   POST /capture-chat-id — Telegram bot webhook bootstrap. On first message from bot,
@@ -62,7 +70,7 @@ export interface Env {
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-const VERSION = "2.1.1";
+const VERSION = "2.2.0";
 const BROKER_INTERNAL_URL = "https://internal/mint";
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 const KV_CHAT_ID_KEY = "robert_chat_id";
@@ -74,6 +82,29 @@ const KV_OUTBOUND_LOG_PREFIX = "outbound:";
 const DEDUP_TTL_SECONDS = 86_400; // 24 h
 const OUTBOUND_LOG_TTL_SECONDS = 90 * 24 * 60 * 60;
 const OUTBOUND_TEXT_MAX = 4_000;
+
+// ── One Wire (Attention-Routing v2.0.0, Robert GO 2026-07-12) ────────────────
+// Typed Robert-facing message contract. Four types exist: fire | call | signoff
+// | fyi. fyi NEVER sends live — it queues for the daily digest. call/signoff
+// respect quiet hours, Wednesdays, and the daily interrupt budget. fire always
+// sends, and repeats with the same `key` EDIT the original message in place.
+const KV_WIRE_SEQ_PREFIX = "wire:seq:"; // wire:seq:F|C|S → last ref number
+const KV_WIRE_FIRE_PREFIX = "wire:fire:"; // wire:fire:<hash> → live incident msg
+const KV_WIRE_OPEN_PREFIX = "wire:open:"; // wire:open:<ref> → unanswered call/signoff
+const KV_WIRE_DIGESTQ_PREFIX = "wire:digestq:"; // wire:digestq:<ulid> → queued digest item
+const KV_WIRE_BUDGET_PREFIX = "wire:budget:"; // wire:budget:<ET date> → live interrupts today
+const WIRE_FIRE_TTL_SECONDS = 86_400; // edit-in-place window per incident key
+const WIRE_OPEN_TTL_SECONDS = 7 * 24 * 60 * 60; // unanswered items resurface via digest
+const WIRE_DIGESTQ_TTL_SECONDS = 3 * 24 * 60 * 60; // queue survives a missed digest run
+const WIRE_BUDGET_TTL_SECONDS = 48 * 60 * 60;
+// Non-FIRE live interrupts per ET day beyond this hard cap auto-queue to the
+// digest. Target is ≤3/day; the cap is the overflow backstop, not the target.
+const WIRE_INTERRUPT_HARD_CAP = 5;
+const WIRE_QUIET_START_HOUR = 21; // ET; call/signoff queue to digest 21:00–08:00
+const WIRE_QUIET_END_HOUR = 8;
+const WIRE_FIRE_MAX_UPDATES = 6; // most-recent update lines kept in the edited message
+// Set when bwm-board deploys (due 2026-07-17); empty = omit board links.
+const BOARD_URL = "";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Priority filter rules
@@ -729,6 +760,61 @@ async function handleEvent(
   // Filter check
   if (!shouldSend(eventType, payload)) {
     return json({ ok: true, action: "filtered", event_type: eventType });
+  }
+
+  // One Wire: incidents route through the FIRE machinery — same key discriminator
+  // as the old rate limiter (client+severity+kind+scope), but a repeat EDITS the
+  // original message instead of being dropped or re-pinged. P-7 (LOCKED
+  // 2026-06-24): bob-orchestrator hygiene incidents below P0 are Bob-owned —
+  // they queue for the Day Done digest, never a live ping.
+  if (eventType === "incident.opened") {
+    if (eventId) {
+      // Projector-retry dedup, matching the legacy path. Marked optimistically:
+      // a failed dispatch suppresses the retry, but the fire-key edit-in-place
+      // makes a lost retry harmless (next same-key incident refreshes the msg).
+      const alreadySent = await env.BWM_TELEGRAM_KV.get(`${KV_DEDUP_PREFIX}${eventId}`);
+      if (alreadySent) return json({ ok: true, action: "dedup_skip", event_id: eventId });
+      await env.BWM_TELEGRAM_KV.put(`${KV_DEDUP_PREFIX}${eventId}`, "1", {
+        expirationTtl: DEDUP_TTL_SECONDS,
+      });
+    }
+    const severity = String(payload["severity"] ?? "");
+    const scope = String(payload["scope"] ?? "");
+    const kind = String(payload["kind"] ?? payload["symptom"] ?? "unknown");
+    const client = String(event.client_id ?? payload["client_id"] ?? "");
+    if (scope === "bob-orchestrator" && severity !== "P0") {
+      await enqueueDigestItem(env, {
+        wire_type: "fyi",
+        punchline: `${severity} ${scope}: ${kind}`.slice(0, 200),
+        origin: "incident.opened",
+        reason: "p7_autonomous",
+      });
+      await createOutboundLog(env, {
+        sourceRoute: "/event",
+        originEventId: eventId || null,
+        originEventType: eventType,
+        originSessionId: event.session_id ?? null,
+        parseMode: "HTML",
+        text: `${severity} ${scope}: ${kind}`.slice(0, 300),
+        status: "skipped",
+        metadata: { reason: "p7_digest", wire: { type: "fyi", queued: "digest" } },
+      });
+      return json({ ok: true, action: "queued_digest_p7", event_type: eventType });
+    }
+    const fireInput: WireInput = {
+      type: "fire",
+      punchline: `${severity ? `${severity} ` : ""}${client || scope || "incident"} — ${kind.slice(0, 140)}`,
+      stakes: String(payload["symptom"] ?? payload["description"] ?? "").slice(0, 300) || undefined,
+      key: `${client}\x00${severity}\x00${kind}\x00${scope}`,
+      origin: `event:${eventType}${eventId ? `:${eventId}` : ""}`,
+      session_id: event.session_id,
+    };
+    ctx.waitUntil(
+      dispatchWire(env, fireInput, "/event").then((r) => {
+        if (!r.ok) console.error(JSON.stringify({ where: "handleEvent.wireFire", error: r.error ?? r.action }));
+      }).catch((e) => console.error(JSON.stringify({ where: "handleEvent.wireFire", error: String(e) }))),
+    );
+    return json({ ok: true, action: "wire_fire_queued", event_type: eventType });
   }
 
   const text = formatEventMessage(eventType, payload);
@@ -1501,9 +1587,10 @@ async function processTelegramReply(
     `${env.SUPABASE_URL.replace(/\/+$/, "")}/rest/v1/telegram_outbound` +
     `?telegram_message_id=eq.${replyToMessageId}` +
     `&chat_id=eq.${encodeURIComponent(String(chatId))}` +
-    `&select=origin_event_id,origin_event_type&limit=1`;
+    `&select=origin_event_id,origin_event_type,metadata&limit=1`;
   let originEventId = "";
   let originEventType = "";
+  let wireMeta: { type?: string; ref?: string } | null = null;
 
   try {
     const resp = await fetch(lookupUrl, {
@@ -1520,6 +1607,7 @@ async function processTelegramReply(
     const data = (await resp.json()) as Array<{
       origin_event_id: string | null;
       origin_event_type: string | null;
+      metadata: Record<string, unknown> | null;
     }>;
     if (!data || data.length === 0) {
       console.log(`processTelegramReply: no outbound log for message_id=${replyToMessageId}`);
@@ -1527,8 +1615,53 @@ async function processTelegramReply(
     }
     originEventId = data[0].origin_event_id ?? "";
     originEventType = data[0].origin_event_type ?? "";
+    const metaWire = (data[0].metadata ?? {})["wire"];
+    if (metaWire && typeof metaWire === "object") wireMeta = metaWire as { type?: string; ref?: string };
   } catch (err) {
     console.error("processTelegramReply: query threw", err);
+    return false;
+  }
+
+  // ── ONE WIRE DECISION PATH ─────────────────────────────────────────────────
+  // A reply to a CALL/SIGNOFF is Robert's decision: clear the waiting-on-you
+  // registry, log the decision as a narrative (sessions + Bob read
+  // operational_events), confirm receipt — then CONTINUE normal routing
+  // (return false) so the responder pipeline still acts on free-text
+  // instructions exactly like any other inbound message.
+  if (wireMeta?.ref && (wireMeta.type === "call" || wireMeta.type === "signoff")) {
+    const choiceNum = /^\s*([1-9])\b/.exec(text)?.[1] ?? null;
+    try {
+      await env.BWM_TELEGRAM_KV.delete(`${KV_WIRE_OPEN_PREFIX}${wireMeta.ref}`);
+    } catch (e) {
+      console.error(JSON.stringify({ where: "processTelegramReply.wireClear", error: String(e) }));
+    }
+    await emitOperationalEvent(
+      env,
+      "narrative",
+      {
+        source: "telegram-reply",
+        kind: "wire-decision",
+        wire_ref: wireMeta.ref,
+        wire_type: wireMeta.type,
+        option: choiceNum,
+        choice_raw: text.trim().slice(0, 500),
+        inbound_event_id: inboundEventId,
+        note: `Robert answered ${wireMeta.ref}${choiceNum ? ` with option ${choiceNum}` : ""}: "${text.trim().slice(0, 200)}"`,
+      },
+      `telegram-reply-${inboundEventId}`,
+    );
+    try {
+      await sendTelegramMessage(
+        botToken,
+        chatId,
+        `✅ ${wireMeta.ref} logged${choiceNum ? ` — option ${choiceNum}` : ""}. On it.`,
+        undefined,
+        message.message_id,
+      );
+    } catch (e) {
+      console.error(JSON.stringify({ where: "processTelegramReply.wireConfirm", error: String(e) }));
+    }
+    // fall through to normal routing (responder still executes the instruction)
     return false;
   }
 
@@ -1897,20 +2030,64 @@ async function handleReactionUpdate(env: Env, update: TelegramUpdate): Promise<v
   if (removed) return;
 
   // Resolve which outbound message was acked (telegram_outbound audit log).
-  let origin: { origin_event_id?: string; origin_event_type?: string; source_route?: string;
-                text_redacted?: string } | null = null;
+  interface AckOrigin {
+    origin_event_id?: string;
+    origin_event_type?: string;
+    source_route?: string;
+    text_redacted?: string;
+    metadata?: Record<string, unknown>;
+  }
+  let origin: AckOrigin | null = null;
   if (supabaseConfigured(env)) {
     try {
       const q = `telegram_outbound?chat_id=eq.${encodeURIComponent(String(reaction.chat.id))}` +
         `&telegram_message_id=eq.${reaction.message_id}` +
-        `&select=origin_event_id,origin_event_type,source_route,text_redacted&limit=1`;
+        `&select=origin_event_id,origin_event_type,source_route,text_redacted,metadata&limit=1`;
       const resp = await fetch(supabaseRestUrl(env, q), { headers: supabaseHeaders(env) });
       if (resp.ok) {
-        const rows = (await resp.json()) as Array<Record<string, string>>;
+        const rows = (await resp.json()) as Array<AckOrigin>;
         origin = rows[0] ?? null;
       }
     } catch (e) {
       console.error(JSON.stringify({ where: "handleReactionUpdate.lookup", error: String(e) }));
+    }
+  }
+
+  // One Wire: 👍 on a CALL/SIGNOFF = "take my rec / approved". Clear the
+  // waiting-on-you entry and log a wire-decision narrative so Bob/sessions act.
+  const wireOnAck = (origin?.metadata ?? {})["wire"] as { type?: string; ref?: string } | undefined;
+  if (wireOnAck?.ref && (wireOnAck.type === "call" || wireOnAck.type === "signoff")) {
+    try {
+      await env.BWM_TELEGRAM_KV.delete(`${KV_WIRE_OPEN_PREFIX}${wireOnAck.ref}`);
+    } catch (e) {
+      console.error(JSON.stringify({ where: "handleReactionUpdate.wireClear", error: String(e) }));
+    }
+    if (supabaseConfigured(env)) {
+      try {
+        await fetch(supabaseRestUrl(env, "operational_events"), {
+          method: "POST",
+          headers: supabaseHeaders(env, "return=minimal"),
+          body: JSON.stringify({
+            id: ulid(),
+            event_type: "narrative",
+            client_id: null,
+            occurred_at: new Date().toISOString(),
+            session_id: "daemon:bwm-telegram-relay",
+            payload: {
+              source: "bwm-telegram-relay webhook.reaction",
+              kind: "wire-decision",
+              wire_ref: wireOnAck.ref,
+              wire_type: wireOnAck.type,
+              option: null,
+              choice_raw: `reaction:${emojis.join(" ")}`,
+              note: `Robert acked ${wireOnAck.ref} via ${emojis.join(" ")} — take the recommendation.`,
+              reacted_message_id: reaction.message_id,
+            },
+          }),
+        });
+      } catch (e) {
+        console.error(JSON.stringify({ where: "handleReactionUpdate.wireNarrative", error: String(e) }));
+      }
     }
   }
 
@@ -2149,6 +2326,450 @@ interface TelegramMessage {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// One Wire — typed Robert-facing message gate (POST /notify + Day Done digest)
+// Attention-Routing-Spec v2.0.0. Robert GO 2026-07-12.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/** Current time in Robert's timezone (America/New_York). Digest labels, quiet
+ *  hours, the Wednesday rule, and the daily budget key all run on ET. */
+function etNow(d = new Date()): { date: string; hour: number; weekday: string; label: string; hhmm: string } {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour12: false,
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", weekday: "short",
+  }).formatToParts(d);
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+  const labelFmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York", weekday: "short", month: "short", day: "numeric",
+  });
+  return {
+    date: `${get("year")}-${get("month")}-${get("day")}`,
+    hour: parseInt(get("hour"), 10) % 24,
+    weekday: get("weekday"),
+    label: labelFmt.format(d),
+    hhmm: `${get("hour")}:${get("minute")}`,
+  };
+}
+
+type WireType = "fire" | "call" | "signoff" | "fyi";
+
+interface WireInput {
+  type: WireType;
+  punchline: string;
+  stakes?: string;
+  rec?: string;
+  ask?: string;
+  options?: string[];
+  link?: string;
+  /** Suppression/edit-in-place key for fires. Same key within 24h = edit, not re-ping. */
+  key?: string;
+  /** ISO date/datetime; a call expiring today bypasses the Wednesday queue rule. */
+  expires_at?: string;
+  origin?: string;
+  session_id?: string;
+}
+
+function parseWireInput(raw: Record<string, unknown>): { ok: true; input: WireInput } | { ok: false; error: string } {
+  const type = String(raw["type"] ?? "").toLowerCase();
+  if (!["fire", "call", "signoff", "fyi"].includes(type)) {
+    return { ok: false, error: "type must be one of fire|call|signoff|fyi" };
+  }
+  const punchline = String(raw["punchline"] ?? "").replace(/\s+/g, " ").trim();
+  if (!punchline) return { ok: false, error: "punchline is required" };
+  const str = (k: string) => {
+    const v = raw[k];
+    return typeof v === "string" && v.trim() ? v.trim() : undefined;
+  };
+  let options: string[] | undefined;
+  const rawOpts = raw["options"];
+  if (Array.isArray(rawOpts)) {
+    options = rawOpts
+      .map((o) => (typeof o === "string" ? o : String((o as Record<string, unknown>)?.["label"] ?? "")))
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .slice(0, 4);
+    if (options.length === 0) options = undefined;
+  }
+  return {
+    ok: true,
+    input: {
+      type: type as WireType,
+      punchline: punchline.slice(0, 300),
+      stakes: str("stakes")?.slice(0, 400),
+      rec: str("rec")?.slice(0, 300),
+      ask: str("ask")?.slice(0, 300),
+      options,
+      link: str("link")?.slice(0, 500),
+      key: str("key")?.slice(0, 200),
+      expires_at: str("expires_at"),
+      origin: str("origin")?.slice(0, 120),
+      session_id: str("session_id")?.slice(0, 120),
+    },
+  };
+}
+
+/** Monotonic per-prefix ref counter (F-/C-/S-###). KV get→put is not atomic;
+ *  wire callers are sequential crons/CLIs, so a race at worst duplicates a ref
+ *  label — cosmetic, never drops a message. */
+async function nextWireRef(env: Env, type: WireType): Promise<string> {
+  const prefix = type === "fire" ? "F" : type === "call" ? "C" : "S";
+  const kvKey = `${KV_WIRE_SEQ_PREFIX}${prefix}`;
+  const current = parseInt((await env.BWM_TELEGRAM_KV.get(kvKey)) ?? "0", 10);
+  const next = (Number.isFinite(current) ? current : 0) + 1;
+  await env.BWM_TELEGRAM_KV.put(kvKey, String(next));
+  return `${prefix}-${String(next).padStart(3, "0")}`;
+}
+
+const WIRE_EMOJI: Record<WireType, string> = { fire: "🔴", call: "🟡", signoff: "🔵", fyi: "🟢" };
+
+/** Render the wire format (Telegram HTML parse mode). One shape per type so
+ *  Robert's eye learns it: tag+ref+punchline / stakes / rec / reply protocol / link. */
+function renderWire(input: WireInput, ref: string, updates: string[] = []): string {
+  const lines: string[] = [];
+  const tag = input.type.toUpperCase();
+  lines.push(`${WIRE_EMOJI[input.type]} <b>${tag} ${ref} — ${escapeHtml(input.punchline)}</b>`);
+  if (input.stakes) lines.push(escapeHtml(input.stakes));
+  if (input.rec) lines.push(`<b>My rec: ${escapeHtml(input.rec)}</b>`);
+  if (input.ask) lines.push(escapeHtml(input.ask));
+  if (input.type === "call" || input.type === "signoff") {
+    if (input.options && input.options.length > 0) {
+      lines.push(`Reply: ${input.options.map((o, i) => `${i + 1} = ${escapeHtml(o)}`).join(" · ")}`);
+    } else if (input.type === "signoff") {
+      lines.push("Reply: 1 = approve · 2 = changes (say what)");
+    } else {
+      lines.push("Reply with your call — or 👍 to take my rec.");
+    }
+  }
+  if (input.link) lines.push(escapeHtml(input.link));
+  if (input.type === "fire") {
+    if (updates.length > 0) {
+      lines.push("<b>Updates:</b>");
+      for (const u of updates.slice(-WIRE_FIRE_MAX_UPDATES)) lines.push(escapeHtml(u));
+    } else {
+      lines.push("<i>Updates will edit this message — no re-pings.</i>");
+    }
+  }
+  const text = lines.join("\n");
+  return text.length > 3800 ? `${text.slice(0, 3800)}…` : text;
+}
+
+async function editTelegramMessage(
+  botToken: string,
+  chatId: string | number,
+  messageId: number,
+  text: string,
+): Promise<TelegramSendResult> {
+  const res = await fetch(`${TELEGRAM_API_BASE}/bot${botToken}/editMessageText`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: chatId, message_id: messageId, text, parse_mode: "HTML" }),
+  });
+  const data = (await res.json().catch(() => ({ ok: false, description: "telegram_non_json_response" }))) as {
+    ok: boolean;
+    description?: string;
+    result?: { message_id?: number };
+  };
+  // Telegram rejects a no-op edit; for our purposes an identical message IS current.
+  if (!res.ok || !data.ok) {
+    if ((data.description ?? "").includes("message is not modified")) {
+      return { ok: true, status: res.status, telegramMessageId: messageId, response: data };
+    }
+    return { ok: false, status: res.status, error: data.description ?? `HTTP ${res.status}`, response: data };
+  }
+  return { ok: true, status: res.status, telegramMessageId: data.result?.message_id ?? messageId, response: data };
+}
+
+async function enqueueDigestItem(
+  env: Env,
+  item: { wire_type: WireType; punchline: string; link?: string; origin?: string; reason: string },
+): Promise<void> {
+  await env.BWM_TELEGRAM_KV.put(
+    `${KV_WIRE_DIGESTQ_PREFIX}${ulid()}`,
+    JSON.stringify({ ...item, ts: new Date().toISOString() }),
+    { expirationTtl: WIRE_DIGESTQ_TTL_SECONDS },
+  );
+}
+
+interface WireResult {
+  ok: boolean;
+  action: string;
+  ref?: string;
+  error?: string;
+}
+
+/** Core wire dispatch. Self-contained (mints its own token) so it can run
+ *  synchronously from /notify or inside waitUntil from /event. */
+async function dispatchWire(env: Env, input: WireInput, sourceRoute: string): Promise<WireResult> {
+  const et = etNow();
+
+  // FYI never interrupts — straight to the digest queue.
+  if (input.type === "fyi") {
+    await enqueueDigestItem(env, {
+      wire_type: "fyi", punchline: input.punchline, link: input.link, origin: input.origin, reason: "fyi",
+    });
+    await createOutboundLog(env, {
+      sourceRoute, originSessionId: input.session_id ?? null, parseMode: "HTML",
+      text: renderWire(input, "FYI"), status: "queued",
+      metadata: { wire: { type: "fyi", queued: "digest", origin: input.origin ?? null } },
+    });
+    return { ok: true, action: "queued_digest" };
+  }
+
+  const chatId = await env.BWM_TELEGRAM_KV.get(KV_CHAT_ID_KEY);
+  if (!chatId) return { ok: false, action: "skipped_no_chat_id", error: "chat_id not captured yet" };
+
+  // call/signoff gates: quiet hours, Wednesday (Robert's no-meeting day), budget.
+  if (input.type === "call" || input.type === "signoff") {
+    const expiresToday = (input.expires_at ?? "").slice(0, 10) === et.date;
+    const quiet = et.hour >= WIRE_QUIET_START_HOUR || et.hour < WIRE_QUIET_END_HOUR;
+    const wednesday = et.weekday === "Wed" && !expiresToday;
+    let deferReason: string | null = quiet ? "quiet_hours" : wednesday ? "wednesday" : null;
+    const budgetKey = `${KV_WIRE_BUDGET_PREFIX}${et.date}`;
+    const spent = parseInt((await env.BWM_TELEGRAM_KV.get(budgetKey)) ?? "0", 10) || 0;
+    if (!deferReason && spent >= WIRE_INTERRUPT_HARD_CAP) deferReason = "budget";
+    if (deferReason) {
+      await enqueueDigestItem(env, {
+        wire_type: input.type, punchline: input.punchline, link: input.link, origin: input.origin,
+        reason: deferReason,
+      });
+      await createOutboundLog(env, {
+        sourceRoute, originSessionId: input.session_id ?? null, parseMode: "HTML",
+        text: renderWire(input, input.type === "call" ? "C-?" : "S-?"), status: "queued",
+        metadata: { wire: { type: input.type, queued: "digest", reason: deferReason, origin: input.origin ?? null } },
+      });
+      return { ok: true, action: `queued_digest_${deferReason}` };
+    }
+  }
+
+  let botToken: string;
+  try {
+    botToken = await mintToken(env, "TELEGRAM_BOT_TOKEN");
+  } catch (e) {
+    return { ok: false, action: "failed", error: `token_mint_failed: ${String(e).slice(0, 200)}` };
+  }
+
+  // FIRE edit-in-place: same key within 24h updates the existing message.
+  if (input.type === "fire") {
+    const fireKey = `${KV_WIRE_FIRE_PREFIX}${shortHash(input.key ?? input.punchline)}`;
+    const existingRaw = await env.BWM_TELEGRAM_KV.get(fireKey);
+    if (existingRaw) {
+      try {
+        const reg = JSON.parse(existingRaw) as {
+          message_id: number; ref: string; base: WireInput; updates: string[]; count: number; first_at: string;
+        };
+        reg.count += 1;
+        const updateLine = `↻ ${et.hhmm} ET — ${input.punchline === reg.base.punchline ? (input.stakes ?? `repeat ×${reg.count}`) : input.punchline}`;
+        reg.updates = [...reg.updates, updateLine].slice(-WIRE_FIRE_MAX_UPDATES);
+        const text = renderWire(reg.base, reg.ref, reg.updates);
+        const edit = await editTelegramMessage(botToken, chatId, reg.message_id, text);
+        if (edit.ok) {
+          await env.BWM_TELEGRAM_KV.put(fireKey, JSON.stringify({ ...reg, last_at: new Date().toISOString() }), {
+            expirationTtl: WIRE_FIRE_TTL_SECONDS,
+          });
+          await createOutboundLog(env, {
+            sourceRoute, originSessionId: input.session_id ?? null, chatId, parseMode: "HTML", text,
+            status: "sent",
+            metadata: { wire: { type: "fire", ref: reg.ref, action: "edited", count: reg.count, key: input.key ?? null } },
+          });
+          return { ok: true, action: "edited", ref: reg.ref };
+        }
+        // Message gone/too old — fall through and send a fresh one.
+        console.warn(JSON.stringify({ where: "dispatchWire.fireEdit", warn: edit.error, ref: reg.ref }));
+      } catch (e) {
+        console.error(JSON.stringify({ where: "dispatchWire.fireRegistry", error: String(e) }));
+      }
+    }
+  }
+
+  const ref = await nextWireRef(env, input.type);
+  const text = renderWire(input, ref);
+  const outboundId = await createOutboundLog(env, {
+    sourceRoute, originSessionId: input.session_id ?? null, chatId, parseMode: "HTML", text, status: "queued",
+    metadata: { wire: { type: input.type, ref, key: input.key ?? null, origin: input.origin ?? null } },
+  });
+
+  const result = await sendTelegramMessage(botToken, chatId, text, "HTML");
+  if (!result.ok) {
+    await updateOutboundLog(env, outboundId, {
+      status: "failed", error: result.error ?? "telegram_send_failed", telegramResponse: result.response,
+    });
+    return { ok: false, action: "failed", ref, error: result.error };
+  }
+  await updateOutboundLog(env, outboundId, {
+    status: "sent", telegramMessageId: result.telegramMessageId, telegramResponse: result.response, error: null,
+    metadata: { wire: { type: input.type, ref, key: input.key ?? null, origin: input.origin ?? null } },
+  });
+  await env.BWM_TELEGRAM_KV.put(KV_LAST_SEND_AT_KEY, new Date().toISOString());
+
+  if (input.type === "fire" && result.telegramMessageId) {
+    const fireKey = `${KV_WIRE_FIRE_PREFIX}${shortHash(input.key ?? input.punchline)}`;
+    await env.BWM_TELEGRAM_KV.put(fireKey, JSON.stringify({
+      message_id: result.telegramMessageId, ref, base: input, updates: [], count: 1,
+      first_at: new Date().toISOString(), last_at: new Date().toISOString(), outbound_id: outboundId,
+    }), { expirationTtl: WIRE_FIRE_TTL_SECONDS });
+  }
+
+  if (input.type === "call" || input.type === "signoff") {
+    await env.BWM_TELEGRAM_KV.put(`${KV_WIRE_OPEN_PREFIX}${ref}`, JSON.stringify({
+      type: input.type, punchline: input.punchline, link: input.link ?? null,
+      message_id: result.telegramMessageId ?? null, outbound_id: outboundId, ts: new Date().toISOString(),
+    }), { expirationTtl: WIRE_OPEN_TTL_SECONDS });
+    // Live interrupt spent — count it (budget gates only call/signoff; fires are exempt).
+    const budgetKey = `${KV_WIRE_BUDGET_PREFIX}${et.date}`;
+    const spent = parseInt((await env.BWM_TELEGRAM_KV.get(budgetKey)) ?? "0", 10) || 0;
+    await env.BWM_TELEGRAM_KV.put(budgetKey, String(spent + 1), { expirationTtl: WIRE_BUDGET_TTL_SECONDS });
+  }
+
+  return { ok: true, action: "sent", ref };
+}
+
+async function handleNotify(request: Request, env: Env): Promise<Response> {
+  const key = request.headers.get("X-BWM-Internal-Key") ?? "";
+  if (!env.BWM_INTERNAL_KEY || key !== env.BWM_INTERNAL_KEY) {
+    return json({ ok: false, error: "unauthorized" }, 401);
+  }
+  let raw: Record<string, unknown>;
+  try {
+    raw = (await request.json()) as Record<string, unknown>;
+  } catch {
+    return json({ ok: false, error: "invalid_json" }, 400);
+  }
+  const parsed = parseWireInput(raw);
+  if (!parsed.ok) return json({ ok: false, error: parsed.error }, 400);
+  const result = await dispatchWire(env, parsed.input, "/notify");
+  return json(result, result.ok ? 200 : 502);
+}
+
+/** Compose + send the Day Done digest: open fires, shipped (last 24h rolling —
+ *  avoids DST math), waiting-on-you, queued notes. Always sends, even on a
+ *  quiet day — the empty digest is the trust signal that silence = nothing. */
+async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireResult & { items?: number }> {
+  const chatId = await env.BWM_TELEGRAM_KV.get(KV_CHAT_ID_KEY);
+  if (!chatId) return { ok: false, action: "skipped_no_chat_id" };
+  const et = etNow();
+
+  // Queued notes
+  const qList = await env.BWM_TELEGRAM_KV.list({ prefix: KV_WIRE_DIGESTQ_PREFIX, limit: 1000 });
+  const qItems = (await Promise.all(qList.keys.map(async (k) => {
+    const raw = await env.BWM_TELEGRAM_KV.get(k.name);
+    if (!raw) return null;
+    try { return { key: k.name, ...(JSON.parse(raw) as Record<string, unknown>) }; } catch { return null; }
+  }))).filter((x): x is Record<string, unknown> & { key: string } => !!x)
+    .sort((a, b) => String(a["ts"] ?? "").localeCompare(String(b["ts"] ?? "")));
+
+  // Waiting on you
+  const openList = await env.BWM_TELEGRAM_KV.list({ prefix: KV_WIRE_OPEN_PREFIX, limit: 100 });
+  const openItems = (await Promise.all(openList.keys.map(async (k) => {
+    const raw = await env.BWM_TELEGRAM_KV.get(k.name);
+    if (!raw) return null;
+    try {
+      return { ref: k.name.slice(KV_WIRE_OPEN_PREFIX.length), ...(JSON.parse(raw) as Record<string, unknown>) };
+    } catch { return null; }
+  }))).filter((x): x is Record<string, unknown> & { ref: string } => !!x)
+    .sort((a, b) => a.ref.localeCompare(b.ref));
+
+  // Open fires
+  const fireList = await env.BWM_TELEGRAM_KV.list({ prefix: KV_WIRE_FIRE_PREFIX, limit: 50 });
+  const fireItems = (await Promise.all(fireList.keys.map(async (k) => {
+    const raw = await env.BWM_TELEGRAM_KV.get(k.name);
+    if (!raw) return null;
+    try { return JSON.parse(raw) as { ref: string; base: WireInput; count: number }; } catch { return null; }
+  }))).filter((x): x is { ref: string; base: WireInput; count: number } => !!x);
+
+  // Shipped — rolling 24h from operational_events
+  let shippedCount = 0;
+  const shippedTitles: string[] = [];
+  if (supabaseConfigured(env)) {
+    try {
+      const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      const q = `operational_events?event_type=eq.build.shipped&occurred_at=gte.${encodeURIComponent(since)}` +
+        `&select=payload,client_id&order=occurred_at.desc&limit=50`;
+      const resp = await fetch(supabaseRestUrl(env, q), { headers: supabaseHeaders(env) });
+      if (resp.ok) {
+        const rows = (await resp.json()) as Array<{ payload: Record<string, unknown> | null; client_id: string | null }>;
+        shippedCount = rows.length;
+        for (const r of rows.slice(0, 3)) {
+          const p = r.payload ?? {};
+          const title = String(p["title"] ?? p["node_id"] ?? p["summary"] ?? r.client_id ?? "build").slice(0, 60);
+          shippedTitles.push(title);
+        }
+      }
+    } catch (e) {
+      console.error(JSON.stringify({ where: "composeDayDone.shipped", error: String(e) }));
+    }
+  }
+
+  const lines: string[] = [];
+  lines.push(`🌙 <b>DAY DONE — ${escapeHtml(et.label)}</b>`);
+  if (fireItems.length > 0) {
+    lines.push(`<b>Open fires (${fireItems.length}):</b>`);
+    for (const f of fireItems.slice(0, 5)) {
+      lines.push(`• ${escapeHtml(f.ref)} — ${escapeHtml(f.base.punchline.slice(0, 80))}${f.count > 1 ? ` (×${f.count})` : ""}`);
+    }
+  }
+  lines.push(`<b>Shipped (last 24h):</b> ${shippedCount === 0 ? "nothing new" : `${shippedCount}${shippedTitles.length ? ` — ${escapeHtml(shippedTitles.join(" · "))}` : ""}`}`);
+  if (openItems.length > 0) {
+    lines.push(`<b>Waiting on you (${openItems.length}):</b>`);
+    for (const o of openItems.slice(0, 6)) {
+      lines.push(`• ${escapeHtml(o.ref)} — ${escapeHtml(String(o["punchline"] ?? "").slice(0, 80))}`);
+    }
+    if (openItems.length > 6) lines.push(`…+${openItems.length - 6} more`);
+  } else {
+    lines.push("<b>Waiting on you:</b> nothing — all clear.");
+  }
+  if (qItems.length > 0) {
+    lines.push(`<b>Notes (${qItems.length}):</b>`);
+    for (const it of qItems.slice(0, 12)) {
+      lines.push(`• ${escapeHtml(String(it["punchline"] ?? "").slice(0, 90))}`);
+    }
+    if (qItems.length > 12) lines.push(`…+${qItems.length - 12} more`);
+  }
+  if (BOARD_URL) lines.push(`<i>Detail: ${escapeHtml(BOARD_URL)}</i>`);
+  lines.push(`<i>Reply to anything by ref ("C-003: go") — or just type what you want.</i>`);
+  let text = lines.join("\n");
+  if (text.length > 3900) text = `${text.slice(0, 3900)}…`;
+
+  let botToken: string;
+  try {
+    botToken = await mintToken(env, "TELEGRAM_BOT_TOKEN");
+  } catch (e) {
+    return { ok: false, action: "failed", error: `token_mint_failed: ${String(e).slice(0, 200)}` };
+  }
+  const outboundId = await createOutboundLog(env, {
+    sourceRoute: "/digest", chatId, parseMode: "HTML", text, status: "queued",
+    metadata: { wire: { type: "digest", kind: "day-done", trigger, notes: qItems.length, waiting: openItems.length, fires: fireItems.length } },
+  });
+  const result = await sendTelegramMessage(botToken, chatId, text, "HTML");
+  if (!result.ok) {
+    await updateOutboundLog(env, outboundId, {
+      status: "failed", error: result.error ?? "telegram_send_failed", telegramResponse: result.response,
+    });
+    return { ok: false, action: "failed", error: result.error };
+  }
+  await updateOutboundLog(env, outboundId, {
+    status: "sent", telegramMessageId: result.telegramMessageId, telegramResponse: result.response, error: null,
+  });
+  await env.BWM_TELEGRAM_KV.put(KV_LAST_SEND_AT_KEY, new Date().toISOString());
+  // Flush ONLY what this digest actually rendered; items queued mid-send survive.
+  await Promise.all(qItems.map((it) => env.BWM_TELEGRAM_KV.delete(it.key)));
+  return { ok: true, action: "sent", items: qItems.length };
+}
+
+async function handleDigestFlush(request: Request, env: Env): Promise<Response> {
+  const key = request.headers.get("X-BWM-Internal-Key") ?? "";
+  if (!env.BWM_INTERNAL_KEY || key !== env.BWM_INTERNAL_KEY) {
+    return json({ ok: false, error: "unauthorized" }, 401);
+  }
+  const result = await composeAndSendDayDone(env, "manual_flush");
+  return json(result, result.ok ? 200 : 502);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Worker export
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2167,6 +2788,12 @@ export default {
       }
       if (method === "POST" && path === "/event") {
         return handleEvent(request, env, ctx);
+      }
+      if (method === "POST" && path === "/notify") {
+        return handleNotify(request, env);
+      }
+      if (method === "POST" && path === "/digest/flush") {
+        return handleDigestFlush(request, env);
       }
       if (method === "POST" && path === "/test") {
         return handleTest(request, env);
@@ -2193,10 +2820,19 @@ export default {
   },
 
   async scheduled(
-    _event: ScheduledController,
+    event: ScheduledController,
     env: Env,
     ctx: ExecutionContext,
   ): Promise<void> {
+    // One Wire Day Done digest — 20:30 UTC (16:30 EDT).
+    if (event.cron === "30 20 * * *") {
+      ctx.waitUntil(
+        composeAndSendDayDone(env, "cron").catch((e) =>
+          console.error("scheduled digest failed:", (e as Error)?.message ?? e),
+        ),
+      );
+      return;
+    }
     // Emit daemon.heartbeat — counts pulled from KV (best-effort; 0 on cold start)
     ctx.waitUntil(
       emitHeartbeat(env, 0, 0).catch((e) =>
