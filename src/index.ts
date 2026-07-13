@@ -1768,14 +1768,16 @@ async function processTelegramReply(
           console.error(JSON.stringify({ where: "processTelegramReply.digestConfirm", error: String(e) }));
         }
       } else {
-        // Same TTL-expiry hedge as the direct-reply path: close a surviving
-        // still-queued mirror by wire_ref (guarded — a follow-up to an
-        // answered ref must not double-resolve; codex r7).
-        let lateResolved = false;
+        // Same TTL-expiry hedge as the direct-reply path, same ordering:
+        // classify via the mirror, persist the decision narrative, only then
+        // close the task (codex r7+r8).
+        let confirmMsg = `${m[1].toUpperCase()} isn't open (already answered or expired).`;
         if (!ref.startsWith("F-")) {
-          lateResolved = await emitWireTaskResolved(env, null, ref, answer || "(late answer)", `telegram-reply-${inboundEventId}`, true);
-          if (lateResolved) {
-            await emitOperationalEvent(env, "narrative", {
+          const mirrorHit = await findQueuedWireMirror(env, null, ref);
+          if (mirrorHit === "unavailable") {
+            confirmMsg = `⚠️ Couldn't check ${ref} just now — try again in a minute.`;
+          } else if (mirrorHit) {
+            const narrativeId = await emitOperationalEvent(env, "narrative", {
               source: "telegram-reply",
               kind: "wire-decision",
               wire_ref: ref,
@@ -1788,14 +1790,16 @@ async function processTelegramReply(
               inbound_event_id: inboundEventId,
               note: `Robert answered ${ref} via digest reply after its ref expired: "${answer.slice(0, 200)}"`,
             }, `telegram-reply-${inboundEventId}`);
+            if (narrativeId) {
+              await emitWireTaskResolved(env, mirrorHit.id, ref, answer || "(late answer)", `telegram-reply-${inboundEventId}`);
+              confirmMsg = `✅ ${ref} logged (late — the ref had expired). On it.`;
+            } else {
+              confirmMsg = `⚠️ Couldn't log ${ref} just now — try again in a minute.`;
+            }
           }
         }
         try {
-          await sendTelegramMessage(botToken, chatId,
-            lateResolved
-              ? `✅ ${ref} logged (late — the ref had expired). On it.`
-              : `${m[1].toUpperCase()} isn't open (already answered or expired).`,
-            undefined, message.message_id);
+          await sendTelegramMessage(botToken, chatId, confirmMsg, undefined, message.message_id);
         } catch { /* fail-soft */ }
       }
       // Continue normal routing either way — responder still sees the text.
@@ -1817,16 +1821,16 @@ async function processTelegramReply(
     if (!stillOpen) {
       // Registry gone = EITHER already answered (follow-up) OR expired
       // unanswered (7-day TTL) — the mirror's status tells them apart (codex
-      // r7): guardStatus resolves ONLY a still-queued mirror, so follow-ups
-      // can't duplicate task.resolved. A guarded resolution firing means this
-      // reply IS the (late) decision — log it as one and say so instead of
-      // mislabeling it "already answered".
-      const lateResolved = await emitWireTaskResolved(
-        env, wireMeta.task_event_id ?? null, wireMeta.ref, text.trim(),
-        `telegram-reply-${inboundEventId}`, true,
-      );
-      if (lateResolved) {
-        await emitOperationalEvent(env, "narrative", {
+      // r7). Ordering (codex r8): the wire-decision narrative persists FIRST
+      // (decisions are data; Bob + the scorecard read them), only then does
+      // the task close — a lost narrative must not leave a closed task with
+      // a "logged" confirmation.
+      const mirrorHit = await findQueuedWireMirror(env, wireMeta.task_event_id ?? null, wireMeta.ref);
+      let confirmMsg = `ℹ️ ${wireMeta.ref} was already answered — treating this as a follow-up note.`;
+      if (mirrorHit === "unavailable") {
+        confirmMsg = `⚠️ Couldn't check ${wireMeta.ref} just now — try again in a minute.`;
+      } else if (mirrorHit) {
+        const narrativeId = await emitOperationalEvent(env, "narrative", {
           source: "telegram-reply",
           kind: "wire-decision",
           wire_ref: wireMeta.ref,
@@ -1837,13 +1841,15 @@ async function processTelegramReply(
           inbound_event_id: inboundEventId,
           note: `Robert answered ${wireMeta.ref} after its ref expired: "${text.trim().slice(0, 200)}"`,
         }, `telegram-reply-${inboundEventId}`);
+        if (narrativeId) {
+          await emitWireTaskResolved(env, mirrorHit.id, wireMeta.ref, text.trim(), `telegram-reply-${inboundEventId}`);
+          confirmMsg = `✅ ${wireMeta.ref} logged (late — the ref had expired). On it.`;
+        } else {
+          confirmMsg = `⚠️ Couldn't log ${wireMeta.ref} just now — try again in a minute.`;
+        }
       }
       try {
-        await sendTelegramMessage(botToken, chatId,
-          lateResolved
-            ? `✅ ${wireMeta.ref} logged (late — the ref had expired). On it.`
-            : `ℹ️ ${wireMeta.ref} was already answered — treating this as a follow-up note.`,
-          undefined, message.message_id);
+        await sendTelegramMessage(botToken, chatId, confirmMsg, undefined, message.message_id);
       } catch { /* fail-soft */ }
       return false; // normal routing still delivers the text to the responder
     }
@@ -3093,12 +3099,44 @@ async function emitWireTaskQueued(
  *  (b) a transient emit failure parks a retry marker that the daily digest
  *  composers sweep, so the mirrored task can't stay queued forever behind a
  *  one-off Supabase blip;
- *  (c) guardStatus: late paths (registry gone) must ONLY resolve a
- *  still-queued mirror — a follow-up reply to an answered ref would
- *  otherwise duplicate task.resolved even when the exact id is known
- *  (codex r7). Returns true iff a resolution was actually emitted. */
+ *  Returns true iff a resolution was actually emitted. Late paths (registry
+ *  gone) must first classify the reply via findQueuedWireMirror — a
+ *  follow-up to an answered ref must not resolve anything, and the decision
+ *  narrative must persist BEFORE the task closes (codex r7+r8). */
 const KV_WIRE_TASKRETRY_PREFIX = "wire:taskretry:";
 const WIRE_TASKRETRY_TTL_SECONDS = 7 * 24 * 60 * 60;
+
+/** Classify a late reply's target: {id} = the mirror is STILL QUEUED (this
+ *  reply is a genuine late decision) · null = no queued mirror (ordinary
+ *  follow-up to an answered ref, or never went live) · "unavailable" = a
+ *  substrate read failed and no verdict is possible right now. */
+async function findQueuedWireMirror(
+  env: Env,
+  taskEventId: string | null,
+  ref: string,
+): Promise<{ id: string } | "unavailable" | null> {
+  let id = taskEventId;
+  if (!id) {
+    // 14-day bound: refs carry 25 bits of randomness and can repeat over the
+    // service lifetime (codex r6).
+    const refSince = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+    const rows = await fetchRows<{ id: string }>(
+      env,
+      `operational_events?select=id&event_type=eq.task.queued` +
+      `&payload->>wire_ref=eq.${encodeURIComponent(ref)}` +
+      `&occurred_at=gte.${encodeURIComponent(refSince)}&order=occurred_at.desc&limit=1`,
+    );
+    if (rows === null) return "unavailable";
+    id = rows[0]?.id ?? null;
+    if (!id) return null;
+  }
+  const mirror = await fetchRows<{ status: string }>(
+    env,
+    `command_tasks?select=status&source_event_id=eq.${encodeURIComponent(id)}&limit=1`,
+  );
+  if (mirror === null) return "unavailable";
+  return mirror[0]?.status === "queued" ? { id } : null;
+}
 
 async function emitWireTaskResolved(
   env: Env,
@@ -3106,28 +3144,8 @@ async function emitWireTaskResolved(
   ref: string,
   choiceRaw: string,
   sessionId: string,
-  guardStatus = false,
 ): Promise<boolean> {
   let id = taskEventId ?? null;
-  if (id && guardStatus) {
-    const mirror = await fetchRows<{ status: string }>(
-      env,
-      `command_tasks?select=status&source_event_id=eq.${encodeURIComponent(id)}&limit=1`,
-    );
-    if (mirror === null) {
-      // Unavailable read is retryable, not a verdict — park and let the
-      // sweep's own status guard decide (codex r5 semantics).
-      try {
-        await env.BWM_TELEGRAM_KV.put(`${KV_WIRE_TASKRETRY_PREFIX}${ref}`, JSON.stringify({
-          task_event_id: id, choice: choiceRaw.slice(0, 200), ts: new Date().toISOString(),
-        }), { expirationTtl: WIRE_TASKRETRY_TTL_SECONDS });
-      } catch (e) {
-        console.error(JSON.stringify({ where: "emitWireTaskResolved.guardRetryMarker", error: String(e) }));
-      }
-      return false;
-    }
-    if (mirror[0]?.status !== "queued") return false;
-  }
   if (!id) {
     // 14-day bound: refs carry 25 bits of randomness and can repeat over the
     // service lifetime — an unbounded newest-by-ref lookup could resolve a
@@ -3281,8 +3299,20 @@ async function handleNotify(request: Request, env: Env): Promise<Response> {
  *  refs carry random suffixes, so a ref sort could hide an old item behind the
  *  display cap forever (codex r3). Shared by Day Done, Day Ahead, redelivery. */
 async function listOpenWireItems(env: Env): Promise<Array<Record<string, unknown> & { ref: string }>> {
-  const openList = await env.BWM_TELEGRAM_KV.list({ prefix: KV_WIRE_OPEN_PREFIX, limit: 100 });
-  return (await Promise.all(openList.keys.map(async (k) => {
+  // Follow the KV cursor: past 100 open refs a single page is an ARBITRARY
+  // subset, so its "oldest" is not the global oldest and omitted decisions
+  // could expire without ever surfacing (codex r8). 10-page ceiling = 1000
+  // keys, far past any real backlog.
+  const keys: { name: string }[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < 10; page++) {
+    const res = await env.BWM_TELEGRAM_KV.list({ prefix: KV_WIRE_OPEN_PREFIX, limit: 100, cursor });
+    keys.push(...res.keys);
+    if (res.list_complete) break;
+    cursor = (res as { cursor?: string }).cursor;
+    if (!cursor) break;
+  }
+  return (await Promise.all(keys.map(async (k) => {
     const raw = await env.BWM_TELEGRAM_KV.get(k.name);
     if (!raw) return null;
     try {
@@ -3743,10 +3773,13 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
   // query would drop every all-day event (codex r2). Timed rows re-check the
   // exact window in JS below; all-day rows match by ET date.
   const calWideStart = new Date(new Date(startIso).getTime() - 24 * 60 * 60 * 1000).toISOString();
+  // order=desc: the window is widened a day backwards, so ascending order
+  // could exhaust the row cap on yesterday's rows before today's (codex r8);
+  // latest-first fills from today's side. Re-sorted ascending after filter.
   const calRaw = await fetchRows<{ summary: string | null; start_at: string | null; all_day: boolean | null; status: string | null }>(
     env,
     `ea_calendar_events?select=summary,start_at,all_day,status` +
-    `&start_at=gte.${encodeURIComponent(calWideStart)}&start_at=lt.${encodeURIComponent(endIso)}&order=start_at.asc&limit=40`,
+    `&start_at=gte.${encodeURIComponent(calWideStart)}&start_at=lt.${encodeURIComponent(endIso)}&order=start_at.desc&limit=40`,
   );
   // Numeric compares: PostgREST may format offsets as +00:00 while startIso
   // uses .000Z — a string compare drops boundary events (codex r3 P3).
@@ -3757,7 +3790,7 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
     if (r.all_day) return r.start_at.slice(0, 10) === et.date;
     const t = Date.parse(r.start_at);
     return Number.isFinite(t) && t >= startMs && t < endMs;
-  });
+  }).sort((a, b) => String(a.start_at).localeCompare(String(b.start_at)));
   const needsThreads = await fetchRows<{ sender_email: string | null; subject: string | null; action_taken: string | null }>(
     env,
     `ea_threads?select=sender_email,subject,action_taken&action_taken=in.(escalate,halt)` +
@@ -4035,8 +4068,14 @@ async function computeCommsScorecard(env: Env): Promise<CommsScorecard | null> {
   });
   const digests = sent.filter((r) => wireOf(r)?.type === "digest");
 
+  // Latency anchors to the first LIVE delivery (status=sent), not the first
+  // log row: a quiet-hours deferral writes a queued row at e.g. 22:00 but
+  // Robert first SEES the call at the 09:00 redelivery — counting the held
+  // period would misreport the ≤4-waking-hours SLO by a full night (codex
+  // r8).
   const firstQueuedByRef = new Map<string, number>();
   for (const r of outb) {
+    if (r.status !== "sent") continue;
     const w = wireOf(r);
     if (!w?.ref) continue;
     const t = Date.parse(r.queued_at);
