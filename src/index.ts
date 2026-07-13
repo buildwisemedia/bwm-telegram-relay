@@ -2733,13 +2733,23 @@ function parseWireJudgment(
       return { dropped: "judgment requires rec or judgment.claude_prediction" };
     }
     const outcomeAt = str("outcome_knowable_at", 10);
-    if (outcomeAt !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(outcomeAt)) {
-      return { dropped: "judgment.outcome_knowable_at must be YYYY-MM-DD" };
+    if (outcomeAt !== undefined) {
+      // Must be a REAL calendar date, not just regex-shaped — "2026-02-30"
+      // would pass /notify as "accepted" and then be rejected by the capture
+      // CLI at sweep time, silently never capturing (codex P2).
+      const roundTrip = /^\d{4}-\d{2}-\d{2}$/.test(outcomeAt)
+        && new Date(`${outcomeAt}T00:00:00Z`).toISOString().slice(0, 10) === outcomeAt;
+      if (!roundTrip) return { dropped: "judgment.outcome_knowable_at must be a valid YYYY-MM-DD date" };
     }
     let confidence: number | undefined;
-    if (j["claude_confidence"] !== undefined) {
-      const c = Number(j["claude_confidence"]);
-      if (!Number.isFinite(c) || c < 0 || c > 1) return { dropped: "judgment.claude_confidence must be 0–1" };
+    // null = "not provided" (absent); anything else non-number is a sender
+    // bug — Number() coercion would seal a confidence the caller never gave
+    // (false→0, "0.7"→0.7; codex P2).
+    if (j["claude_confidence"] !== undefined && j["claude_confidence"] !== null) {
+      const c = j["claude_confidence"];
+      if (typeof c !== "number" || !Number.isFinite(c) || c < 0 || c > 1) {
+        return { dropped: "judgment.claude_confidence must be a JSON number 0–1" };
+      }
       confidence = c;
     }
     const loop = str("loop", 4);
@@ -2838,12 +2848,18 @@ function parseWireInput(
  *  options resolve numeric answers). Only present when the sender opted in. */
 function wireJudgmentMeta(input: WireInput): Record<string, unknown> | undefined {
   if (!input.judgment) return undefined;
+  // A signoff without explicit options still ADVERTISES numbered choices
+  // ("1 = approve · 2 = changes" — see renderWire); materialize them here so
+  // the sweep resolves a bare "2" to "changes" instead of mis-sealing the rec
+  // (codex P1).
+  const options = input.options
+    ?? (input.type === "signoff" ? ["approve", "changes (say what)"] : null);
   return {
     ...input.judgment,
     punchline: input.punchline,
     stakes: input.stakes ?? null,
     rec: input.rec ?? null,
-    options: input.options ?? null,
+    options,
   };
 }
 
