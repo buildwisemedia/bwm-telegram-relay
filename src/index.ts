@@ -1748,10 +1748,12 @@ async function processTelegramReply(
       if (openRaw) {
         let openType = "call";
         let digestTaskEventId: string | null = null;
+        let digestJudgment: Record<string, unknown> | undefined;
         try {
           const openReg = JSON.parse(openRaw) as Record<string, unknown>;
           openType = String(openReg["type"] ?? "call");
           digestTaskEventId = (openReg["task_event_id"] as string | null | undefined) ?? null;
+          digestJudgment = registryJudgmentMeta(openReg);
         } catch { /* default */ }
         const choiceNum = /^([1-9])\b/.exec(answer)?.[1] ?? null;
         const logged = await emitOperationalEvent(env, "narrative", {
@@ -1763,6 +1765,7 @@ async function processTelegramReply(
           choice_raw: answer.slice(0, 500) || "(ack)",
           inbound_event_id: inboundEventId,
           note: `Robert answered ${ref} via digest reply${choiceNum ? ` with option ${choiceNum}` : ""}: "${answer.slice(0, 200)}"`,
+          ...(digestJudgment ? { judgment: digestJudgment } : {}),
         }, `telegram-reply-${inboundEventId}`);
         if (logged) {
           await env.BWM_TELEGRAM_KV.delete(`${KV_WIRE_OPEN_PREFIX}${ref}`);
@@ -1821,9 +1824,14 @@ async function processTelegramReply(
     const openRawReply = await env.BWM_TELEGRAM_KV.get(`${KV_WIRE_OPEN_PREFIX}${wireMeta.ref}`);
     const stillOpen = openRawReply !== null;
     let replyTaskEventId: string | null = wireMeta.task_event_id ?? null;
-    if (openRawReply && !replyTaskEventId) {
+    let replyJudgment: Record<string, unknown> | undefined;
+    if (openRawReply) {
       try {
-        replyTaskEventId = (JSON.parse(openRawReply) as { task_event_id?: string | null }).task_event_id ?? null;
+        const replyReg = JSON.parse(openRawReply) as Record<string, unknown>;
+        if (!replyTaskEventId) {
+          replyTaskEventId = (replyReg["task_event_id"] as string | null | undefined) ?? null;
+        }
+        replyJudgment = registryJudgmentMeta(replyReg);
       } catch { /* pre-Phase-2 registry rows have no task mirror */ }
     }
     if (!stillOpen) {
@@ -1878,6 +1886,7 @@ async function processTelegramReply(
         choice_raw: text.trim().slice(0, 500),
         inbound_event_id: inboundEventId,
         note: `Robert answered ${wireMeta.ref}${choiceNum ? ` with option ${choiceNum}` : ""}: "${text.trim().slice(0, 200)}"`,
+        ...(replyJudgment ? { judgment: replyJudgment } : {}),
       },
       `telegram-reply-${inboundEventId}`,
     );
@@ -2319,9 +2328,12 @@ async function handleReactionUpdate(env: Env, update: TelegramUpdate): Promise<v
     : null;
   const ackRefStillOpen = ackOpenRaw !== null;
   let ackTaskEventId: string | null = null;
+  let ackJudgment: Record<string, unknown> | undefined;
   if (ackOpenRaw) {
     try {
-      ackTaskEventId = (JSON.parse(ackOpenRaw) as { task_event_id?: string | null }).task_event_id ?? null;
+      const ackReg = JSON.parse(ackOpenRaw) as Record<string, unknown>;
+      ackTaskEventId = (ackReg["task_event_id"] as string | null | undefined) ?? null;
+      ackJudgment = registryJudgmentMeta(ackReg);
     } catch { /* pre-Phase-2 registry rows have no task mirror */ }
   }
   // Only an OPEN ref accepts a reaction-decision — a late/accidental 👍 on an
@@ -2348,6 +2360,7 @@ async function handleReactionUpdate(env: Env, update: TelegramUpdate): Promise<v
               choice_raw: `reaction:${emojis.join(" ")}`,
               note: `Robert acked ${wireOnAck.ref} via 👍 — take the recommendation.`,
               reacted_message_id: reaction.message_id,
+              ...(ackJudgment ? { judgment: ackJudgment } : {}),
             },
           }),
         });
@@ -2947,6 +2960,25 @@ async function enqueueDigestItem(
     JSON.stringify({ ...item, ts: new Date().toISOString() }),
     { expirationTtl: WIRE_DIGESTQ_TTL_SECONDS },
   );
+}
+
+/** Judgment stamp recovered from a wire:open registry entry's stored input —
+ *  carried into the wire-decision narrative itself so the capture join
+ *  survives even when the outbound audit row's best-effort Supabase insert
+ *  failed (codex r3: direct/digest/reaction answers and deferred items
+ *  answered before redelivery would otherwise lose an accepted judgment).
+ *  Never throws — a malformed registry entry just means no stamp. */
+function registryJudgmentMeta(
+  reg: Record<string, unknown> | null | undefined,
+): Record<string, unknown> | undefined {
+  if (!reg) return undefined;
+  try {
+    const input = reg["input"] as WireInput | undefined;
+    if (!input || !input.judgment) return undefined;
+    return wireJudgmentMeta(input);
+  } catch {
+    return undefined;
+  }
 }
 
 interface WireResult {
