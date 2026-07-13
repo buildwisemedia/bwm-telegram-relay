@@ -90,7 +90,12 @@ for arg, field in (("STAKES","stakes"),("REC","rec"),("ASK","ask"),("LINK","link
 j = os.environ.get("JUDGMENT", "")
 if j:
     try:
-        body["judgment"] = json.loads(j)
+        parsed = json.loads(j)
+        # allow_nan=False round-trip: NaN/Infinity parse fine but serialize
+        # as invalid JSON that Workers rejects WHOLE-REQUEST — losing the
+        # CALL itself (codex r5).
+        json.dumps(parsed, allow_nan=False)
+        body["judgment"] = parsed
     except ValueError:
         # NEVER block the wire on a capture problem (contract: fails safe) —
         # a hard exit here would silently lose the CALL itself for an
