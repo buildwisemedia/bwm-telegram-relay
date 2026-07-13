@@ -4059,12 +4059,18 @@ async function computeCommsScorecard(env: Env): Promise<CommsScorecard | null> {
 
   const wireOf = (r: { metadata: Record<string, unknown> | null }) =>
     (r.metadata ?? {})["wire"] as { type?: string; ref?: string; action?: string } | undefined;
-  const sent = outb.filter((r) => r.status === "sent");
-  // A FIRE edit updates in place (no ping) and a digest is the anti-interrupt
-  // — neither counts against the ≤3/day interrupt target.
+  // A FIRE edit updates the existing message in place — no new message, no
+  // ping. Excluded from send totals or an incident storm inflates sends/day
+  // (codex r9).
+  const sent = outb.filter((r) => r.status === "sent" && wireOf(r)?.action !== "edited");
+  // Interrupt = anything that pinged live: typed fire/call/signoff PLUS
+  // untyped legacy rows (/send freeform + /event pings carry no
+  // metadata.wire but absolutely interrupted Robert — codex r9). Digests and
+  // queued fyis are the anti-interrupt.
   const liveInterrupts = sent.filter((r) => {
     const w = wireOf(r);
-    return !!w && ["fire", "call", "signoff"].includes(w.type ?? "") && w.action !== "edited";
+    if (!w) return true; // legacy untyped live send
+    return ["fire", "call", "signoff"].includes(w.type ?? "");
   });
   const digests = sent.filter((r) => wireOf(r)?.type === "digest");
 
@@ -4109,7 +4115,9 @@ async function computeCommsScorecard(env: Env): Promise<CommsScorecard | null> {
 
   let unanswered = 0;
   try {
-    unanswered = (await env.BWM_TELEGRAM_KV.list({ prefix: KV_WIRE_OPEN_PREFIX, limit: 100 })).keys.length;
+    // Cursor-following count via the shared lister — a single KV page caps
+    // the metric at exactly 100 during a backlog (codex r9).
+    unanswered = (await listOpenWireItems(env)).length;
   } catch (e) {
     // Same honesty bar as the Supabase reads: an unavailable substrate makes
     // the WHOLE scorecard unavailable — never a false-zero metric (codex
