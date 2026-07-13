@@ -92,8 +92,11 @@ if j:
     try:
         body["judgment"] = json.loads(j)
     except ValueError:
-        print("bwm-robert-notify: --judgment is not valid JSON", file=sys.stderr)
-        sys.exit(64)
+        # NEVER block the wire on a capture problem (contract: fails safe) —
+        # a hard exit here would silently lose the CALL itself for an
+        # unattended sender (codex r2). Send without the opt-in and warn.
+        print("bwm-robert-notify: --judgment is not valid JSON — "
+              "sending WITHOUT the judgment-capture opt-in", file=sys.stderr)
 opts = [o for o in sys.argv[1:] if o.strip()]
 if opts: body["options"] = opts
 print(json.dumps(body))

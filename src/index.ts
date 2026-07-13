@@ -2716,23 +2716,29 @@ function parseWireJudgment(
     if (typeof raw !== "object" || Array.isArray(raw)) return { dropped: "judgment must be an object" };
     if (type !== "call" && type !== "signoff") return { dropped: "judgment only applies to call/signoff" };
     const j = raw as Record<string, unknown>;
-    const str = (k: string, max: number) => {
+    // Machine fields (domain/date/loop) validate on the FULL trimmed value —
+    // truncate-then-validate silently accepted "2026-07-13oops" as a date and
+    // "both-extra" as a loop (codex r2). Free-text fields cap after.
+    const full = (k: string) => {
       const v = j[k];
-      return typeof v === "string" && v.trim() ? v.trim().slice(0, max) : undefined;
+      return typeof v === "string" && v.trim() ? v.trim() : undefined;
     };
-    const domain = str("domain", 20);
+    const domain = full("domain");
     if (!domain || !JUDGMENT_DOMAINS.includes(domain)) {
       return { dropped: `judgment.domain must be one of ${JUDGMENT_DOMAINS.join("|")}` };
     }
-    const outcomeBy = str("outcome_knowable_by", 300);
+    const outcomeBy = full("outcome_knowable_by")?.slice(0, 300);
     if (!outcomeBy) return { dropped: "judgment.outcome_knowable_by is required" };
-    const claudePrediction = str("claude_prediction", 400);
-    if (!claudePrediction && !hasRec) {
-      // The sweep derives Claude's forecast from the rec when no explicit
-      // prediction is given — with neither, the captured row can't exist.
-      return { dropped: "judgment requires rec or judgment.claude_prediction" };
+    if (!hasRec) {
+      // §12 gives every call/signoff a recommendation; the sweep can only
+      // resolve a 👍/(ack) answer by adopting it. Accepting a rec-less
+      // judgment would report "accepted" and then silently never capture on
+      // an ack (codex r2) — an explicit claude_prediction does not fix that,
+      // because it is Claude's forecast, not Robert's adopted one.
+      return { dropped: "judgment requires a rec on the call" };
     }
-    const outcomeAt = str("outcome_knowable_at", 10);
+    const claudePrediction = full("claude_prediction")?.slice(0, 400);
+    const outcomeAt = full("outcome_knowable_at");
     if (outcomeAt !== undefined) {
       // Must be a REAL calendar date, not just regex-shaped — "2026-02-30"
       // would pass /notify as "accepted" and then be rejected by the capture
@@ -2752,7 +2758,7 @@ function parseWireJudgment(
       }
       confidence = c;
     }
-    const loop = str("loop", 4);
+    const loop = full("loop");
     if (loop !== undefined && !["A", "B", "both"].includes(loop)) {
       return { dropped: "judgment.loop must be A|B|both" };
     }
@@ -3244,6 +3250,12 @@ async function emitWireTaskQueued(
     // HUMAN_GATE_RE if a future consumer only reads text).
     human_gate: "Robert answers on the wire — human decision, not agent-executable",
     ...(redelivered ? { redelivered: true } : {}),
+    // Redundant durable judgment stamp: telegram_outbound's Supabase insert is
+    // best-effort (KV-first), so a transient failure there would otherwise
+    // lose the ONLY record the wire-sweep joins on and the answered call
+    // would silently never capture (codex r2). The sweep falls back to this
+    // task.queued payload when no outbound stamp is found.
+    ...(input.judgment ? { judgment: wireJudgmentMeta(input) } : {}),
   }, input.session_id ?? "daemon:bwm-telegram-relay");
 }
 
