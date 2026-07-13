@@ -2787,7 +2787,8 @@ function parseWireJudgment(
       return { dropped: "judgment.loop must be A|B|both" };
     }
     let resolution: Record<string, unknown> | undefined;
-    if (j["resolution"] !== undefined) {
+    // null = absent, matching claude_confidence and the capture CLI (codex r7).
+    if (j["resolution"] !== undefined && j["resolution"] !== null) {
       if (typeof j["resolution"] !== "object" || j["resolution"] === null || Array.isArray(j["resolution"])) {
         return { dropped: "judgment.resolution must be an object" };
       }
@@ -2976,9 +2977,15 @@ async function enqueueDigestItem(
 /** Judgment stamp recovered from a wire:open registry entry's stored input —
  *  carried into the wire-decision narrative itself so the capture join
  *  survives even when the outbound audit row's best-effort Supabase insert
- *  failed (codex r3: direct/digest/reaction answers and deferred items
- *  answered before redelivery would otherwise lose an accepted judgment).
- *  Never throws — a malformed registry entry just means no stamp. */
+ *  failed (codex r3: covers every path that emits a wire-decision, incl.
+ *  deferred items answered by digest ref before redelivery). KNOWN BOUNDARY
+ *  (codex r7, accepted): direct replies/reactions resolve via the Supabase
+ *  outbound row (v2.2 property, judgment-independent) — if that row's insert
+ *  failed, the direct answer doesn't register AT ALL (no decision, so no
+ *  capture either); the item stays open and resolves via the digest-by-ref
+ *  path, which reads this registry and carries the stamp. Hardening that
+ *  decision path (message-id→ref KV index) is wire-system work outside the
+ *  judgment wiring. Never throws — a malformed entry just means no stamp. */
 function registryJudgmentMeta(
   reg: Record<string, unknown> | null | undefined,
 ): Record<string, unknown> | undefined {
