@@ -2755,8 +2755,10 @@ function parseWireJudgment(
     if (outcomeAt !== undefined) {
       // Must be a REAL calendar date, not just regex-shaped — "2026-02-30"
       // would pass /notify as "accepted" and then be rejected by the capture
-      // CLI at sweep time, silently never capturing (codex P2).
-      const roundTrip = /^\d{4}-\d{2}-\d{2}$/.test(outcomeAt)
+      // CLI at sweep time, silently never capturing (codex P2). Year 0000 is
+      // excluded: JS Date accepts it, Python fromisoformat downstream does
+      // not (codex r4).
+      const roundTrip = /^(?!0000)\d{4}-\d{2}-\d{2}$/.test(outcomeAt)
         && new Date(`${outcomeAt}T00:00:00Z`).toISOString().slice(0, 10) === outcomeAt;
       if (!roundTrip) return { dropped: "judgment.outcome_knowable_at must be a valid YYYY-MM-DD date" };
     }
