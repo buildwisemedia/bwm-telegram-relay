@@ -5,7 +5,19 @@
 #   bwm-robert-notify --type fire|call|signoff|fyi --punchline "one line" \
 #     [--stakes "what it means in $"] [--rec "my recommendation"] [--ask "the ask"] \
 #     [--option "label"] [--option "label"] [--link URL] [--key suppress-key] \
-#     [--expires YYYY-MM-DD] [--origin name] [--json '{...raw body...}']
+#     [--expires YYYY-MM-DD] [--origin name] [--judgment '{...}'] \
+#     [--json '{...raw body...}']
+#
+# --judgment (call/signoff only) opts the decision into PROJ-UPLIFT-001
+# judgment capture — set it ONLY for genuine business forks with a checkable
+# future outcome (never plumbing/go-live/test calls). JSON object:
+#   {"domain":"pricing|offer|client_select|copy|hiring|strategy|ops|other",
+#    "outcome_knowable_by":"plain words (required)",
+#    "outcome_knowable_at":"YYYY-MM-DD (optional)",
+#    "claude_prediction":"defaults to --rec", "claude_confidence":0.7,
+#    "loop":"both", "resolution":{...contract §9 spec...}}
+# The wire send never fails on a bad judgment object — the relay drops it and
+# reports `judgment: "dropped: <reason>"` in the response. Check for it.
 #
 # Types:
 #   fyi     — NEVER pings; queues into the Day Done digest.
@@ -36,7 +48,7 @@ if [ -z "$BWM_INTERNAL_KEY" ]; then
   exit 78
 fi
 
-TYPE="" PUNCHLINE="" STAKES="" REC="" ASK="" LINK="" KEY="" EXPIRES="" ORIGIN="" RAW_JSON=""
+TYPE="" PUNCHLINE="" STAKES="" REC="" ASK="" LINK="" KEY="" EXPIRES="" ORIGIN="" JUDGMENT="" RAW_JSON=""
 OPTIONS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -50,8 +62,9 @@ while [ $# -gt 0 ]; do
     --key)       KEY="$2"; shift 2;;
     --expires)   EXPIRES="$2"; shift 2;;
     --origin)    ORIGIN="$2"; shift 2;;
+    --judgment)  JUDGMENT="$2"; shift 2;;
     --json)      RAW_JSON="$2"; shift 2;;
-    -h|--help)   sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    -h|--help)   sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
     *) echo "bwm-robert-notify: unknown arg: $1" >&2; exit 64;;
   esac
 done
@@ -66,6 +79,7 @@ else
   BODY=$(
     TYPE="$TYPE" PUNCHLINE="$PUNCHLINE" STAKES="$STAKES" REC="$REC" ASK="$ASK" \
     LINK="$LINK" KEY="$KEY" EXPIRES="$EXPIRES" ORIGIN="${ORIGIN:-cli:$(whoami)}" \
+    JUDGMENT="$JUDGMENT" \
     python3 -c '
 import json, os, sys
 body = {"type": os.environ["TYPE"], "punchline": os.environ["PUNCHLINE"]}
@@ -73,6 +87,13 @@ for arg, field in (("STAKES","stakes"),("REC","rec"),("ASK","ask"),("LINK","link
                    ("KEY","key"),("EXPIRES","expires_at"),("ORIGIN","origin")):
     v = os.environ.get(arg, "")
     if v: body[field] = v
+j = os.environ.get("JUDGMENT", "")
+if j:
+    try:
+        body["judgment"] = json.loads(j)
+    except ValueError:
+        print("bwm-robert-notify: --judgment is not valid JSON", file=sys.stderr)
+        sys.exit(64)
 opts = [o for o in sys.argv[1:] if o.strip()]
 if opts: body["options"] = opts
 print(json.dumps(body))

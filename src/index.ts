@@ -4,10 +4,18 @@
  * Routes:
  *   POST /notify          — One Wire typed gate (X-BWM-Internal-Key auth). Body:
  *                           {type: fire|call|signoff|fyi, punchline, stakes?, rec?,
- *                           ask?, options?, link?, key?, expires_at?, origin?}.
- *                           fyi → Day Done digest queue (never live). call/signoff →
- *                           quiet-hours/Wednesday/budget gates. fire → edit-in-place
- *                           per key. Attention-Routing-Spec v2.0.0.
+ *                           ask?, options?, link?, key?, expires_at?, origin?,
+ *                           judgment?}. fyi → Day Done digest queue (never live).
+ *                           call/signoff → quiet-hours/Wednesday/budget gates. fire →
+ *                           edit-in-place per key. Attention-Routing-Spec v2.0.0.
+ *                           `judgment` (call/signoff only) opts the decision into
+ *                           PROJ-UPLIFT-001 judgment capture: it is validated, stamped
+ *                           into telegram_outbound metadata.wire.judgment, and a LOCAL
+ *                           sweeper (bwm-ops-events bin/bwm-judgment-wire-sweep) seals
+ *                           the row after Robert answers. The relay NEVER captures —
+ *                           an invalid judgment object is dropped (reported in the
+ *                           response) and the wire send proceeds unaffected (fail-safe
+ *                           per reference/Judgment-Capture-Contract.md).
  *   POST /digest/flush    — compose + send the Day Done digest now (internal-key).
  *   POST /digest/day-ahead — compose + send the Day Ahead morning digest now
  *                           (internal-key). Redelivers deferred decisions first.
@@ -74,7 +82,7 @@ export interface Env {
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-const VERSION = "2.3.0";
+const VERSION = "2.4.0";
 const BROKER_INTERNAL_URL = "https://internal/mint";
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 const KV_CHAT_ID_KEY = "robert_chat_id";
@@ -2670,6 +2678,98 @@ function etDateOf(iso: string): string {
   }).format(new Date(t));
 }
 
+/** PROJ-UPLIFT-001 judgment-capture opt-in on a call/signoff (Judgment-Capture-
+ *  Contract "One Wire CALL source"). Senders set this ONLY for genuine business
+ *  forks with a checkable future outcome — the default is NO capture; nothing
+ *  here classifies or guesses. The relay just validates + stamps it into
+ *  telegram_outbound metadata.wire.judgment; the local wire-sweep seals the
+ *  judgment_predictions row after Robert's answer lands as a wire-decision. */
+interface WireJudgment {
+  /** Contract §2 domain taxonomy (matches the judgment_predictions check). */
+  domain: string;
+  /** Contract §3: the condition that makes the outcome knowable, plain words. */
+  outcome_knowable_by: string;
+  /** YYYY-MM-DD when derivable — lets the resurface scheduler find it. */
+  outcome_knowable_at?: string;
+  /** Claude's independent forecast. Defaults to the call's rec at sweep time. */
+  claude_prediction?: string;
+  /** 0–1. */
+  claude_confidence?: number;
+  /** A | B | both (sweep defaults to both). */
+  loop?: string;
+  /** Contract §9 machine-scoreable resolver spec — passthrough, never sealed. */
+  resolution?: Record<string, unknown>;
+}
+
+const JUDGMENT_DOMAINS = ["pricing", "offer", "client_select", "copy", "hiring", "strategy", "ops", "other"];
+
+/** Validate the judgment opt-in. Returns the sanitized object, or a drop
+ *  reason. NEVER throws and NEVER fails the send — capture failure must not
+ *  block the wire (contract: fails safe). */
+function parseWireJudgment(
+  raw: unknown,
+  type: WireType,
+  hasRec: boolean,
+): { judgment?: WireJudgment; dropped?: string } {
+  if (raw === undefined || raw === null) return {};
+  try {
+    if (typeof raw !== "object" || Array.isArray(raw)) return { dropped: "judgment must be an object" };
+    if (type !== "call" && type !== "signoff") return { dropped: "judgment only applies to call/signoff" };
+    const j = raw as Record<string, unknown>;
+    const str = (k: string, max: number) => {
+      const v = j[k];
+      return typeof v === "string" && v.trim() ? v.trim().slice(0, max) : undefined;
+    };
+    const domain = str("domain", 20);
+    if (!domain || !JUDGMENT_DOMAINS.includes(domain)) {
+      return { dropped: `judgment.domain must be one of ${JUDGMENT_DOMAINS.join("|")}` };
+    }
+    const outcomeBy = str("outcome_knowable_by", 300);
+    if (!outcomeBy) return { dropped: "judgment.outcome_knowable_by is required" };
+    const claudePrediction = str("claude_prediction", 400);
+    if (!claudePrediction && !hasRec) {
+      // The sweep derives Claude's forecast from the rec when no explicit
+      // prediction is given — with neither, the captured row can't exist.
+      return { dropped: "judgment requires rec or judgment.claude_prediction" };
+    }
+    const outcomeAt = str("outcome_knowable_at", 10);
+    if (outcomeAt !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(outcomeAt)) {
+      return { dropped: "judgment.outcome_knowable_at must be YYYY-MM-DD" };
+    }
+    let confidence: number | undefined;
+    if (j["claude_confidence"] !== undefined) {
+      const c = Number(j["claude_confidence"]);
+      if (!Number.isFinite(c) || c < 0 || c > 1) return { dropped: "judgment.claude_confidence must be 0–1" };
+      confidence = c;
+    }
+    const loop = str("loop", 4);
+    if (loop !== undefined && !["A", "B", "both"].includes(loop)) {
+      return { dropped: "judgment.loop must be A|B|both" };
+    }
+    let resolution: Record<string, unknown> | undefined;
+    if (j["resolution"] !== undefined) {
+      if (typeof j["resolution"] !== "object" || j["resolution"] === null || Array.isArray(j["resolution"])) {
+        return { dropped: "judgment.resolution must be an object" };
+      }
+      if (JSON.stringify(j["resolution"]).length > 2000) return { dropped: "judgment.resolution too large (>2000 chars)" };
+      resolution = j["resolution"] as Record<string, unknown>;
+    }
+    return {
+      judgment: {
+        domain,
+        outcome_knowable_by: outcomeBy,
+        ...(outcomeAt ? { outcome_knowable_at: outcomeAt } : {}),
+        ...(claudePrediction ? { claude_prediction: claudePrediction } : {}),
+        ...(confidence !== undefined ? { claude_confidence: confidence } : {}),
+        ...(loop ? { loop } : {}),
+        ...(resolution ? { resolution } : {}),
+      },
+    };
+  } catch (e) {
+    return { dropped: `judgment parse error: ${String(e).slice(0, 100)}` };
+  }
+}
+
 interface WireInput {
   type: WireType;
   punchline: string;
@@ -2684,9 +2784,13 @@ interface WireInput {
   expires_at?: string;
   origin?: string;
   session_id?: string;
+  /** Judgment-capture opt-in (call/signoff). Absent = no capture, ever. */
+  judgment?: WireJudgment;
 }
 
-function parseWireInput(raw: Record<string, unknown>): { ok: true; input: WireInput } | { ok: false; error: string } {
+function parseWireInput(
+  raw: Record<string, unknown>,
+): { ok: true; input: WireInput; judgmentDropped?: string } | { ok: false; error: string } {
   const type = String(raw["type"] ?? "").toLowerCase();
   if (!["fire", "call", "signoff", "fyi"].includes(type)) {
     return { ok: false, error: "type must be one of fire|call|signoff|fyi" };
@@ -2707,6 +2811,7 @@ function parseWireInput(raw: Record<string, unknown>): { ok: true; input: WireIn
       .slice(0, 4);
     if (options.length === 0) options = undefined;
   }
+  const jr = parseWireJudgment(raw["judgment"], type as WireType, Boolean(str("rec")));
   return {
     ok: true,
     input: {
@@ -2721,7 +2826,24 @@ function parseWireInput(raw: Record<string, unknown>): { ok: true; input: WireIn
       expires_at: str("expires_at"),
       origin: str("origin")?.slice(0, 120),
       session_id: str("session_id")?.slice(0, 120),
+      judgment: jr.judgment,
     },
+    judgmentDropped: jr.dropped,
+  };
+}
+
+/** metadata.wire.judgment payload for telegram_outbound — the opt-in fields
+ *  plus a snapshot of the call content the sweep needs to build the sealed
+ *  judgment row (decision = punchline; rec = default claude_prediction;
+ *  options resolve numeric answers). Only present when the sender opted in. */
+function wireJudgmentMeta(input: WireInput): Record<string, unknown> | undefined {
+  if (!input.judgment) return undefined;
+  return {
+    ...input.judgment,
+    punchline: input.punchline,
+    stakes: input.stakes ?? null,
+    rec: input.rec ?? null,
+    options: input.options ?? null,
   };
 }
 
@@ -2888,13 +3010,14 @@ async function dispatchWire(
         message_id: null, deferred: deferReason, input,
         ts: new Date().toISOString(),
       }), { expirationTtl: WIRE_OPEN_TTL_SECONDS });
+      const deferredJudgment = wireJudgmentMeta(input);
       await createOutboundLog(env, {
         sourceRoute,
         originEventId: origin?.originEventId ?? null,
         originEventType: origin?.originEventType ?? null,
         originSessionId: input.session_id ?? null, parseMode: "HTML",
         text: renderWire(input, ref), status: "queued",
-        metadata: { wire: { type: input.type, ref, queued: "digest", reason: deferReason, origin: input.origin ?? null } },
+        metadata: { wire: { type: input.type, ref, queued: "digest", reason: deferReason, origin: input.origin ?? null, ...(deferredJudgment ? { judgment: deferredJudgment } : {}) } },
       });
       return { ok: true, action: `queued_digest_${deferReason}`, ref };
     }
@@ -2996,12 +3119,16 @@ async function dispatchWire(
     });
   }
   const text = renderWire(input, ref);
+  // metadata.wire.judgment must survive EVERY later metadata rewrite on this
+  // row — updateOutboundLog PATCHes metadata wholesale, so each subsequent
+  // composition below re-includes it (the wire-sweep joins on it).
+  const judgmentMeta = wireJudgmentMeta(input);
   const outboundId = await createOutboundLog(env, {
     sourceRoute,
     originEventId: origin?.originEventId ?? null,
     originEventType: origin?.originEventType ?? null,
     originSessionId: input.session_id ?? null, chatId, parseMode: "HTML", text, status: "queued",
-    metadata: { wire: { type: input.type, ref, key: input.type === "fire" ? (input.key ?? input.punchline) : (input.key ?? null), origin: input.origin ?? null } },
+    metadata: { wire: { type: input.type, ref, key: input.type === "fire" ? (input.key ?? input.punchline) : (input.key ?? null), origin: input.origin ?? null, ...(judgmentMeta ? { judgment: judgmentMeta } : {}) } },
   });
 
   let result: TelegramSendResult;
@@ -3027,7 +3154,7 @@ async function dispatchWire(
   }
   await updateOutboundLog(env, outboundId, {
     status: "sent", telegramMessageId: result.telegramMessageId, telegramResponse: result.response, error: null,
-    metadata: { wire: { type: input.type, ref, key: input.type === "fire" ? (input.key ?? input.punchline) : (input.key ?? null), origin: input.origin ?? null } },
+    metadata: { wire: { type: input.type, ref, key: input.type === "fire" ? (input.key ?? input.punchline) : (input.key ?? null), origin: input.origin ?? null, ...(judgmentMeta ? { judgment: judgmentMeta } : {}) } },
   });
   await env.BWM_TELEGRAM_KV.put(KV_LAST_SEND_AT_KEY, new Date().toISOString());
 
@@ -3059,7 +3186,7 @@ async function dispatchWire(
       // lifetime (codex r6).
       await updateOutboundLog(env, outboundId, {
         status: "sent",
-        metadata: { wire: { type: input.type, ref, key: input.key ?? null, origin: input.origin ?? null, task_event_id: taskEventId } },
+        metadata: { wire: { type: input.type, ref, key: input.key ?? null, origin: input.origin ?? null, task_event_id: taskEventId, ...(judgmentMeta ? { judgment: judgmentMeta } : {}) } },
       });
     }
     // Budget slot was reserved before the send (see releaseBudget for the
@@ -3305,7 +3432,14 @@ async function handleNotify(request: Request, env: Env): Promise<Response> {
   const parsed = parseWireInput(raw);
   if (!parsed.ok) return json({ ok: false, error: parsed.error }, 400);
   const result = await dispatchWire(env, parsed.input, "/notify");
-  return json(result, result.ok ? 200 : 502);
+  // Surface the capture opt-in outcome so senders see a silent drop (the send
+  // itself is never blocked by judgment problems — contract: fails safe).
+  const judgment = parsed.judgmentDropped
+    ? `dropped: ${parsed.judgmentDropped}`
+    : parsed.input.judgment
+      ? "accepted"
+      : undefined;
+  return json(judgment ? { ...result, judgment } : result, result.ok ? 200 : 502);
 }
 
 /** Read + parse every wire:open registry entry, oldest first by enqueue time —
@@ -3655,10 +3789,11 @@ async function redeliverDeferredDecisions(env: Env, chatId: string): Promise<num
     spent += 1;
     await env.BWM_TELEGRAM_KV.put(budgetKey, String(spent), { expirationTtl: WIRE_BUDGET_TTL_SECONDS });
     const text = renderWire(input, entry.ref);
+    const redeliveredJudgment = wireJudgmentMeta(input);
     const outboundId = await createOutboundLog(env, {
       sourceRoute: "/digest/day-ahead",
       originSessionId: input.session_id ?? null, chatId, parseMode: "HTML", text, status: "queued",
-      metadata: { wire: { type: input.type, ref: entry.ref, action: "redelivered", origin: input.origin ?? null } },
+      metadata: { wire: { type: input.type, ref: entry.ref, action: "redelivered", origin: input.origin ?? null, ...(redeliveredJudgment ? { judgment: redeliveredJudgment } : {}) } },
     });
     let result: TelegramSendResult;
     try {
