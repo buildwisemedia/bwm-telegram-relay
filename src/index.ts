@@ -1768,13 +1768,34 @@ async function processTelegramReply(
           console.error(JSON.stringify({ where: "processTelegramReply.digestConfirm", error: String(e) }));
         }
       } else {
-        // Same TTL-expiry hedge as the direct-reply path: close any surviving
-        // task mirror by wire_ref before shrugging (codex Phase 2).
+        // Same TTL-expiry hedge as the direct-reply path: close a surviving
+        // still-queued mirror by wire_ref (guarded — a follow-up to an
+        // answered ref must not double-resolve; codex r7).
+        let lateResolved = false;
         if (!ref.startsWith("F-")) {
-          await emitWireTaskResolved(env, null, ref, answer || "(late answer)", `telegram-reply-${inboundEventId}`);
+          lateResolved = await emitWireTaskResolved(env, null, ref, answer || "(late answer)", `telegram-reply-${inboundEventId}`, true);
+          if (lateResolved) {
+            await emitOperationalEvent(env, "narrative", {
+              source: "telegram-reply",
+              kind: "wire-decision",
+              wire_ref: ref,
+              // Post-expiry the registry no longer knows call vs signoff —
+              // "unknown" keeps the CALL latency metric unpolluted.
+              wire_type: "unknown",
+              option: /^([1-9])\b/.exec(answer)?.[1] ?? null,
+              choice_raw: (answer || "(late answer)").slice(0, 500),
+              late: true,
+              inbound_event_id: inboundEventId,
+              note: `Robert answered ${ref} via digest reply after its ref expired: "${answer.slice(0, 200)}"`,
+            }, `telegram-reply-${inboundEventId}`);
+          }
         }
         try {
-          await sendTelegramMessage(botToken, chatId, `${m[1].toUpperCase()} isn't open (already answered or expired).`, undefined, message.message_id);
+          await sendTelegramMessage(botToken, chatId,
+            lateResolved
+              ? `✅ ${ref} logged (late — the ref had expired). On it.`
+              : `${m[1].toUpperCase()} isn't open (already answered or expired).`,
+            undefined, message.message_id);
         } catch { /* fail-soft */ }
       }
       // Continue normal routing either way — responder still sees the text.
@@ -1794,15 +1815,34 @@ async function processTelegramReply(
       } catch { /* pre-Phase-2 registry rows have no task mirror */ }
     }
     if (!stillOpen) {
-      // The registry entry may have EXPIRED (7-day TTL) rather than been
-      // answered — the mirrored command_tasks row outlives KV state (codex
-      // Phase 2). Best-effort close so a late answer doesn't strand an
-      // "Answer <ref>" task in Robert's queue. Prefer the exact id stamped on
-      // the outbound row over the wire_ref fallback (codex r6, ref reuse).
-      await emitWireTaskResolved(env, wireMeta.task_event_id ?? null, wireMeta.ref, text.trim(), `telegram-reply-${inboundEventId}`);
+      // Registry gone = EITHER already answered (follow-up) OR expired
+      // unanswered (7-day TTL) — the mirror's status tells them apart (codex
+      // r7): guardStatus resolves ONLY a still-queued mirror, so follow-ups
+      // can't duplicate task.resolved. A guarded resolution firing means this
+      // reply IS the (late) decision — log it as one and say so instead of
+      // mislabeling it "already answered".
+      const lateResolved = await emitWireTaskResolved(
+        env, wireMeta.task_event_id ?? null, wireMeta.ref, text.trim(),
+        `telegram-reply-${inboundEventId}`, true,
+      );
+      if (lateResolved) {
+        await emitOperationalEvent(env, "narrative", {
+          source: "telegram-reply",
+          kind: "wire-decision",
+          wire_ref: wireMeta.ref,
+          wire_type: wireMeta.type,
+          option: /^\s*([1-9])\b/.exec(text)?.[1] ?? null,
+          choice_raw: text.trim().slice(0, 500),
+          late: true,
+          inbound_event_id: inboundEventId,
+          note: `Robert answered ${wireMeta.ref} after its ref expired: "${text.trim().slice(0, 200)}"`,
+        }, `telegram-reply-${inboundEventId}`);
+      }
       try {
         await sendTelegramMessage(botToken, chatId,
-          `ℹ️ ${wireMeta.ref} was already answered — treating this as a follow-up note.`,
+          lateResolved
+            ? `✅ ${wireMeta.ref} logged (late — the ref had expired). On it.`
+            : `ℹ️ ${wireMeta.ref} was already answered — treating this as a follow-up note.`,
           undefined, message.message_id);
       } catch { /* fail-soft */ }
       return false; // normal routing still delivers the text to the responder
@@ -3046,13 +3086,17 @@ async function emitWireTaskQueued(
 }
 
 /** task.resolved emit when a wire-decision lands — closes the command_tasks
- *  row the live send queued. Two hardenings from the Phase 2 codex review:
+ *  row the live send queued. Hardenings from the Phase 2 codex review:
  *  (a) a missing task_event_id (registry expired past its 7-day TTL, or a
  *  pre-Phase-2 row) falls back to recovering the mirror's ULID by wire_ref
  *  from operational_events — the command_tasks row outlives KV state;
  *  (b) a transient emit failure parks a retry marker that the daily digest
  *  composers sweep, so the mirrored task can't stay queued forever behind a
- *  one-off Supabase blip. */
+ *  one-off Supabase blip;
+ *  (c) guardStatus: late paths (registry gone) must ONLY resolve a
+ *  still-queued mirror — a follow-up reply to an answered ref would
+ *  otherwise duplicate task.resolved even when the exact id is known
+ *  (codex r7). Returns true iff a resolution was actually emitted. */
 const KV_WIRE_TASKRETRY_PREFIX = "wire:taskretry:";
 const WIRE_TASKRETRY_TTL_SECONDS = 7 * 24 * 60 * 60;
 
@@ -3062,8 +3106,28 @@ async function emitWireTaskResolved(
   ref: string,
   choiceRaw: string,
   sessionId: string,
-): Promise<void> {
+  guardStatus = false,
+): Promise<boolean> {
   let id = taskEventId ?? null;
+  if (id && guardStatus) {
+    const mirror = await fetchRows<{ status: string }>(
+      env,
+      `command_tasks?select=status&source_event_id=eq.${encodeURIComponent(id)}&limit=1`,
+    );
+    if (mirror === null) {
+      // Unavailable read is retryable, not a verdict — park and let the
+      // sweep's own status guard decide (codex r5 semantics).
+      try {
+        await env.BWM_TELEGRAM_KV.put(`${KV_WIRE_TASKRETRY_PREFIX}${ref}`, JSON.stringify({
+          task_event_id: id, choice: choiceRaw.slice(0, 200), ts: new Date().toISOString(),
+        }), { expirationTtl: WIRE_TASKRETRY_TTL_SECONDS });
+      } catch (e) {
+        console.error(JSON.stringify({ where: "emitWireTaskResolved.guardRetryMarker", error: String(e) }));
+      }
+      return false;
+    }
+    if (mirror[0]?.status !== "queued") return false;
+  }
   if (!id) {
     // 14-day bound: refs carry 25 bits of randomness and can repeat over the
     // service lifetime — an unbounded newest-by-ref lookup could resolve a
@@ -3087,7 +3151,7 @@ async function emitWireTaskResolved(
       } catch (e) {
         console.error(JSON.stringify({ where: "emitWireTaskResolved.lookupRetryMarker", error: String(e) }));
       }
-      return;
+      return false;
     }
     id = rows[0]?.id ?? null;
     if (id) {
@@ -3110,12 +3174,12 @@ async function emitWireTaskResolved(
         } catch (e) {
           console.error(JSON.stringify({ where: "emitWireTaskResolved.statusRetryMarker", error: String(e) }));
         }
-        return;
+        return false;
       }
-      if (mirror[0]?.status !== "queued") return;
+      if (mirror[0]?.status !== "queued") return false;
     }
   }
-  if (!id) return; // never went live — no mirror to close
+  if (!id) return false; // never went live — no mirror to close
   const ok = await emitOperationalEvent(env, "task.resolved", {
     task_id: id,
     outcome: "done",
@@ -3132,6 +3196,7 @@ async function emitWireTaskResolved(
       console.error(JSON.stringify({ where: "emitWireTaskResolved.retryMarker", error: String(e) }));
     }
   }
+  return ok !== null;
 }
 
 /** Sweep parked task-resolve retries (see emitWireTaskResolved). Runs at the
@@ -3237,6 +3302,12 @@ function waitingOnYouLines(openItems: Array<Record<string, unknown> & { ref: str
     return lines;
   }
   lines.push(`<b>Waiting on you (${openItems.length}):</b>`);
+  // Char budget inside the section: ten entries with long (valid ≤500-char)
+  // links can alone exceed the whole message allowance, and the final
+  // truncation would then cut refs WITHOUT an explicit "+N more" (codex r7).
+  const CHAR_BUDGET = 2400;
+  let used = 0;
+  let shown = 0;
   for (const o of openItems.slice(0, 10)) {
     const rec = String(o["rec"] ?? "").slice(0, 60);
     const deferred = String(o["deferred"] ?? "");
@@ -3248,15 +3319,18 @@ function waitingOnYouLines(openItems: Array<Record<string, unknown> & { ref: str
     const link = linkRaw
       ? `<a href="${linkRaw.replace(/&/g, "&amp;").replace(/"/g, "&quot;")}">open</a>`
       : "";
-    lines.push(
+    const line =
       `• ${escapeHtml(o.ref)} — ${escapeHtml(String(o["punchline"] ?? "").slice(0, 80))}` +
       (rec ? ` · <b>rec:</b> ${escapeHtml(rec)}` : "") +
       (opts ? ` · ${escapeHtml(opts)}` : "") +
       (link ? ` · ${link}` : "") +
-      (deferred ? ` <i>(held: ${escapeHtml(deferred)})</i>` : ""),
-    );
+      (deferred ? ` <i>(held: ${escapeHtml(deferred)})</i>` : "");
+    if (used + line.length > CHAR_BUDGET) break;
+    lines.push(line);
+    used += line.length + 1;
+    shown += 1;
   }
-  if (openItems.length > 10) lines.push(`…+${openItems.length - 10} more`);
+  if (openItems.length > shown) lines.push(`…+${openItems.length - shown} more — answer by ref anytime`);
   return lines;
 }
 
