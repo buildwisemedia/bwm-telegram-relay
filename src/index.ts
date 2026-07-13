@@ -2657,6 +2657,19 @@ function etNow(d = new Date()): { date: string; hour: number; weekday: string; l
 
 type WireType = "fire" | "call" | "signoff" | "fyi";
 
+/** ET calendar date of an expires_at value. Bare dates ("2026-07-16") pass
+ *  through as authored; ISO DATETIMES convert to America/New_York first — a
+ *  UTC-date slice can differ from the ET date and hold an urgent Wednesday
+ *  decision past its deadline (post-deploy codex round). */
+function etDateOf(iso: string): string {
+  if (!iso.includes("T")) return iso.slice(0, 10);
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return iso.slice(0, 10);
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(new Date(t));
+}
+
 interface WireInput {
   type: WireType;
   punchline: string;
@@ -2844,7 +2857,7 @@ async function dispatchWire(
 
   // call/signoff gates: quiet hours, Wednesday (Robert's no-meeting day), budget.
   if (input.type === "call" || input.type === "signoff") {
-    const expiresToday = (input.expires_at ?? "").slice(0, 10) === et.date;
+    const expiresToday = input.expires_at ? etDateOf(input.expires_at) === et.date : false;
     const quiet = et.hour >= WIRE_QUIET_START_HOUR || et.hour < WIRE_QUIET_END_HOUR;
     const wednesday = et.weekday === "Wed" && !expiresToday;
     let deferReason: string | null = quiet ? "quiet_hours" : wednesday ? "wednesday" : null;
@@ -3627,7 +3640,7 @@ async function redeliverDeferredDecisions(env: Env, chatId: string): Promise<num
   for (const entry of deferredEntries) {
     if (spent >= WIRE_INTERRUPT_HARD_CAP) break;
     const input = entry["input"] as WireInput;
-    const expiresToday = (input.expires_at ?? "").slice(0, 10) === et.date;
+    const expiresToday = input.expires_at ? etDateOf(input.expires_at) === et.date : false;
     if (et.weekday === "Wed" && !expiresToday) continue;
     if (!botToken) {
       try {
@@ -3905,11 +3918,13 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
   } else if (plan.length === 0) {
     planSection.push("<b>Plan:</b> queue is empty.");
   } else {
-    planSection.push(`<b>Plan (${plan.length} queued):</b>`);
+    // The query caps at 50 — render "50+" rather than an exact-looking total
+    // that understates a deeper backlog (post-deploy codex round).
+    planSection.push(`<b>Plan (${plan.length}${plan.length === 50 ? "+" : ""} queued):</b>`);
     for (const p of plan.slice(0, 6)) {
       planSection.push(`• ${escapeHtml((p.priority ?? "P2").slice(0, 3))} · ${escapeHtml((p.title ?? "(untitled)").slice(0, 70))}`);
     }
-    if (plan.length > 6) planSection.push(`…+${plan.length - 6} more`);
+    if (plan.length > 6) planSection.push(`…+${plan.length - 6}${plan.length === 50 ? "+" : ""} more`);
   }
 
   // Overnight section (Sarah's log, data-derived from her real dispositions).
