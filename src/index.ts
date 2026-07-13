@@ -2736,6 +2736,15 @@ function parseWireJudgment(
       const v = j[k];
       return typeof v === "string" && v.trim() ? v.trim() : undefined;
     };
+    // Present-but-wrong-typed optionals must DROP, not silently vanish — a
+    // numeric claude_prediction would otherwise report "accepted" and seal
+    // the rec instead of the submitted forecast (codex r6). null = absent.
+    for (const k of ["claude_prediction", "outcome_knowable_at", "loop", "outcome_knowable_by", "domain"]) {
+      const v = j[k];
+      if (v !== undefined && v !== null && (typeof v !== "string" || !v.trim())) {
+        return { dropped: `judgment.${k} must be a non-empty string` };
+      }
+    }
     const domain = full("domain");
     if (!domain || !JUDGMENT_DOMAINS.includes(domain)) {
       return { dropped: `judgment.domain must be one of ${JUDGMENT_DOMAINS.join("|")}` };
