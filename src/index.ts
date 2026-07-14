@@ -30,7 +30,8 @@
  *   POST /capture-chat-id — Telegram bot webhook bootstrap. On first message from bot,
  *                           stores chat_id in KV under `bootstrap_chat_id`. One-time.
  *   GET  /health          — { status, version, telegram_configured, last_send_at }
- *   POST /send            — legacy: backwards-compat send route (X-BWM-Internal-Key auth).
+ *   POST /send            — legacy compatibility input; hard-wraps to the FYI digest
+ *                           and suppresses test/no-action payloads. Never sends live.
  *   POST /webhook         — legacy: Telegram update receiver (PROJ-ATTN-ROUTING-001 Phase 6).
  *   scheduled             — emits daemon.heartbeat every 15 min.
  *
@@ -82,7 +83,7 @@ export interface Env {
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-const VERSION = "2.4.0";
+const VERSION = "2.5.0";
 const BROKER_INTERNAL_URL = "https://internal/mint";
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 const KV_CHAT_ID_KEY = "robert_chat_id";
@@ -100,6 +101,8 @@ const OUTBOUND_TEXT_MAX = 4_000;
 // | fyi. fyi NEVER sends live — it queues for the daily digest. call/signoff
 // respect quiet hours, Wednesdays, and the daily interrupt budget. fire always
 // sends, and repeats with the same `key` EDIT the original message in place.
+// Legacy /send is hard-wrapped to FYI here; there is no freeform live-send
+// allowlist. Known smoke/no-action payloads are dropped before the digest queue.
 const KV_WIRE_FIRE_PREFIX = "wire:fire:"; // wire:fire:<hash> → live incident msg
 const KV_WIRE_OPEN_PREFIX = "wire:open:"; // wire:open:<ref> → unanswered call/signoff
 const KV_WIRE_DIGESTQ_PREFIX = "wire:digestq:"; // wire:digestq:<ulid> → queued digest item
@@ -1126,8 +1129,48 @@ async function handleCaptureChatId(request: Request, env: Env): Promise<Response
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Route: POST /send (legacy backwards-compat)
+// Route: POST /send (legacy hard-wrap — Phase 3 containment)
 // ─────────────────────────────────────────────────────────────────────────────
+
+function decodeLegacyHtml(value: string): string {
+  return value
+    .replace(/<br\s*\/?>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#0*39;|&apos;/gi, "'")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function legacySuppressionReason(text: string): string | null {
+  const plain = decodeLegacyHtml(text).toLowerCase();
+  if (plain === "wrap-check") return "phase3_wrap_check";
+  if (/\bno action (?:is )?needed\b|\bnothing (?:is )?(?:needed|required) from (?:you|robert)\b|\bfor visibility only\b/i.test(plain)) {
+    return "explicit_no_action";
+  }
+  if (/\[[^\]]{0,100}(?:smoke|test|gate)[^\]]{0,100}\]|\b(?:smoke test|test notification|test alert|ignore this test)\b|\b(?:close-sweep gate|bob-opt-final-gate)\b/i.test(plain)) {
+    return "test_or_smoke";
+  }
+  return null;
+}
+
+export function legacyDigestPunchline(text: string): string {
+  const plain = decodeLegacyHtml(text);
+  if (/^bob needs a human reply\b/i.test(plain)) {
+    return "A client reply is waiting for human review in the work queue.";
+  }
+  if (/^human triage\b/i.test(plain)) {
+    return "Bob has items waiting for team triage in the work queue.";
+  }
+  if (/lane capacity/i.test(plain)) {
+    return "The team's workload changed; details are in the work queue.";
+  }
+  return plain.slice(0, 300);
+}
 
 async function handleSend(request: Request, env: Env): Promise<Response> {
   const key = request.headers.get("X-BWM-Internal-Key") ?? "";
@@ -1135,9 +1178,9 @@ async function handleSend(request: Request, env: Env): Promise<Response> {
     return json({ ok: false, error: "unauthorized" }, 401);
   }
 
-  let body: { text?: string; parse_mode?: string };
+  let body: { text?: string; parse_mode?: string; origin?: string; session_id?: string };
   try {
-    body = (await request.json()) as { text?: string; parse_mode?: string };
+    body = (await request.json()) as { text?: string; parse_mode?: string; origin?: string; session_id?: string };
   } catch {
     return json({ ok: false, error: "invalid_json" }, 400);
   }
@@ -1147,56 +1190,40 @@ async function handleSend(request: Request, env: Env): Promise<Response> {
     return json({ ok: false, error: "text is required" }, 400);
   }
 
-  const chatId = await env.BWM_TELEGRAM_KV.get(KV_CHAT_ID_KEY);
-  if (!chatId) {
+  const suppressionReason = legacySuppressionReason(text);
+  if (suppressionReason) {
     await createOutboundLog(env, {
       sourceRoute: "/send",
       text,
       parseMode: body.parse_mode ?? null,
       status: "skipped",
-      metadata: { reason: "missing_chat_id" },
+      metadata: {
+        reason: suppressionReason,
+        wire: { type: "fyi", queued: "digest", hard_wrapped: true, suppressed: true },
+      },
     });
-    return json({ ok: false, error: "chat_id not captured yet — send /start to the bot to register" }, 400);
+    return json({
+      ok: true,
+      action: suppressionReason === "phase3_wrap_check" ? "queued_digest" : "suppressed",
+      hard_wrapped: true,
+      suppressed: true,
+      reason: suppressionReason,
+    });
   }
 
-  const outboundId = await createOutboundLog(env, {
-    sourceRoute: "/send",
-    chatId,
-    text,
-    parseMode: body.parse_mode ?? null,
-    status: "queued",
-  });
-
-  let botToken: string;
-  try {
-    botToken = await mintToken(env, "TELEGRAM_BOT_TOKEN");
-  } catch (e) {
-    console.error(JSON.stringify({ where: "handleSend.mintToken", error: String(e) }));
-    await updateOutboundLog(env, outboundId, {
-      status: "failed",
-      error: `token_mint_failed: ${String(e).slice(0, 200)}`,
-    });
-    return json({ ok: false, error: "token_mint_failed", detail: String(e).slice(0, 200) }, 502);
-  }
-
-  const result = await sendTelegramMessage(botToken, chatId, text, body.parse_mode);
-  if (!result.ok) {
-    console.error(JSON.stringify({ where: "handleSend.sendMessage", error: result.error }));
-    await updateOutboundLog(env, outboundId, {
-      status: "failed",
-      error: result.error ?? "telegram_send_failed",
-      telegramResponse: result.response,
-    });
-    return json({ ok: false, error: "telegram_send_failed", detail: result.error }, 502);
-  }
-
-  await updateOutboundLog(env, outboundId, {
-    status: "sent",
-    telegramMessageId: result.telegramMessageId,
-    telegramResponse: result.response,
-    error: null,
-  });
-  return json({ ok: true, chat_id: chatId });
+  const result = await dispatchWire(env, {
+    type: "fyi",
+    punchline: legacyDigestPunchline(text),
+    origin: typeof body.origin === "string" && body.origin.trim()
+      ? body.origin.trim().slice(0, 120)
+      : "legacy:/send",
+    session_id: typeof body.session_id === "string" ? body.session_id.trim().slice(0, 120) : undefined,
+  }, "/send");
+  return json({
+    ...result,
+    hard_wrapped: true,
+    legacy_parse_mode_ignored: Boolean(body.parse_mode),
+  }, result.ok ? 200 : 502);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2836,18 +2863,22 @@ function parseWireInput(
   if (!["fire", "call", "signoff", "fyi"].includes(type)) {
     return { ok: false, error: "type must be one of fire|call|signoff|fyi" };
   }
-  const punchline = String(raw["punchline"] ?? "").replace(/\s+/g, " ").trim();
+  const punchline = decodeLegacyHtml(String(raw["punchline"] ?? ""));
   if (!punchline) return { ok: false, error: "punchline is required" };
   const str = (k: string) => {
     const v = raw[k];
     return typeof v === "string" && v.trim() ? v.trim() : undefined;
+  };
+  const plainStr = (k: string) => {
+    const v = str(k);
+    return v ? decodeLegacyHtml(v) : undefined;
   };
   let options: string[] | undefined;
   const rawOpts = raw["options"];
   if (Array.isArray(rawOpts)) {
     options = rawOpts
       .map((o) => (typeof o === "string" ? o : String((o as Record<string, unknown>)?.["label"] ?? "")))
-      .map((s) => s.trim().slice(0, 80))
+      .map((s) => decodeLegacyHtml(s).slice(0, 80))
       .filter(Boolean)
       .slice(0, 4);
     if (options.length === 0) options = undefined;
@@ -2858,9 +2889,9 @@ function parseWireInput(
     input: {
       type: type as WireType,
       punchline: punchline.slice(0, 300),
-      stakes: str("stakes")?.slice(0, 400),
-      rec: str("rec")?.slice(0, 300),
-      ask: str("ask")?.slice(0, 300),
+      stakes: plainStr("stakes")?.slice(0, 400),
+      rec: plainStr("rec")?.slice(0, 300),
+      ask: plainStr("ask")?.slice(0, 300),
       options,
       link: str("link")?.slice(0, 500),
       key: str("key")?.slice(0, 200),
@@ -2909,10 +2940,19 @@ const WIRE_EMOJI: Record<WireType, string> = { fire: "🔴", call: "🟡", signo
 
 /** Render the wire format (Telegram HTML parse mode). One shape per type so
  *  Robert's eye learns it: tag+ref+punchline / stakes / rec / reply protocol / link. */
-function renderWire(input: WireInput, ref: string, updates: string[] = []): string {
+export function renderWire(input: WireInput, ref: string, updates: string[] = []): string {
   const lines: string[] = [];
-  const tag = input.type.toUpperCase();
-  lines.push(`${WIRE_EMOJI[input.type]} <b>${tag} ${ref} — ${escapeHtml(input.punchline)}</b>`);
+  const label: Record<WireType, string> = {
+    fire: "Urgent",
+    call: "Decision",
+    signoff: "Approval",
+    fyi: "Update",
+  };
+  // The wire ref remains in stored metadata for direct-reply resolution. It is
+  // intentionally hidden from a live message: Robert replies to the message,
+  // not to an internal code. Digests still show refs where one message contains
+  // multiple answerable decisions.
+  lines.push(`${WIRE_EMOJI[input.type]} <b>${label[input.type]}: ${escapeHtml(input.punchline)}</b>`);
   if (input.stakes) lines.push(escapeHtml(input.stakes));
   if (input.rec) lines.push(`<b>My rec: ${escapeHtml(input.rec)}</b>`);
   if (input.ask) lines.push(escapeHtml(input.ask));
@@ -2963,12 +3003,18 @@ async function editTelegramMessage(
   return { ok: true, status: res.status, telegramMessageId: data.result?.message_id ?? messageId, response: data };
 }
 
-async function enqueueDigestItem(
+export async function enqueueDigestItem(
   env: Env,
-  item: { wire_type: WireType; punchline: string; link?: string; origin?: string; reason: string },
+  item: { wire_type: WireType; punchline: string; link?: string; origin?: string; reason: string; key?: string },
 ): Promise<void> {
+  // A typed FYI key is a merge key, not merely metadata. Repeated stages of
+  // the same team-owned incident overwrite the queued note so the digest shows
+  // only the latest state. Unkeyed notes retain append-only behavior.
+  const queueKey = item.key
+    ? `${KV_WIRE_DIGESTQ_PREFIX}merge:${shortHash(item.key)}`
+    : `${KV_WIRE_DIGESTQ_PREFIX}${ulid()}`;
   await env.BWM_TELEGRAM_KV.put(
-    `${KV_WIRE_DIGESTQ_PREFIX}${ulid()}`,
+    queueKey,
     JSON.stringify({ ...item, ts: new Date().toISOString() }),
     { expirationTtl: WIRE_DIGESTQ_TTL_SECONDS },
   );
@@ -3033,7 +3079,7 @@ async function dispatchWire(
   // FYI never interrupts — straight to the digest queue.
   if (input.type === "fyi") {
     await enqueueDigestItem(env, {
-      wire_type: "fyi", punchline: input.punchline, link: input.link, origin: input.origin, reason: "fyi",
+      wire_type: "fyi", punchline: input.punchline, link: input.link, origin: input.origin, reason: "fyi", key: input.key,
     });
     await createOutboundLog(env, {
       sourceRoute,
@@ -3041,7 +3087,7 @@ async function dispatchWire(
       originEventType: origin?.originEventType ?? null,
       originSessionId: input.session_id ?? null, parseMode: "HTML",
       text: renderWire(input, "FYI"), status: "queued",
-      metadata: { wire: { type: "fyi", queued: "digest", origin: input.origin ?? null } },
+      metadata: { wire: { type: "fyi", queued: "digest", origin: input.origin ?? null, key: input.key ?? null } },
     });
     return { ok: true, action: "queued_digest" };
   }
@@ -4441,7 +4487,8 @@ export default {
       if (method === "POST" && path === "/capture-chat-id") {
         return handleCaptureChatId(request, env);
       }
-      // Legacy routes preserved for backwards compat
+      // Legacy route preserved as a compatibility input, but hard-wrapped to
+      // the FYI digest. It can no longer send a live Telegram message.
       if (method === "POST" && path === "/send") {
         return handleSend(request, env);
       }

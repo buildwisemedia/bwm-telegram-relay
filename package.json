@@ -8,7 +8,8 @@
     "deploy": "wrangler deploy",
     "rotate:broker-bearer": "node scripts/rotate-broker-bearer.mjs",
     "smoke:telegram": "node scripts/telegram-smoke.mjs",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.ts"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250320.0",
