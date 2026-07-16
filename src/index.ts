@@ -83,7 +83,7 @@ export interface Env {
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-const VERSION = "2.6.0";
+const VERSION = "2.6.1";
 const BROKER_INTERNAL_URL = "https://internal/mint";
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 const KV_CHAT_ID_KEY = "robert_chat_id";
@@ -111,9 +111,10 @@ const WIRE_FIRE_TTL_SECONDS = 86_400; // edit-in-place window per incident key
 const WIRE_OPEN_TTL_SECONDS = 7 * 24 * 60 * 60; // unanswered items resurface via digest
 const WIRE_DIGESTQ_TTL_SECONDS = 3 * 24 * 60 * 60; // queue survives a missed digest run
 const WIRE_BUDGET_TTL_SECONDS = 48 * 60 * 60;
-// Non-FIRE live interrupts per ET day beyond this hard cap auto-queue to the
-// digest. Target is ≤3/day; the cap is the overflow backstop, not the target.
-export const WIRE_INTERRUPT_HARD_CAP = 3;
+// One unsolicited CALL/SIGNOFF per ET day leaves headroom for genuine P1
+// incidents while holding the combined live lane below the ≤3/day acceptance
+// target. Conversational replies do not consume this budget.
+export const WIRE_INTERRUPT_HARD_CAP = 1;
 export const WIRE_DIGEST_LIVE_REDELIVERY = false;
 const WIRE_QUIET_START_HOUR = 21; // ET; call/signoff queue to digest 21:00–08:00
 const WIRE_QUIET_END_HOUR = 8;
@@ -411,6 +412,8 @@ interface OutboundLogInput {
   status?: OutboundStatus;
   error?: string | null;
   metadata?: Record<string, unknown>;
+  /** Live delivery must not proceed if its durable SQL audit row is missing. */
+  requireSupabase?: boolean;
 }
 
 async function putOutboundKv(env: Env, id: string, row: Record<string, unknown>): Promise<void> {
@@ -423,7 +426,7 @@ async function putOutboundKv(env: Env, id: string, row: Record<string, unknown>)
   }
 }
 
-async function createOutboundLog(env: Env, input: OutboundLogInput): Promise<string> {
+export async function createOutboundLog(env: Env, input: OutboundLogInput): Promise<string> {
   const id = input.id ?? ulid();
   const now = new Date().toISOString();
   const status = input.status ?? "queued";
@@ -456,6 +459,9 @@ async function createOutboundLog(env: Env, input: OutboundLogInput): Promise<str
       source_route: input.sourceRoute,
       id,
     }));
+    if (input.requireSupabase) {
+      throw new Error(`outbound_audit_required_but_unconfigured:${id}`);
+    }
     return id;
   }
 
@@ -466,15 +472,20 @@ async function createOutboundLog(env: Env, input: OutboundLogInput): Promise<str
       body: JSON.stringify(row),
     });
     if (!resp.ok) {
+      const detail = (await resp.text().catch(() => "")).slice(0, 300);
       console.error(JSON.stringify({
         where: "createOutboundLog",
         status: resp.status,
-        detail: (await resp.text().catch(() => "")).slice(0, 300),
+        detail,
         id,
       }));
+      if (input.requireSupabase) {
+        throw new Error(`outbound_audit_insert_failed:${resp.status}:${detail}`);
+      }
     }
   } catch (err) {
     console.error(JSON.stringify({ where: "createOutboundLog", error: String(err), id }));
+    if (input.requireSupabase) throw err;
   }
 
   return id;
@@ -960,6 +971,7 @@ async function handleEvent(
     text,
     dedupeKey,
     status: "queued",
+    requireSupabase: true,
   });
 
   // Mint token and send — fire-and-forget via waitUntil to not block response
@@ -3119,7 +3131,7 @@ async function dispatchWire(
       // stamp-then-release pattern matches the rate limiter — codex r2). The
       // slot is released on mint/send failure below.
       // ACCEPTED TRADEOFF (codex r3 re-flag, rejected): true atomicity needs a
-      // Durable Object. Callers are sequential crons/CLIs at ≤5 live sends/day;
+      // Durable Object. Callers are sequential crons/CLIs at low live volume;
       // the worst concurrent race yields cap+1 — bounded and harmless next to
       // the 33/day baseline this gate replaces. Same reasoning the 2026-07-05
       // review accepted for the incident rate limiter.
@@ -3251,13 +3263,26 @@ async function dispatchWire(
   // row — updateOutboundLog PATCHes metadata wholesale, so each subsequent
   // composition below re-includes it (the wire-sweep joins on it).
   const judgmentMeta = wireJudgmentMeta(input);
-  const outboundId = await createOutboundLog(env, {
-    sourceRoute,
-    originEventId: origin?.originEventId ?? null,
-    originEventType: origin?.originEventType ?? null,
-    originSessionId: input.session_id ?? null, chatId, parseMode: "HTML", text, status: "queued",
-    metadata: { wire: { type: input.type, ref, key: input.type === "fire" ? (input.key ?? input.punchline) : (input.key ?? null), origin: input.origin ?? null, ...interactionMeta, ...(judgmentMeta ? { judgment: judgmentMeta } : {}) } },
-  });
+  let outboundId: string;
+  try {
+    outboundId = await createOutboundLog(env, {
+      sourceRoute,
+      originEventId: origin?.originEventId ?? null,
+      originEventType: origin?.originEventType ?? null,
+      originSessionId: input.session_id ?? null, chatId, parseMode: "HTML", text, status: "queued",
+      metadata: { wire: { type: input.type, ref, key: input.type === "fire" ? (input.key ?? input.punchline) : (input.key ?? null), origin: input.origin ?? null, ...interactionMeta, ...(judgmentMeta ? { judgment: judgmentMeta } : {}) } },
+      requireSupabase: true,
+    });
+  } catch (e) {
+    await releaseBudget();
+    if (fireClaimKey) await env.BWM_TELEGRAM_KV.delete(fireClaimKey).catch(() => undefined);
+    return {
+      ok: false,
+      action: "failed_audit_closed",
+      ref,
+      error: String(e).slice(0, 200),
+    };
+  }
 
   let result: TelegramSendResult;
   try {
@@ -3779,6 +3804,7 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
   const outboundId = await createOutboundLog(env, {
     sourceRoute: "/digest", chatId, parseMode: "HTML", text, status: "queued",
     metadata: { wire: { type: "digest", kind: "day-done", trigger, notes: qItems.length, waiting: openItems.length, fires: fireItems.length } },
+    requireSupabase: true,
   });
   const result = await sendTelegramMessage(botToken, chatId, text, "HTML");
   if (!result.ok) {
@@ -3924,6 +3950,7 @@ async function redeliverDeferredDecisions(env: Env, chatId: string): Promise<num
       sourceRoute: "/digest/day-ahead",
       originSessionId: input.session_id ?? null, chatId, parseMode: "HTML", text, status: "queued",
       metadata: { wire: { type: input.type, ref: entry.ref, action: "redelivered", origin: input.origin ?? null, ...(redeliveredJudgment ? { judgment: redeliveredJudgment } : {}) } },
+      requireSupabase: true,
     });
     let result: TelegramSendResult;
     try {
@@ -4278,6 +4305,7 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
         redelivered, notes: qItems.length, waiting: openItems.length,
       },
     },
+    requireSupabase: true,
   });
   const result = await sendTelegramMessage(botToken, chatId, text, "HTML");
   if (!result.ok) {

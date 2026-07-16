@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  createOutboundLog,
   enqueueDigestItem,
   isConversationalReply,
   legacyDigestPunchline,
@@ -74,8 +75,8 @@ test("P2 incidents stay off Telegram; only P0/P1 incidents enter the live lane",
   assert.equal(shouldSend("incident.opened", { severity: "P0" }), true);
 });
 
-test("unsolicited call/signoff budget is capped at three per ET day", () => {
-  assert.equal(WIRE_INTERRUPT_HARD_CAP, 3);
+test("one unsolicited call/signoff per day leaves room for true incidents", () => {
+  assert.equal(WIRE_INTERRUPT_HARD_CAP, 1);
 });
 
 test("scheduled digests do not pre-ping deferred decisions", () => {
@@ -85,4 +86,21 @@ test("scheduled digests do not pre-ping deferred decisions", () => {
 test("telegram responder output is marked as a conversational reply", () => {
   assert.equal(isConversationalReply({ origin: "telegram-responder-20260716T120132Z" }), true);
   assert.equal(isConversationalReply({ origin: "cloud-migration-phase3" }), false);
+});
+
+test("live delivery fails closed when the durable outbound audit is unavailable", async () => {
+  const env = {
+    BWM_TELEGRAM_KV: {
+      put: async () => undefined,
+    },
+  };
+  await assert.rejects(
+    createOutboundLog(env as never, {
+      sourceRoute: "/notify",
+      text: "Decision: audit boundary",
+      status: "queued",
+      requireSupabase: true,
+    }),
+    /outbound_audit_required_but_unconfigured/,
+  );
 });
