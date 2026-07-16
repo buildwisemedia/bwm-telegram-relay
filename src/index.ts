@@ -83,7 +83,7 @@ export interface Env {
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-const VERSION = "2.5.0";
+const VERSION = "2.6.0";
 const BROKER_INTERNAL_URL = "https://internal/mint";
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 const KV_CHAT_ID_KEY = "robert_chat_id";
@@ -113,7 +113,8 @@ const WIRE_DIGESTQ_TTL_SECONDS = 3 * 24 * 60 * 60; // queue survives a missed di
 const WIRE_BUDGET_TTL_SECONDS = 48 * 60 * 60;
 // Non-FIRE live interrupts per ET day beyond this hard cap auto-queue to the
 // digest. Target is ≤3/day; the cap is the overflow backstop, not the target.
-const WIRE_INTERRUPT_HARD_CAP = 5;
+export const WIRE_INTERRUPT_HARD_CAP = 3;
+export const WIRE_DIGEST_LIVE_REDELIVERY = false;
 const WIRE_QUIET_START_HOUR = 21; // ET; call/signoff queue to digest 21:00–08:00
 const WIRE_QUIET_END_HOUR = 8;
 const WIRE_FIRE_MAX_UPDATES = 6; // most-recent update lines kept in the edited message
@@ -165,15 +166,16 @@ const SEND_CONDITIONAL: Record<string, (p: EventPayload) => boolean> = {
   "narrative": (p) => p["kind"] === "robert_priority" || p["urgency"] === "high",
   "incident.opened": (p) => {
     const sev = String(p["severity"] ?? "");
-    // PROJ-APPROVAL-ACTION-001 Phase 3 closeout (2026-05-18): accept P2 so
-    // SLA-breach incidents from bwm-sla-monitor surface on Robert's Telegram.
-    return sev === "P0" || sev === "P1" || sev === "P2";
+    // P2 is team-owned operational work. If a P2 genuinely needs Robert's
+    // judgment, its producer must emit an explicit CALL/SIGNOFF instead of a
+    // raw incident dump. This keeps technical failures out of the live lane.
+    return sev === "P0" || sev === "P1";
   },
   "task.queued": (p) =>
     p["assignee"] === "robert" && p["priority"] === "urgent",
 };
 
-function shouldSend(eventType: string, payload: EventPayload): boolean {
+export function shouldSend(eventType: string, payload: EventPayload): boolean {
   if (SEND_NEVER.has(eventType)) return false;
   if (SEND_ALWAYS.has(eventType)) return true;
   if (NAMESPACE_ALWAYS.some((ns) => eventType.startsWith(ns))) return true;
@@ -2856,6 +2858,10 @@ interface WireInput {
   judgment?: WireJudgment;
 }
 
+export function isConversationalReply(input: Pick<WireInput, "origin">): boolean {
+  return /^telegram-responder(?:-|$)/i.test(input.origin ?? "");
+}
+
 function parseWireInput(
   raw: Record<string, unknown>,
 ): { ok: true; input: WireInput; judgmentDropped?: string } | { ok: false; error: string } {
@@ -3063,6 +3069,10 @@ async function dispatchWire(
   origin?: { originEventId?: string | null; originEventType?: string | null },
 ): Promise<WireResult> {
   const et = etNow();
+  const conversationalReply = isConversationalReply(input);
+  const interactionMeta = conversationalReply
+    ? { interaction: "conversational_reply" }
+    : {};
   let budgetReservedKey: string | null = null;
   const releaseBudget = async () => {
     if (!budgetReservedKey) return;
@@ -3096,7 +3106,7 @@ async function dispatchWire(
   if (!chatId) return { ok: false, action: "skipped_no_chat_id", error: "chat_id not captured yet" };
 
   // call/signoff gates: quiet hours, Wednesday (Robert's no-meeting day), budget.
-  if (input.type === "call" || input.type === "signoff") {
+  if ((input.type === "call" || input.type === "signoff") && !conversationalReply) {
     const expiresToday = input.expires_at ? etDateOf(input.expires_at) === et.date : false;
     const quiet = et.hour >= WIRE_QUIET_START_HOUR || et.hour < WIRE_QUIET_END_HOUR;
     const wednesday = et.weekday === "Wed" && !expiresToday;
@@ -3135,7 +3145,7 @@ async function dispatchWire(
         originEventType: origin?.originEventType ?? null,
         originSessionId: input.session_id ?? null, parseMode: "HTML",
         text: renderWire(input, ref), status: "queued",
-        metadata: { wire: { type: input.type, ref, queued: "digest", reason: deferReason, origin: input.origin ?? null, ...(deferredJudgment ? { judgment: deferredJudgment } : {}) } },
+        metadata: { wire: { type: input.type, ref, queued: "digest", reason: deferReason, origin: input.origin ?? null, ...interactionMeta, ...(deferredJudgment ? { judgment: deferredJudgment } : {}) } },
       });
       return { ok: true, action: `queued_digest_${deferReason}`, ref };
     }
@@ -3246,7 +3256,7 @@ async function dispatchWire(
     originEventId: origin?.originEventId ?? null,
     originEventType: origin?.originEventType ?? null,
     originSessionId: input.session_id ?? null, chatId, parseMode: "HTML", text, status: "queued",
-    metadata: { wire: { type: input.type, ref, key: input.type === "fire" ? (input.key ?? input.punchline) : (input.key ?? null), origin: input.origin ?? null, ...(judgmentMeta ? { judgment: judgmentMeta } : {}) } },
+    metadata: { wire: { type: input.type, ref, key: input.type === "fire" ? (input.key ?? input.punchline) : (input.key ?? null), origin: input.origin ?? null, ...interactionMeta, ...(judgmentMeta ? { judgment: judgmentMeta } : {}) } },
   });
 
   let result: TelegramSendResult;
@@ -3272,7 +3282,7 @@ async function dispatchWire(
   }
   await updateOutboundLog(env, outboundId, {
     status: "sent", telegramMessageId: result.telegramMessageId, telegramResponse: result.response, error: null,
-    metadata: { wire: { type: input.type, ref, key: input.type === "fire" ? (input.key ?? input.punchline) : (input.key ?? null), origin: input.origin ?? null, ...(judgmentMeta ? { judgment: judgmentMeta } : {}) } },
+    metadata: { wire: { type: input.type, ref, key: input.type === "fire" ? (input.key ?? input.punchline) : (input.key ?? null), origin: input.origin ?? null, ...interactionMeta, ...(judgmentMeta ? { judgment: judgmentMeta } : {}) } },
   });
   await env.BWM_TELEGRAM_KV.put(KV_LAST_SEND_AT_KEY, new Date().toISOString());
 
@@ -3603,14 +3613,16 @@ function waitingOnYouLines(openItems: Array<Record<string, unknown> & { ref: str
     return lines;
   }
   lines.push(`<b>Waiting on you (${openItems.length}):</b>`);
-  // Char budget inside the section: ten entries with long (valid ≤500-char)
+  // Char budget inside the section: three decisions are enough for one
+  // attention pass. The rest stay answerable by ref and roll into later
+  // digests instead of turning the digest into a backlog dump.
   // links can alone exceed the whole message allowance, and the final
   // truncation would then cut refs WITHOUT an explicit "+N more" (codex r7).
-  const CHAR_BUDGET = 2400;
+  const CHAR_BUDGET = 900;
   let used = 0;
   let shown = 0;
-  for (const o of openItems.slice(0, 10)) {
-    const rec = String(o["rec"] ?? "").slice(0, 60);
+  for (const o of openItems.slice(0, 3)) {
+    const rec = String(o["rec"] ?? "").slice(0, 48);
     const deferred = String(o["deferred"] ?? "");
     const opts = Array.isArray(o["options"])
       ? (o["options"] as unknown[]).map((v, i) => `${i + 1}=${String(v).slice(0, 24)}`).join(" · ").slice(0, 90)
@@ -3621,7 +3633,7 @@ function waitingOnYouLines(openItems: Array<Record<string, unknown> & { ref: str
       ? `<a href="${linkRaw.replace(/&/g, "&amp;").replace(/"/g, "&quot;")}">open</a>`
       : "";
     const line =
-      `• ${escapeHtml(o.ref)} — ${escapeHtml(String(o["punchline"] ?? "").slice(0, 80))}` +
+      `• ${escapeHtml(o.ref)} — ${escapeHtml(String(o["punchline"] ?? "").slice(0, 64))}` +
       (rec ? ` · <b>rec:</b> ${escapeHtml(rec)}` : "") +
       (opts ? ` · ${escapeHtml(opts)}` : "") +
       (link ? ` · ${link}` : "") +
@@ -3651,13 +3663,13 @@ function appendNotesSection(
   lines.push("");
   let used = lines.reduce((n, l) => n + l.length + 1, 0);
   for (const it of qItems) {
-    if (renderedNoteKeys.length >= 12) break;
+    if (renderedNoteKeys.length >= 5) break;
     const noteLinkRaw = String(it["link"] ?? "");
     const noteLink = noteLinkRaw
       ? ` — <a href="${noteLinkRaw.replace(/&/g, "&amp;").replace(/"/g, "&quot;")}">open</a>`
       : "";
-    const line = `• ${escapeHtml(String(it["punchline"] ?? "").slice(0, 90))}${noteLink}`;
-    if (used + line.length > 3600) break; // leave room for the footer
+    const line = `• ${escapeHtml(String(it["punchline"] ?? "").slice(0, 72))}${noteLink}`;
+    if (used + line.length > 1800) break; // keep the digest human-scannable
     lines.push(line);
     used += line.length + 1;
     renderedNoteKeys.push(it.key);
@@ -3709,7 +3721,6 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
   // Shipped — rolling 24h from operational_events
   let shippedCount = 0;
   let shippedOk = false;
-  const shippedTitles: string[] = [];
   if (supabaseConfigured(env)) {
     try {
       const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
@@ -3720,11 +3731,6 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
         shippedOk = true;
         const rows = (await resp.json()) as Array<{ payload: Record<string, unknown> | null; client_id: string | null }>;
         shippedCount = rows.length;
-        for (const r of rows.slice(0, 3)) {
-          const p = r.payload ?? {};
-          const title = String(p["title"] ?? p["node_id"] ?? p["summary"] ?? r.client_id ?? "build").slice(0, 60);
-          shippedTitles.push(title);
-        }
       }
     } catch (e) {
       console.error(JSON.stringify({ where: "composeDayDone.shipped", error: String(e) }));
@@ -3737,13 +3743,13 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
     // The registry is the 24h edit/coalesce window, NOT the incident system of
     // record (command_alerts owns lifecycle) — label to match (codex r4).
     lines.push(`<b>Fires (last 24h) (${fireItems.length}):</b>`);
-    for (const f of fireItems.slice(0, 5)) {
-      lines.push(`• ${escapeHtml(f.ref)} — ${escapeHtml(f.base.punchline.slice(0, 80))}${f.count > 1 ? ` (×${f.count})` : ""}`);
+    for (const f of fireItems.slice(0, 3)) {
+      lines.push(`• ${escapeHtml(f.ref)} — ${escapeHtml(f.base.punchline.slice(0, 64))}${f.count > 1 ? ` (×${f.count})` : ""}`);
     }
   }
   // "nothing new" only when the query SUCCEEDED — an unreachable source renders
   // as unavailable, never as a false zero (codex r3; verify-before-claiming).
-  lines.push(`<b>Shipped (last 24h):</b> ${!shippedOk ? "(data unavailable)" : shippedCount === 0 ? "nothing new" : `${shippedCount}${shippedTitles.length ? ` — ${escapeHtml(shippedTitles.join(" · "))}` : ""}`}`);
+  lines.push(`<b>Shipped (last 24h):</b> ${!shippedOk ? "(data unavailable)" : shippedCount === 0 ? "nothing new" : shippedCount}`);
   // Friday scorecard (Phase 2): the weekly comms SLO rides the Day Done digest
   // + lands as narrative kind=comms-slo so the trend is queryable. Fail-soft:
   // an unavailable substrate renders as unavailable, never a false zero.
@@ -3762,7 +3768,7 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
   const renderedNoteKeys = appendNotesSection(lines, qItems, "Notes");
   if (BOARD_URL) lines.push(`<i>Detail: ${escapeHtml(BOARD_URL)}</i>`);
   lines.push(`<i>Reply to anything by ref ("C-003: go") — or just type what you want.</i>`);
-  const text = safeHtmlTruncate(lines.join("\n"), 3900);
+  const text = safeHtmlTruncate(lines.join("\n"), 2200);
 
   let botToken: string;
   try {
@@ -4020,8 +4026,8 @@ async function expireOrphanedWireMirrors(env: Env): Promise<void> {
   }
 }
 
-/** Compose + send the Day Ahead morning digest (09:00 ET): redelivered
- *  decisions, today's calendar, inbox needs-you, the command queue, open
+/** Compose + send the Day Ahead morning digest (09:00 ET): today's calendar,
+ *  inbox needs-you, the command queue, open
  *  decisions, and Sarah's overnight log — absorbed from the same substrate
  *  tables her standalone 07:00 Telegram brief used to render (ea_threads /
  *  ea_escalations / ea_drafts / ea_calendar_events; the full brief text stays
@@ -4034,7 +4040,11 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
   await expireOrphanedWireMirrors(env);
   const et = etNow();
 
-  const redelivered = await redeliverDeferredDecisions(env, chatId);
+  // Deferred decisions stay inside the scheduled digest. Sending them live
+  // seconds before the digest creates a duplicate notification burst.
+  const redelivered = WIRE_DIGEST_LIVE_REDELIVERY
+    ? await redeliverDeferredDecisions(env, chatId)
+    : 0;
 
   const { startIso, endIso } = etDayRangeUtc();
   const since24h = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
@@ -4115,11 +4125,11 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
       calSection.push("<b>Calendar:</b> clear.");
     } else {
       calSection.push(`<b>Calendar (${events.length}):</b>`);
-      for (const ev of events.slice(0, 8)) {
+      for (const ev of events.slice(0, 3)) {
         const when = ev.all_day ? "all day" : etTimeShort(ev.start_at);
         calSection.push(`• ${escapeHtml(when)} — ${escapeHtml((ev.summary ?? "(no title)").slice(0, 70))}`);
       }
-      if (events.length > 8) calSection.push(`…+${events.length - 8} more`);
+      if (events.length > 3) calSection.push(`…+${events.length - 3} more`);
     }
   }
 
@@ -4155,8 +4165,8 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
         : "<b>Inbox needs you:</b> nothing — Sarah's lanes are clear.");
     } else {
       inboxSection.push(`<b>Inbox needs you (${inboxLines.length}${partial ? "+?" : ""}):</b>`);
-      inboxSection.push(...inboxLines.slice(0, 8));
-      if (inboxLines.length > 8) inboxSection.push(`…+${inboxLines.length - 8} more`);
+      inboxSection.push(...inboxLines.slice(0, 3));
+      if (inboxLines.length > 3) inboxSection.push(`…+${inboxLines.length - 3} more`);
       if (partial) inboxSection.push(`<i>(${failedSources} inbox source${failedSources === 1 ? "" : "s"} unavailable this run)</i>`);
     }
   }
@@ -4180,10 +4190,10 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
     // The query caps at 50 — render "50+" rather than an exact-looking total
     // that understates a deeper backlog (post-deploy codex round).
     planSection.push(`<b>Plan (${plan.length}${plan.length === 50 ? "+" : ""} queued):</b>`);
-    for (const p of plan.slice(0, 6)) {
+    for (const p of plan.slice(0, 3)) {
       planSection.push(`• ${escapeHtml((p.priority ?? "P2").slice(0, 3))} · ${escapeHtml((p.title ?? "(untitled)").slice(0, 70))}`);
     }
-    if (plan.length > 6) planSection.push(`…+${plan.length - 6}${plan.length === 50 ? "+" : ""} more`);
+    if (plan.length > 3) planSection.push(`…+${plan.length - 3}${plan.length === 50 ? "+" : ""} more`);
   }
 
   // Overnight section (Sarah's log, data-derived from her real dispositions).
@@ -4218,14 +4228,13 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
   const lines: string[] = [];
   lines.push(`🌅 <b>DAY AHEAD — ${escapeHtml(et.label)}</b>`);
 
-  // Waiting on you — fresh read AFTER redelivery so held-flags are current.
+  // Waiting on you — deferred items remain here instead of getting a separate
+  // live redelivery immediately before the digest.
   // Highest priority: the decision list is the point of One Wire and is never
   // squeezed out by informational sections.
   const openItems = await listOpenWireItems(env);
   lines.push(...waitingOnYouLines(openItems));
-  if (redelivered > 0) lines.push(`<i>${redelivered} deferred decision${redelivered === 1 ? "" : "s"} just redelivered above.</i>`);
-
-  const SECTION_CEILING = 3450; // leaves room for notes budget + footer
+  const SECTION_CEILING = 1800; // one human-scannable attention pass
   const pushSection = (section: string[], label: string) => {
     if (section.length === 0) return;
     const used = lines.reduce((n, l) => n + l.length + 1, 0);
@@ -4253,7 +4262,7 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
 
   if (BOARD_URL) lines.push(`<i>Detail: ${escapeHtml(BOARD_URL)}</i>`);
   lines.push(`<i>Reply to anything by ref ("C-003: go") — or just type what you want.</i>`);
-  const text = safeHtmlTruncate(lines.join("\n"), 3900);
+  const text = safeHtmlTruncate(lines.join("\n"), 2200);
 
   let botToken: string;
   try {
