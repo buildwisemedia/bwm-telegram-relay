@@ -111,10 +111,11 @@ const WIRE_FIRE_TTL_SECONDS = 86_400; // edit-in-place window per incident key
 const WIRE_OPEN_TTL_SECONDS = 7 * 24 * 60 * 60; // unanswered items resurface via digest
 const WIRE_DIGESTQ_TTL_SECONDS = 3 * 24 * 60 * 60; // queue survives a missed digest run
 const WIRE_BUDGET_TTL_SECONDS = 48 * 60 * 60;
-// One unsolicited CALL/SIGNOFF per ET day leaves headroom for genuine P1
-// incidents while holding the combined live lane below the ≤3/day acceptance
-// target. Conversational replies do not consume this budget.
-export const WIRE_INTERRUPT_HARD_CAP = 1;
+// Robert-directed raise 2026-07-26 ("we run into that 3 limit a lot"): up to
+// FOUR unsolicited CALL/SIGNOFF live interrupts per ET day. Combined-lane
+// acceptance target moves ≤3 → ≤6/day (fires exempt + rare; replies free;
+// overflow still defers to the Day Done digest). Spec §12 amended same day.
+export const WIRE_INTERRUPT_HARD_CAP = 4;
 export const WIRE_DIGEST_LIVE_REDELIVERY = false;
 const WIRE_QUIET_START_HOUR = 21; // ET; call/signoff queue to digest 21:00–08:00
 const WIRE_QUIET_END_HOUR = 8;
