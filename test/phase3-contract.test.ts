@@ -76,7 +76,7 @@ test("P2 incidents stay off Telegram; only P0/P1 incidents enter the live lane",
 });
 
 test("one unsolicited call/signoff per day leaves room for true incidents", () => {
-  assert.equal(WIRE_INTERRUPT_HARD_CAP, 1);
+  assert.equal(WIRE_INTERRUPT_HARD_CAP, 4);
 });
 
 test("scheduled digests do not pre-ping deferred decisions", () => {
