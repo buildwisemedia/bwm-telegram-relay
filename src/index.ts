@@ -1805,12 +1805,23 @@ async function processTelegramReply(
     // ("you handle this") both end in an incident-resolved emit, and both must
     // clear the registry on success (codex r4). Non-resolving replies never
     // reach the gated delete.
-    // Read the STORED fingerprint (metadata.wire.fingerprint), never re-derive it
-    // from the raw key: re-hashing would silently miss whenever the fingerprint recipe
-    // changes, leaving a resolved incident in the registry forever — and a resolved
-    // fire that never clears is a fire that re-renders in every later digest.
+    // Prefer the STORED fingerprint (metadata.wire.fingerprint) — never re-derive it
+    // from the raw key, because re-hashing silently misses whenever the fingerprint
+    // recipe changes, and a resolved fire that never clears re-renders in every later
+    // digest.
+    //
+    // MIGRATION FALLBACK: fires opened BEFORE the fingerprint deploy have no stored
+    // fingerprint, and there are live ones in the registry right now. For those, and
+    // only for DELETION of an already-existing entry, fall back to the legacy
+    // shortHash(rawKey) slot. This mints no identity — it just lets Robert resolve an
+    // in-flight incident instead of stranding it.
     const storedFp = (wireMeta as { fingerprint?: string }).fingerprint;
-    if (storedFp) fireRegistryKeyToClear = `${KV_WIRE_FIRE_PREFIX}${storedFp}`;
+    const fireRawKey = (wireMeta as { key?: string }).key;
+    if (storedFp) {
+      fireRegistryKeyToClear = `${KV_WIRE_FIRE_PREFIX}${storedFp}`;
+    } else if (fireRawKey) {
+      fireRegistryKeyToClear = `${KV_WIRE_FIRE_PREFIX}${shortHash(fireRawKey)}`;
+    }
     // ORIGINLESS fires (created via /notify, no operational-event identity)
     // would dead-end at the missing-origin guard below — resolve them inline
     // (codex r6): persist the decision, clear the registry, confirm.

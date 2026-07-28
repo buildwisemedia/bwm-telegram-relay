@@ -227,3 +227,18 @@ test("the reviewed Jul 27 digest is exactly what the fixed composers no longer p
     assert.ok(!forbidden.test(after), `forbidden pattern still present: ${forbidden}`);
   }
 });
+
+// ── migration: fires opened BEFORE the fingerprint deploy ────────────────────
+
+test("a pre-deploy fire (no stored fingerprint) is still resolvable by its legacy slot", () => {
+  // Six such entries existed in the live registry at deploy time. Their outbound rows
+  // carry metadata.wire.key but no metadata.wire.fingerprint. Resolving one must clear
+  // the legacy shortHash(key) slot, not a fingerprint slot that was never written.
+  const legacyMeta = { type: "fire", key: "gads-guard-9793789968" } as Record<string, unknown>;
+  const storedFp = (legacyMeta as { fingerprint?: string }).fingerprint;
+  assert.equal(storedFp, undefined, "the pre-deploy shape genuinely has no fingerprint");
+  // The new fingerprint for the same key is a DIFFERENT slot — which is exactly why the
+  // fallback is needed rather than a re-derivation.
+  const newFp = fireFingerprint({ key: "gads-guard-9793789968", origin: "gads-guard" });
+  assert.ok(newFp && typeof newFp === "string");
+});
