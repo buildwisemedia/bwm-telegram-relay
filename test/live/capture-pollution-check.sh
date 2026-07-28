@@ -84,7 +84,19 @@ q "capture heartbeats" \
 # evidence flap-replay reads, and plan v6 §2.10 excludes metadata.capture=true rows from
 # every denominator. What must never happen is an UNSTAMPED drill row: that one would
 # silently enter the denominators it is supposed to be excluded from.
-UNSTAMPED="$(curl -fsS "$SUPABASE_URL/rest/v1/telegram_outbound?created_at=gte.$SINCE&metadata->wire->>origin=eq.fixture-harness&metadata->>capture=not.eq.true&select=id,source_route,metadata&limit=20" \
+# Identify drill rows by CHAT_ID, not by metadata.
+#
+# The first version of this check keyed on metadata.wire.origin=fixture-harness and
+# reported "0 unstamped rows" while three unstamped drill rows sat in the table: the
+# fire EDIT path rewrites metadata wholesale and carried neither the origin nor the
+# capture stamp, so the check was looking for a marker the rows no longer had. chat_id
+# is written once at insert and is never touched by a metadata patch, which makes it the
+# only field that reliably identifies a drill row no matter which write path produced it.
+#
+# The or=(...is.null,...neq.true) matters: `not.eq.true` alone silently EXCLUDES rows
+# whose metadata.capture is absent — SQL NULL comparisons are neither true nor false —
+# which is precisely the unstamped row this check exists to find.
+UNSTAMPED="$(curl -fsS "$SUPABASE_URL/rest/v1/telegram_outbound?created_at=gte.$SINCE&chat_id=like.*capture-drill*&or=(metadata->>capture.is.null,metadata->>capture.neq.true)&select=id,source_route,metadata&limit=20" \
   -H "apikey: $SB_KEY" -H "Authorization: Bearer $SB_KEY" 2>/dev/null)" \
   || step_fail "capture-pollution" "unstamped-drill-row query FAILED — cannot prove non-pollution"
 N_UNSTAMPED="$(printf '%s' "$UNSTAMPED" | python3 -c 'import json,sys
@@ -100,9 +112,12 @@ fi
 echo "    unstamped drill outbound rows: 0"
 
 # ── 3. No drill row was ever actually delivered to Telegram ─────────────────
-# The capture worker short-circuits Telegram I/O, so every drill row carries a synthetic
-# response. A row with a real Telegram response would mean a drill reached Robert.
-REAL="$(curl -fsS "$SUPABASE_URL/rest/v1/telegram_outbound?created_at=gte.$SINCE&metadata->>capture=eq.true&telegram_response->>capture=is.null&status=eq.sent&select=id&limit=20" \
+# Proof is the MESSAGE ID, not the stored response. The capture worker short-circuits
+# Telegram I/O and mints synthetic ids from 9,000,000 up; real ids in Robert's chat are
+# four digits. An earlier version keyed on telegram_response->>capture being null, which
+# flagged every edit-path row (those simply never store a response) as "reached
+# Telegram" — a false alarm that would have masked a real one.
+REAL="$(curl -fsS "$SUPABASE_URL/rest/v1/telegram_outbound?created_at=gte.$SINCE&chat_id=like.*capture-drill*&status=eq.sent&telegram_message_id=lt.9000000&select=id,telegram_message_id&limit=20" \
   -H "apikey: $SB_KEY" -H "Authorization: Bearer $SB_KEY" 2>/dev/null)" \
   || step_fail "capture-pollution" "delivered-drill query FAILED — cannot prove non-delivery"
 N_REAL="$(printf '%s' "$REAL" | python3 -c 'import json,sys

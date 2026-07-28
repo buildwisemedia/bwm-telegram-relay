@@ -3672,7 +3672,7 @@ async function dispatchWireInner(
             sourceRoute, originEventId: origin?.originEventId ?? null, originEventType: origin?.originEventType ?? null,
             originSessionId: input.session_id ?? null, parseMode: "HTML",
             text: renderWire(input, reg.ref ?? "F-?"), status: "skipped",
-            metadata: { reason: "fire_claim_pending", wire: { type: "fire", key: input.key ?? null, fingerprint } },
+            metadata: { reason: "fire_claim_pending", wire: { type: "fire", key: input.key ?? null, origin: input.origin ?? null, fingerprint }, ...(isCaptureMode(env) ? { capture: true } : {}) },
           });
           return { ok: true, action: "skipped_claim_pending", ref: reg.ref };
         }
@@ -3701,7 +3701,7 @@ async function dispatchWireInner(
             originEventType: origin?.originEventType ?? null,
             originSessionId: input.session_id ?? null, chatId, parseMode: "HTML", text,
             status: "sent",
-            metadata: { wire: { type: "fire", ref: reg.ref, action: "edited", count: reg.count, key: input.key ?? null, fingerprint } },
+            metadata: { wire: { type: "fire", ref: reg.ref, action: "edited", count: reg.count, key: input.key ?? null, origin: input.origin ?? null, fingerprint }, ...(isCaptureMode(env) ? { capture: true } : {}) },
           });
           // Stamp the edited row with the message_id so reply lookup (newest-
           // first) resolves the LATEST coalesced incident (codex r2).
@@ -3723,7 +3723,7 @@ async function dispatchWireInner(
             sourceRoute, originEventId: origin?.originEventId ?? null, originEventType: origin?.originEventType ?? null,
             originSessionId: input.session_id ?? null, parseMode: "HTML", text, status: "failed",
             error: `edit_transient: ${(edit.error ?? "").slice(0, 150)}`,
-            metadata: { wire: { type: "fire", ref: reg.ref, action: "edit_failed_transient", key: input.key ?? null, fingerprint } },
+            metadata: { wire: { type: "fire", ref: reg.ref, action: "edit_failed_transient", key: input.key ?? null, origin: input.origin ?? null, fingerprint }, ...(isCaptureMode(env) ? { capture: true } : {}) },
           });
           return { ok: false, action: "edit_failed_transient", ref: reg.ref, error: edit.error };
         }
