@@ -49,13 +49,69 @@ except Exception:
   echo "    $label: 0"
 }
 
+# ── 0. CANARY: prove the query mechanism actually sees data ─────────────────
+# Without this, every "0 rows" below could mean "the credentials point at nothing" and
+# the whole check would pass by being blind. The canary asks for rows that MUST exist.
+CANARY="$(curl -fsS "$SUPABASE_URL/rest/v1/telegram_outbound?created_at=gte.$SINCE&select=id&limit=5" \
+  -H "apikey: $SB_KEY" -H "Authorization: Bearer $SB_KEY" 2>/dev/null)" \
+  || step_fail "capture-pollution" "CANARY query failed — this check is blind, not clean"
+N_CANARY="$(printf '%s' "$CANARY" | python3 -c 'import json,sys
+try:
+    print(len(json.load(sys.stdin)))
+except Exception:
+    print(-1)')"
+if [ "$N_CANARY" -lt 1 ] 2>/dev/null || [ "$N_CANARY" = "-1" ]; then
+  step_fail "capture-pollution" "CANARY saw $N_CANARY rows in the last ${WINDOW_HOURS}h — the queries are not reaching live data, so a clean result proves nothing"
+fi
+echo "    canary (must be >0): $N_CANARY"
+
+# ── 1. NO operational_events row from a drill ────────────────────────────────
+# This is the real pollution risk: operational_events drives the fan-out trigger into
+# command_tasks / comms_log / command_alerts / deliverables. A single leaked row there
+# creates downstream work. emitOperationalEvent diverts to KV in capture mode, and the
+# three legacy direct writers are sealed by canWriteOperationalEventsDirectly().
 q "capture-session events" \
   "operational_events?occurred_at=gte.$SINCE&session_id=like.*capture*&select=id,session_id&limit=20"
 q "fixture-harness events" \
   "operational_events?occurred_at=gte.$SINCE&session_id=like.*fixture*&select=id,session_id&limit=20"
-q "capture-stamped outbound" \
-  "telegram_outbound?created_at=gte.$SINCE&metadata->>capture=eq.true&select=id,source_route&limit=20"
-q "fixture-origin outbound" \
-  "telegram_outbound?created_at=gte.$SINCE&metadata->wire->>origin=eq.fixture-harness&select=id,source_route&limit=20"
+q "flap-drill events" \
+  "operational_events?occurred_at=gte.$SINCE&session_id=like.flap-*&select=id,session_id&limit=20"
+q "capture heartbeats" \
+  "operational_events?occurred_at=gte.$SINCE&event_type=eq.daemon.heartbeat&payload->>run_kind=eq.capture&select=id&limit=20"
 
-step_ok "capture-pollution" "no production rows from any drill in the last ${WINDOW_HOURS}h"
+# ── 2. Every drill outbound row MUST be stamped capture=true ─────────────────
+# telegram_outbound rows from the capture worker are EXPECTED — they are the audit
+# evidence flap-replay reads, and plan v6 §2.10 excludes metadata.capture=true rows from
+# every denominator. What must never happen is an UNSTAMPED drill row: that one would
+# silently enter the denominators it is supposed to be excluded from.
+UNSTAMPED="$(curl -fsS "$SUPABASE_URL/rest/v1/telegram_outbound?created_at=gte.$SINCE&metadata->wire->>origin=eq.fixture-harness&metadata->>capture=not.eq.true&select=id,source_route,metadata&limit=20" \
+  -H "apikey: $SB_KEY" -H "Authorization: Bearer $SB_KEY" 2>/dev/null)" \
+  || step_fail "capture-pollution" "unstamped-drill-row query FAILED — cannot prove non-pollution"
+N_UNSTAMPED="$(printf '%s' "$UNSTAMPED" | python3 -c 'import json,sys
+try:
+    print(len(json.load(sys.stdin)))
+except Exception:
+    print(-1)')"
+[ "$N_UNSTAMPED" = "-1" ] && step_fail "capture-pollution" "unstamped-drill-row response unparseable"
+if [ "$N_UNSTAMPED" != "0" ]; then
+  echo "    $(printf '%s' "$UNSTAMPED" | head -c 400)"
+  step_fail "capture-pollution" "$N_UNSTAMPED drill outbound row(s) are NOT stamped capture=true"
+fi
+echo "    unstamped drill outbound rows: 0"
+
+# ── 3. No drill row was ever actually delivered to Telegram ─────────────────
+# The capture worker short-circuits Telegram I/O, so every drill row carries a synthetic
+# response. A row with a real Telegram response would mean a drill reached Robert.
+REAL="$(curl -fsS "$SUPABASE_URL/rest/v1/telegram_outbound?created_at=gte.$SINCE&metadata->>capture=eq.true&telegram_response->>capture=is.null&status=eq.sent&select=id&limit=20" \
+  -H "apikey: $SB_KEY" -H "Authorization: Bearer $SB_KEY" 2>/dev/null)" \
+  || step_fail "capture-pollution" "delivered-drill query FAILED — cannot prove non-delivery"
+N_REAL="$(printf '%s' "$REAL" | python3 -c 'import json,sys
+try:
+    print(len(json.load(sys.stdin)))
+except Exception:
+    print(-1)')"
+[ "$N_REAL" = "-1" ] && step_fail "capture-pollution" "delivered-drill response unparseable"
+[ "$N_REAL" = "0" ] || step_fail "capture-pollution" "$N_REAL drill row(s) reached the real Telegram API"
+echo "    drill rows delivered to Telegram: 0"
+
+step_ok "capture-pollution" "no drill event rows, no unstamped drill rows, nothing delivered (last ${WINDOW_HOURS}h)"

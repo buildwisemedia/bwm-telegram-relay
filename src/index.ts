@@ -389,6 +389,21 @@ function supabaseConfigured(env: Env): boolean {
   return !!env.SUPABASE_URL && !!env.SUPABASE_SERVICE_KEY;
 }
 
+/** Guard for the THREE remaining direct operational_events writers (the reaction
+ *  wire-decision, the reaction ack narrative, and the heartbeat). emitOperationalEvent
+ *  already diverts to the KV sink in capture mode; these three predate it and still
+ *  POST directly, so without this they would write straight into the production
+ *  substrate from a drill worker. §2.9 consolidates them onto the single hardened
+ *  helper in Phase 3 — until then, this is the seal.
+ *
+ *  Note this is deliberately NOT folded into supabaseConfigured(): telegram_outbound
+ *  audit rows MUST still be written in capture mode (stamped metadata.capture=true) —
+ *  they are the evidence the acceptance drills read. Only fan-out-bearing
+ *  operational_events writes are blocked. */
+function canWriteOperationalEventsDirectly(env: Env): boolean {
+  return supabaseConfigured(env) && !isCaptureMode(env);
+}
+
 function supabaseRestUrl(env: Env, path: string): string {
   return `${env.SUPABASE_URL.replace(/\/+$/, "")}/rest/v1/${path}`;
 }
@@ -2494,7 +2509,7 @@ async function handleReactionUpdate(env: Env, update: TelegramUpdate): Promise<v
   // already-answered item stays a plain ack (codex r2, idempotency).
   if (wireOnAck?.ref && (wireOnAck.type === "call" || wireOnAck.type === "signoff") && emojis.includes("👍") && ackRefStillOpen) {
     let decisionLogged = false;
-    if (supabaseConfigured(env)) {
+    if (canWriteOperationalEventsDirectly(env)) {
       try {
         const resp = await fetch(supabaseRestUrl(env, "operational_events"), {
           method: "POST",
@@ -2540,7 +2555,7 @@ async function handleReactionUpdate(env: Env, update: TelegramUpdate): Promise<v
   }
 
   // Narrative so the ack is visible in operational_events (Bob/Sarah/sweeps).
-  if (supabaseConfigured(env)) {
+  if (canWriteOperationalEventsDirectly(env)) {
     try {
       const preview = (origin?.text_redacted ?? "").slice(0, 160);
       const resp = await fetch(supabaseRestUrl(env, "operational_events"), {
@@ -2715,6 +2730,10 @@ async function emitHeartbeat(
     triggered_by: "cron:*/15",
   };
 
+  if (!canWriteOperationalEventsDirectly(env)) {
+    console.log(JSON.stringify({ where: "heartbeat", skipped: "capture_mode" }));
+    return;
+  }
   try {
     const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/operational_events`, {
       method: "POST",
