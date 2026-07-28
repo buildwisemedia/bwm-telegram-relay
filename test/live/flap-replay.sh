@@ -81,9 +81,13 @@ SB_KEY="${SUPABASE_SECRET_KEY:-${SUPABASE_SERVICE_ROLE_KEY:-}}"
 ROWS="$(curl -fsS "$SUPABASE_URL/rest/v1/telegram_outbound?origin_session_id=eq.$RUN&select=id,status,metadata,telegram_message_id&order=created_at.asc" \
   -H "apikey: $SB_KEY" -H "Authorization: Bearer $SB_KEY")" || step_fail "flap-outbound-set" "audit query failed"
 
-printf '%s' "$ROWS" | python3 - <<'PY' || exit 1
+# The rows go to a FILE, not stdin: a heredoc-fed python already owns stdin, so
+# `printf ... | python3 - <<PY` makes json.load read the SCRIPT and blow up.
+ROWS_FILE="$(mktemp)"
+printf '%s' "$ROWS" > "$ROWS_FILE"
+python3 - "$ROWS_FILE" <<'PY' || { rm -f "$ROWS_FILE"; exit 1; }
 import json, sys
-rows = json.load(sys.stdin)
+rows = json.load(open(sys.argv[1]))
 sent = [r for r in rows if ((r.get("metadata") or {}).get("wire") or {}).get("action") != "edited" and r.get("status") == "sent"]
 edited = [r for r in rows if ((r.get("metadata") or {}).get("wire") or {}).get("action") == "edited"]
 ids = {r.get("telegram_message_id") for r in rows if r.get("telegram_message_id")}
@@ -99,6 +103,7 @@ if problems:
     sys.exit(1)
 print(f"STEP:flap-outbound-set:OK 1 sent + 1 edited, single message id {ids.pop()}, fingerprint {fps.pop()}")
 PY
+rm -f "$ROWS_FILE"
 
 # ── NEGATIVE control: the OLD random-suffix key shape must still split ───────
 # Without this, a passing assertion above could mean "the relay coalesces everything",
