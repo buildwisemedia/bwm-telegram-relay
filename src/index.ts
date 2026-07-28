@@ -2842,9 +2842,19 @@ export function isEmailAsRobert(...parts: Array<string | null | undefined>): boo
   }
 }
 
-/** Layer 3. Drop every LINE carrying a signature from an already-composed payload.
- *  Returns the scrubbed text plus how many lines were removed (telemetry: a nonzero
- *  count means an un-enumerated ingress path exists and must be found). */
+/** Layer 3. Drop every LINE carrying a signature from an already-composed payload,
+ *  then REPAIR what the removal left behind.
+ *
+ *  Removing a line is not enough on its own. A scrubbed item can leave:
+ *    · a section header with nothing under it, and
+ *    · a reply footer naming a ref that is no longer on screen —
+ *  which is finding 12 ("the reply instruction demonstrates a reference that does not
+ *  exist") reintroduced by the very guard meant to clean the surface. Observed while
+ *  rendering a real pre-deploy wire:open entry through the composer, so it is repaired
+ *  here rather than left for Robert to find.
+ *
+ *  Returns the finished text plus how many signature lines were removed — a nonzero
+ *  count means an un-enumerated ingress path exists and must be found. */
 export function scrubEmailAsRobert(text: string): { text: string; removed: number } {
   const kept: string[] = [];
   let removed = 0;
@@ -2852,7 +2862,30 @@ export function scrubEmailAsRobert(text: string): { text: string; removed: numbe
     if (isEmailAsRobert(line)) { removed += 1; continue; }
     kept.push(line);
   }
-  return { text: kept.join("\n"), removed };
+  if (removed === 0) return { text: kept.join("\n"), removed };
+
+  // Drop a footer whose named ref no longer appears anywhere else on screen.
+  const isFooter = (l: string) => /^<i>Reply by ref/.test(l);
+  const refIn = (l: string) => (/"([FCS]-[0-9A-Z]{3,6}):/.exec(l) ?? [])[1];
+  const repaired = kept.filter((l) => {
+    if (!isFooter(l)) return true;
+    const ref = refIn(l);
+    if (!ref) return true;
+    return kept.some((other) => other !== l && other.includes(ref));
+  });
+
+  // Drop a section header with no bullet under it.
+  const isHeader = (l: string) => /^<b>[^<]+:<\/b>$/.test(l);
+  const isBullet = (l: string) => l.startsWith("•");
+  const final = repaired.filter((l, i) => {
+    if (!isHeader(l)) return true;
+    for (let j = i + 1; j < repaired.length; j++) {
+      if (isBullet(repaired[j])) return true;
+      if (isHeader(repaired[j])) break;
+    }
+    return false;
+  });
+  return { text: final.join("\n"), removed };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

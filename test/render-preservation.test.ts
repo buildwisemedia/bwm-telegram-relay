@@ -242,3 +242,34 @@ test("a pre-deploy fire (no stored fingerprint) is still resolvable by its legac
   const newFp = fireFingerprint({ key: "gads-guard-9793789968", origin: "gads-guard" });
   assert.ok(newFp && typeof newFp === "string");
 });
+
+test("layer 3 repairs what it removes: no dangling header, no orphaned footer", () => {
+  // A pre-deploy wire:open entry carrying the email item — it bypassed ingress because
+  // it was registered before the kill list existed, so layer 3 is the only guard.
+  const { lines, renderedRefs } = waitingOnYouLines([{
+    ref: "S-B37RS",
+    punchline: 'Email ready to send as you → dap@example.com: "Re: New card job"',
+    ts: "2026-07-21T19:23:46Z",
+  }]);
+  const composed = ["🌙 <b>DAY DONE</b>", ...lines, ...replyFooter(renderedRefs)].join("\n");
+  assert.match(composed, /Email ready to send as you/, "the defect is genuinely present before the scrub");
+
+  const { text, removed } = scrubEmailAsRobert(composed);
+  assert.equal(removed, 1);
+  assert.ok(!text.includes("Email ready to send as you"), "the item must be gone");
+  assert.ok(!/<b>Waiting on you:<\/b>/.test(text), "a header with nothing under it must be dropped");
+  assert.ok(!/Reply by ref/.test(text), "a footer naming an off-screen ref must be dropped (finding 12)");
+});
+
+test("layer 3 keeps the header and footer when a real item survives alongside", () => {
+  const { lines, renderedRefs } = waitingOnYouLines([
+    { ref: "C-8KQ2M", punchline: "Approve the Cathryn block booking or hold list price.", ts: "2026-07-21T10:00:00Z" },
+    { ref: "S-B37RS", punchline: "Email ready to send as you → dap@example.com", ts: "2026-07-21T19:23:46Z" },
+  ]);
+  const composed = ["🌙 <b>DAY DONE</b>", ...lines, ...replyFooter(renderedRefs)].join("\n");
+  const { text, removed } = scrubEmailAsRobert(composed);
+  assert.equal(removed, 1);
+  assert.match(text, /<b>Waiting on you:<\/b>/, "the header still has a bullet under it");
+  assert.match(text, /C-8KQ2M/, "the real decision survives");
+  assert.match(text, /Reply by ref — for example "C-8KQ2M/, "the footer still names an on-screen ref");
+});
