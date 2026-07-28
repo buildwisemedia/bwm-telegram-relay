@@ -19,8 +19,10 @@ import {
   fitWholeUnits,
   assertSourcePreservation,
   isEmailAsRobert,
+  isEmailAsRobertOrigin,
   scrubEmailAsRobert,
   fireFingerprint,
+  parseWireInput,
 } from "../src/index.ts";
 
 /** The six fragments, each with the whole unit it was cut from. */
@@ -184,9 +186,41 @@ test("the kill list fails CLOSED on an evaluation error", () => {
 });
 
 test("the kill list does not eat ordinary business copy", () => {
-  assert.ok(!isEmailAsRobert("Design2Sell booking form is rejecting every submission"));
-  assert.ok(!isEmailAsRobert("Cathryn wants 10 client slots at the Pilot price"));
-  assert.ok(!isEmailAsRobert("A client message reached the 2-hour team follow-up mark"));
+  // An adversarial review killed 9 of these 10 under the first (over-general) regex set.
+  // A kill list that eats real decisions is a worse failure than the one it prevents:
+  // the sender gets HTTP 200 and Robert gets silence. These are the regression guard.
+  const MUST_SURVIVE = [
+    "Sent the proposal to the client as you asked this morning.",
+    "3 new ad creative drafts ready to send to the design team.",
+    "Approve and send this draft blog post to Cathryn's list?",
+    "Design2Sell booking form is rejecting every submission",
+    "Cathryn wants 10 client slots at the Pilot price",
+    "A client message reached the 2-hour team follow-up mark",
+    "Replied to Barbara as you were on the call — she has the quote now.",
+    "The vendor responded as you predicted; they want a 3-week lead time.",
+    "Two proposal drafts are ready to send once you pick a price.",
+    "I drafted a reply as a starting point — the team will send it.",
+  ];
+  for (const line of MUST_SURVIVE) {
+    assert.equal(isEmailAsRobert(line), false, `kill list must NOT eat: ${JSON.stringify(line)}`);
+  }
+});
+
+test("the kill list still catches the real capability, by text and by producer", () => {
+  const MUST_DIE = [
+    'Email ready to send as you → dap@example.com: "Re: New card job"',
+    "Tap the link to send it now. To discard instead, ignore it.",
+    "Drafts ready to send: 3",
+    "ignore it — the draft expires in 7 days.",
+  ];
+  for (const line of MUST_DIE) {
+    assert.equal(isEmailAsRobert(line), true, `kill list must catch: ${JSON.stringify(line)}`);
+  }
+  // Producer binding is the precise mechanism — it does not depend on prose at all.
+  assert.equal(isEmailAsRobertOrigin("bwm-gmail-send"), true);
+  assert.equal(isEmailAsRobertOrigin("bwm-gmail-send worker"), true);
+  assert.equal(isEmailAsRobertOrigin("launchagent-health"), false);
+  assert.equal(isEmailAsRobertOrigin(null), false);
 });
 
 test("layer 3 scrubs a signature line out of an already-composed payload", () => {
@@ -272,4 +306,40 @@ test("layer 3 keeps the header and footer when a real item survives alongside", 
   assert.match(text, /<b>Waiting on you:<\/b>/, "the header still has a bullet under it");
   assert.match(text, /C-8KQ2M/, "the real decision survives");
   assert.match(text, /Reply by ref — for example "C-8KQ2M/, "the footer still names an on-screen ref");
+});
+
+// ── adversarial-review regressions ───────────────────────────────────────────
+
+test("an over-long option drops the WHOLE set, never renumbering the survivors", () => {
+  // Dropping option 2 of 3 would silently promote option 3 into slot 2, so Robert's "2"
+  // resolves to a choice he never saw. The numbering IS the reply contract, and the
+  // decision is made at INGRESS, which is where this must be asserted.
+  const long = "x".repeat(200);
+  const parsed = parseWireInput({ type: "call", punchline: "pick one", rec: "go", options: ["Go now", long, "Something else"] });
+  assert.ok(parsed.ok);
+  if (!parsed.ok) return;
+  assert.equal(parsed.input.options, undefined, "the whole set drops together");
+  assert.ok(parsed.droppedFields?.some((d) => d.startsWith("options:whole_set_dropped")), "and the sender is told");
+
+  const text = renderWire(parsed.input, "C-TEST9");
+  assert.ok(!text.includes("2 = Something else"), "survivors must not be renumbered");
+  assert.match(text, /Reply with your call/, "falls back to free-text reply");
+});
+
+test("an item that cannot render whole leaves no dangling header", () => {
+  // Mirrors the Day Done / Calendar / Plan sites: build bullets first, emit the header
+  // only if at least one bullet survived.
+  const { lines, renderedRefs } = waitingOnYouLines([{ ref: "C-LONG1", punchline: "", ts: "2026-07-27T00:00:00Z" }]);
+  const text = lines.join("\n");
+  assert.equal(renderedRefs.length, 0);
+  assert.ok(!/<b>Waiting on you:<\/b>$/.test(text), "no bare header with nothing under it");
+  assert.match(text, /nothing that renders cleanly/);
+});
+
+test("a long punchline that FITS the budget still renders whole", () => {
+  // The complement of the case above: whole-unit means whole, not short.
+  const long = `${"y".repeat(380)} END`;
+  const { lines, renderedRefs } = waitingOnYouLines([{ ref: "C-LONG2", punchline: long, ts: "2026-07-27T00:00:00Z" }]);
+  assert.equal(renderedRefs.length, 1);
+  assert.ok(lines.join("\n").includes(long), "the whole punchline survives");
 });

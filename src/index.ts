@@ -2820,15 +2820,25 @@ function escapeHtml(text: string): string {
 // config flag.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// The signatures are deliberately TIGHT and literal. An earlier version used general
+// patterns ("send/reply … as you", "approve and send this draft") and an adversarial
+// review showed it killing 9 of 10 ordinary operational sentences — including
+// "Approve and send this draft blog post to Cathryn's list?", which is a legitimate
+// SIGNOFF and one of the system's core use cases. A kill list that eats real decisions
+// is a worse failure than the one it prevents: the sender gets HTTP 200 and Robert gets
+// silence. Match the capability's actual output, nothing broader.
 const EMAIL_AS_ROBERT_SIGNATURES: RegExp[] = [
-  /\bemail\s+ready\s+to\s+send\s+as\s+you\b/i,
-  /\b(?:send|sent|sending|reply|replied|respond|responded)\b[^.\n]{0,40}\bas\s+(?:you|robert)\b/i,
-  /\bdrafted?\s+(?:an?\s+)?(?:email|reply|response)\b[^.\n]{0,40}\b(?:as|on behalf of)\s+(?:you|robert)\b/i,
-  /\btap\s+the\s+link\s+to\s+send\s+it\s+now\b/i,
-  /\bdrafts?\s+ready\s+to\s+send\b/i,
-  /\bapprove\s+(?:and\s+)?send\s+(?:this\s+)?(?:email|reply|draft)\b/i,
-  /\bthe\s+draft\s+expires\s+in\b/i,
+  /\bemail\s+ready\s+to\s+send\s+as\s+you\b/i,          // the f05 punchline, verbatim
+  /\bready\s+to\s+send\s+as\s+(?:you|robert)\s*[→>]/i,    // same shape, addressee arrow
+  /\btap\s+the\s+link\s+to\s+send\s+it\s+now\b/i,        // the f05 rec, verbatim
+  /\bdrafts?\s+ready\s+to\s+send\s*:/i,                   // the retired Day Ahead line
+  /\bthe\s+draft\s+expires\s+in\s+\d+\s+days?\b/i,        // the f05 discard instruction
 ];
+
+/** Origins whose ENTIRE output is the disabled capability. Blocking by producer is the
+ *  precise mechanism — the capability has a name, so it does not need to be inferred
+ *  from prose. Text matching above is the backstop for anything that slips the origin. */
+const EMAIL_AS_ROBERT_ORIGINS = /^bwm-gmail-send\b|^bwm-ea-drafts\b/i;
 
 /** True when any part of an item carries an email-as-Robert signature.
  *  FAILS CLOSED — an exception counts as a match (plan v6 §2.1 typed failure posture). */
@@ -2837,6 +2847,15 @@ export function isEmailAsRobert(...parts: Array<string | null | undefined>): boo
     const hay = parts.filter(Boolean).join("\n");
     if (!hay) return false;
     return EMAIL_AS_ROBERT_SIGNATURES.some((re) => re.test(hay));
+  } catch {
+    return true;
+  }
+}
+
+/** True when the item comes from a producer whose whole job is the disabled capability. */
+export function isEmailAsRobertOrigin(origin: string | null | undefined): boolean {
+  try {
+    return !!origin && EMAIL_AS_ROBERT_ORIGINS.test(origin);
   } catch {
     return true;
   }
@@ -3215,7 +3234,7 @@ const WIRE_LIMITS = {
   session_id: 120,
 } as const;
 
-function parseWireInput(
+export function parseWireInput(
   raw: Record<string, unknown>,
 ): { ok: true; input: WireInput; judgmentDropped?: string; droppedFields?: string[] } | { ok: false; error: string } {
   const type = String(raw["type"] ?? "").toLowerCase();
@@ -3260,12 +3279,18 @@ function parseWireInput(
       .map((s) => decodeLegacyHtml(s))
       .filter(Boolean)
       .slice(0, 4);
-    // An over-long option is dropped WHOLE. "2=Wait for Sol's cross-che" is exactly
-    // the half-sentence choice Robert could not act on.
-    const before = options.length;
-    options = options.filter((o) => o.length <= WIRE_LIMITS.option);
-    if (options.length !== before) droppedFields.push(`options:${before - options.length}_over_${WIRE_LIMITS.option}`);
-    if (options.length === 0) options = undefined;
+    // Options are one SET, not independent units: the numbering IS the reply contract.
+    // Dropping option 2 of 3 silently renumbers option 3 into slot 2, so Robert's "2"
+    // resolves to a choice he never saw (adversarial review, P2). Include-whole-or-
+    // drop-whole therefore applies to the WHOLE set — if any option cannot render, the
+    // item falls back to free-text reply rather than offering mislabelled numbers.
+    const over = options.filter((o) => o.length > WIRE_LIMITS.option).length;
+    if (over > 0) {
+      droppedFields.push(`options:whole_set_dropped_${over}_over_${WIRE_LIMITS.option}`);
+      options = undefined;
+    } else if (options.length === 0) {
+      options = undefined;
+    }
   }
   const jr = parseWireJudgment(raw["judgment"], type as WireType, Boolean(str("rec")));
   return {
@@ -3546,7 +3571,8 @@ async function dispatchWireInner(
   // Active in EVERY mode and on EVERY route that reaches dispatchWire, so there is
   // exactly one door. A match is dropped here — never queued, never sent, never
   // resurfaced by a later digest — and leaves an auditable skipped row.
-  if (isEmailAsRobert(input.punchline, input.stakes, input.rec, input.ask, ...(input.options ?? []))) {
+  if (isEmailAsRobertOrigin(input.origin)
+      || isEmailAsRobert(input.punchline, input.stakes, input.rec, input.ask, ...(input.options ?? []))) {
     await createOutboundLog(env, {
       sourceRoute,
       originEventId: origin?.originEventId ?? null,
@@ -3660,7 +3686,35 @@ async function dispatchWireInner(
   let fireClaimKey: string | null = null;
   if (input.type === "fire" && fingerprint) {
     const fireKey = fireRegistryKey(fingerprint);
-    const existingRaw = await env.BWM_TELEGRAM_KV.get(fireKey);
+    let existingRaw = await env.BWM_TELEGRAM_KV.get(fireKey);
+    // ONE-TIME MIGRATION LOOKUP (adversarial review, P0). Six fires were open in the
+    // live registry when the fingerprint landed, stored under the OLD slot
+    // shortHash(key ?? punchline). Checking only the new slot would find nothing on
+    // recurrence and open a SECOND message for an already-open incident — precisely the
+    // re-ping this change exists to remove. So: if the new slot is empty, look in the
+    // legacy slot, and on a hit adopt the entry into the new slot and delete the old one
+    // (migrate-on-touch). Once the pre-deploy entries drain this branch is dead weight
+    // and can be removed; it mints no identity and never runs when the new slot hits.
+    if (!existingRaw && input.key) {
+      const legacyKey = `${KV_WIRE_FIRE_PREFIX}${shortHash(input.key)}`;
+      if (legacyKey !== fireKey) {
+        const legacyRaw = await env.BWM_TELEGRAM_KV.get(legacyKey);
+        if (legacyRaw) {
+          existingRaw = legacyRaw;
+          try {
+            await env.BWM_TELEGRAM_KV.put(fireKey, legacyRaw);
+            await env.BWM_TELEGRAM_KV.delete(legacyKey);
+            console.log(JSON.stringify({
+              where: "dispatchWire.fireLegacyMigrate", from: legacyKey, to: fireKey, fingerprint,
+            }));
+          } catch (e) {
+            // Migration is best-effort: we already HAVE the entry, so the edit proceeds
+            // either way. A failed move just means we migrate again next time.
+            console.warn(JSON.stringify({ where: "dispatchWire.fireLegacyMigrate", warn: String(e) }));
+          }
+        }
+      }
+    }
     if (existingRaw) {
       try {
         const reg = JSON.parse(existingRaw) as {
@@ -4092,7 +4146,14 @@ async function handleNotify(request: Request, env: Env): Promise<Response> {
     : parsed.input.judgment
       ? "accepted"
       : undefined;
-  return json(judgment ? { ...result, judgment } : result, result.ok ? 200 : 502);
+  // Report dropped fields for the same reason the judgment drop is reported: the
+  // sender's copy did not fully reach Robert, and silence about that is how a sender
+  // keeps emitting text nobody can render (adversarial review, P2).
+  return json({
+    ...result,
+    ...(judgment ? { judgment } : {}),
+    ...(parsed.droppedFields ? { dropped_fields: parsed.droppedFields } : {}),
+  }, result.ok ? 200 : 502);
 }
 
 /** The reply footer, bound to a ref that is ACTUALLY ON SCREEN (plan v6 §2.4).
@@ -4250,6 +4311,16 @@ async function listDigestNotes(env: Env): Promise<Array<Record<string, unknown> 
 /** Compose + send the Day Done digest: open fires, shipped (last 24h rolling —
  *  avoids DST math), waiting-on-you, queued notes. Always sends, even on a
  *  quiet day — the empty digest is the trust signal that silence = nothing. */
+/** Shape of a wire:fire:<fingerprint> registry entry as the digest reads it. */
+interface FireRegistryEntry {
+  ref: string;
+  base: WireInput;
+  count: number;
+  first_at?: string;
+  last_at?: string;
+  escalated?: boolean;
+}
+
 async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireResult & { items?: number }> {
   const chatId = await env.BWM_TELEGRAM_KV.get(KV_CHAT_ID_KEY);
   if (!chatId) return { ok: false, action: "skipped_no_chat_id" };
@@ -4267,8 +4338,8 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
   const fireItems = (await Promise.all(fireList.keys.map(async (k) => {
     const raw = await env.BWM_TELEGRAM_KV.get(k.name);
     if (!raw) return null;
-    try { return JSON.parse(raw) as { ref: string; base: WireInput; count: number }; } catch { return null; }
-  }))).filter((x): x is { ref: string; base: WireInput; count: number } =>
+    try { return JSON.parse(raw) as FireRegistryEntry; } catch { return null; }
+  }))).filter((x): x is FireRegistryEntry =>
     // Skip in-flight {pending:true} claims + malformed rows — rendering one
     // would throw on base.punchline and abort the whole digest (codex r5).
     !!x && !!(x as { base?: WireInput }).base && typeof (x as { base?: WireInput }).base?.punchline === "string");
@@ -4299,10 +4370,21 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
     // Google Ads line told Robert an alarm had fired four times without telling him
     // whether anything had been done about it — pure stress, zero decision value
     // (finding 5). Punchlines render WHOLE or the line is dropped (§2.6).
-    lines.push("<b>Still open:</b>");
-    for (const f of fireItems.slice(0, 3)) {
-      if (!f.base.punchline || f.base.punchline.length > 240) continue;
-      lines.push(`• ${escapeHtml(f.ref)} — ${escapeHtml(f.base.punchline)}`);
+    // Build the bullets FIRST, then emit the header only if at least one survived the
+    // whole-unit check. Pushing the header up front shipped a header with nothing under
+    // it whenever every candidate was too long to render whole (adversarial review, P1
+    // — the same defect waitingOnYouLines was already fixed for).
+    // Most-recent first: KV list order is lexicographic by fingerprint, which is
+    // effectively random, so without this an old escalated fire can crowd out today's.
+    const fireBullets = fireItems
+      .slice()
+      .sort((a, b) => String(b.last_at ?? b.first_at ?? "").localeCompare(String(a.last_at ?? a.first_at ?? "")))
+      .filter((f) => f.base.punchline && f.base.punchline.length <= 240)
+      .slice(0, 3)
+      .map((f) => `• ${escapeHtml(f.ref)} — ${escapeHtml(f.base.punchline)}`);
+    if (fireBullets.length > 0) {
+      lines.push("<b>Still open:</b>");
+      lines.push(...fireBullets);
     }
   }
   // The raw "Shipped (last 24h): 10" line is REMOVED (plan v6 §2.3): a bare count of
@@ -4419,7 +4501,19 @@ async function sweepFireRegistry(env: Env): Promise<void> {
     const first = Date.parse(String(reg["first_at"] ?? ""));
     if (!Number.isFinite(first) || now - first <= WIRE_FIRE_STALE_MS) continue;
     stale += 1;
-    if (reg["escalated"] === true) continue;
+    if (reg["escalated"] === true) {
+      // TERMINAL CLEANUP (adversarial review, P2). Removing the TTL was deliberate, but
+      // an escalated entry that never gets a reply would otherwise live forever and
+      // eventually crowd newer fires out of the 3-item digest preview. Once the team has
+      // owned it for a full stale window, the registry entry has done its job: the
+      // incident lives in command_tasks now, which is its real system of record.
+      const escalatedAt = Date.parse(String(reg["escalated_at"] ?? ""));
+      if (Number.isFinite(escalatedAt) && now - escalatedAt > WIRE_FIRE_STALE_MS) {
+        await env.BWM_TELEGRAM_KV.delete(k.name).catch(() => undefined);
+        collapsed += 1;
+      }
+      continue;
+    }
     const base = (reg["base"] ?? {}) as { punchline?: string; origin?: string };
     const taskId = await emitOperationalEvent(env, "task.queued", {
       assignee: "team",
@@ -4568,6 +4662,11 @@ async function redeliverDeferredDecisions(env: Env, chatId: string): Promise<num
     try {
       text = renderWire(input, entry.ref);
     } catch (e) {
+      // Release the slot we reserved above — nothing was sent, so consuming one of the
+      // four daily live interrupts would be a silent loss (adversarial review, P2;
+      // matches the mint-failure and send-failure branches below).
+      spent -= 1;
+      await env.BWM_TELEGRAM_KV.put(budgetKey, String(Math.max(0, spent)), { expirationTtl: WIRE_BUDGET_TTL_SECONDS });
       console.error(JSON.stringify({ where: "redeliverDeferred.render", error: "render_failed_closed", detail: String(e).slice(0, 200), ref: entry.ref }));
       continue;
     }
@@ -4777,12 +4876,19 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
     if (events.length === 0) {
       calSection.push("<b>Calendar:</b> clear.");
     } else {
-      calSection.push("<b>Calendar:</b>");
+      // Bullets first, header only if any survived (adversarial review, P1).
+      const calBullets: string[] = [];
       for (const ev of events.slice(0, 3)) {
         const when = ev.all_day ? "all day" : etTimeShort(ev.start_at);
         const summary = ev.summary ?? "(no title)";
         if (summary.length > 160) continue; // whole unit or nothing (§2.6)
-        calSection.push(`• ${escapeHtml(when)} — ${escapeHtml(summary)}`);
+        calBullets.push(`• ${escapeHtml(when)} — ${escapeHtml(summary)}`);
+      }
+      if (calBullets.length > 0) {
+        calSection.push("<b>Calendar:</b>");
+        calSection.push(...calBullets);
+      } else {
+        calSection.push("<b>Calendar:</b> nothing that renders cleanly this run.");
       }
     }
   }
@@ -4829,6 +4935,8 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
     } else {
       // NO COUNT, NO "+N more" (§2.3). A partial read is still reported honestly —
       // that is a data-availability fact, not a backlog tally.
+      // inboxLines is non-empty here by the enclosing branch, so the header always has
+      // a bullet under it.
       inboxSection.push("<b>Inbox needs you:</b>");
       inboxSection.push(...inboxLines.slice(0, 3));
       if (partial) inboxSection.push(`<i>(${failedSources} inbox source${failedSources === 1 ? "" : "s"} unavailable this run)</i>`);
@@ -4847,11 +4955,20 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
     // NO COUNT (§2.3): "Plan (50+ queued)" is the single line that most directly told
     // Robert he was fifty items behind. The priority TOKEN ("P2") is also gone —
     // internal severity labels are banned from Robert-visible text (rule 6).
-    planSection.push("<b>Plan:</b>");
+    // Bullets first, header only if any survived (adversarial review, P1). Plan titles
+    // are auto-generated as `Answer {ref} — {punchline}` and a punchline can run to the
+    // 1000-char ingress cap, so "every candidate too long" is a realistic case here.
+    const planBullets: string[] = [];
     for (const p of plan.slice(0, 3)) {
       const title = p.title ?? "(untitled)";
       if (title.length > 160) continue; // whole unit or nothing (§2.6)
-      planSection.push(`• ${escapeHtml(title)}`);
+      planBullets.push(`• ${escapeHtml(title)}`);
+    }
+    if (planBullets.length > 0) {
+      planSection.push("<b>Plan:</b>");
+      planSection.push(...planBullets);
+    } else {
+      planSection.push("<b>Plan:</b> nothing that renders cleanly this run.");
     }
   }
 
