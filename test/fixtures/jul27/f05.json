@@ -1,0 +1,24 @@
+{
+  "provenance": {
+    "kind": "live",
+    "source_table": "telegram_outbound",
+    "source_row_id": "01KY324PHZECQ354C89B62FKDY",
+    "captured_at": "2026-07-28T22:44:23.838Z",
+    "note": "Email-as-Robert signoff — a capability Robert disabled"
+  },
+  "observed": {
+    "created_at": "2026-07-21T19:23:46.369618+00:00",
+    "status": "queued",
+    "source_route": "/notify",
+    "metadata": {
+      "wire": {
+        "ref": "S-B37RS",
+        "type": "signoff",
+        "origin": "bwm-gmail-send",
+        "queued": "digest",
+        "reason": "budget"
+      }
+    },
+    "text_redacted": "🔵 <b>Approval: Email ready to send as you → dap@decaturatlantaprinting.com: \"Re: New card job - black stock, yellow foil + painted edges\"</b>\nClient: buildwise-media · Intent: vendor-quote · Hey John, Good to hear from you. White ink on black stock is off the table - understood, and no problem. We reworked the production so nothing needs white ink or black stock. New plan, same design: - White textured stock, your heaviest uncoated - laid or ribbed grain if you car…\n<b>My rec: Tap the link to send it now. To discard instead, ignore it — the draft expires in 7 days.</b>\nReply: 1 = approve · 2 = changes (say what)\nhttps://bwm-gmail-send.robert-ba0.workers.dev/approve?token=[REDACTED]"
+  }
+}

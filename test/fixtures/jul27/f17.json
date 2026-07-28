@@ -1,0 +1,50 @@
+{
+  "provenance": {
+    "kind": "synthetic",
+    "captured_at": "2026-07-28T22:44:26.538Z",
+    "note": "recap-status negative set — merely-queued/threshold/assignment work renders NOTHING"
+  },
+  "cases": [
+    {
+      "event_type": "task.queued",
+      "payload": {
+        "assignee": "team",
+        "title": "Rotate the broker bearer"
+      },
+      "expected": {
+        "renders": false
+      }
+    },
+    {
+      "event_type": "narrative",
+      "payload": {
+        "kind": "threshold-crossed",
+        "body": "ASAP hit the 2-hour follow-up mark"
+      },
+      "expected": {
+        "renders": false
+      }
+    },
+    {
+      "event_type": "build.shipped",
+      "payload": {
+        "delivery_state": "pr_created",
+        "summary": "PR opened"
+      },
+      "expected": {
+        "renders": false
+      }
+    },
+    {
+      "event_type": "client_state.transition",
+      "payload": {
+        "to_stage": "closing",
+        "reason": "contract sent"
+      },
+      "expected": {
+        "renders": false,
+        "why": "source REMOVED from the closed recap set (plan v6 §2.2)"
+      }
+    }
+  ]
+}

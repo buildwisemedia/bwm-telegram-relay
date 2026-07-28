@@ -1,0 +1,28 @@
+{
+  "provenance": {
+    "kind": "live",
+    "source_table": "operational_events",
+    "source_row_id": "01KYHFJWAVCX74PDFAM9JMB5K3",
+    "captured_at": "2026-07-28T22:44:23.989Z",
+    "note": "Shape A build.shipped, delivery_state=pr_created, merged=false → renders NOTHING"
+  },
+  "observed": {
+    "event_type": "build.shipped",
+    "payload": {
+      "repo": "buildwisemedia/bwm-connector-audit",
+      "commit": "ba48743",
+      "merged": false,
+      "pr_url": "https://github.com/buildwisemedia/bwm-connector-audit/pull/57",
+      "source": "bob-orchestrator orchestrate.py",
+      "work_id": "496c18f7-fec1-4cdf-bc70-0e630d2180e6",
+      "build_kind": "patch",
+      "qa_verdict": {},
+      "round_slug": "connector-audit-2026-07-27-asap-pest-and-wildlife-5-496c18f7",
+      "delivery_state": "pr_created",
+      "review_required": true,
+      "orchestrator_round": 0
+    },
+    "client_id": null,
+    "occurred_at": "2026-07-27T09:48:04.373107+00:00"
+  }
+}

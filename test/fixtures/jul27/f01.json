@@ -1,0 +1,23 @@
+{
+  "provenance": {
+    "kind": "live",
+    "source_table": "telegram_outbound",
+    "source_row_id": "01KYHYED33PH59XP4VK2XP4357",
+    "captured_at": "2026-07-28T22:44:23.531Z",
+    "note": "LaunchAgent health flap — the fire Robert saw twice (random key suffix)"
+  },
+  "observed": {
+    "created_at": "2026-07-27T14:07:46.518782+00:00",
+    "status": "sent",
+    "source_route": "/notify",
+    "metadata": {
+      "wire": {
+        "key": "launchagent-health-4126371745a9-b7be76f9",
+        "ref": "F-F1PF0",
+        "type": "fire",
+        "origin": "launchagent-health"
+      }
+    },
+    "text_redacted": "🔴 <b>Urgent: LaunchAgent health: 1 confirmed critical(s)</b>\ncom.buildwisemedia.aeo-probe\n<b>My rec: Open the health-scan evidence and repair the failing agent(s).</b>\n<i>Updates will edit this message — no re-pings.</i>"
+  }
+}

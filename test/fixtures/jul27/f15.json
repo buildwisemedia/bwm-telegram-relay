@@ -1,0 +1,19 @@
+{
+  "provenance": {
+    "kind": "synthetic",
+    "captured_at": "2026-07-28T22:44:26.538Z",
+    "note": "synthetic eligible LIVE fire — the send/edit control for flap-replay"
+  },
+  "wire_input": {
+    "type": "fire",
+    "punchline": "Design2Sell booking form is rejecting every submission — no lead can reach the team.",
+    "stakes": "Every inbound lead is being lost while this is open.",
+    "key": "fixture:f15:d2s-booking-form-down",
+    "origin": "fixture-harness"
+  },
+  "expected": {
+    "first_dispatch": "sent",
+    "second_dispatch": "edited",
+    "distinct_telegram_message_ids": 1
+  }
+}

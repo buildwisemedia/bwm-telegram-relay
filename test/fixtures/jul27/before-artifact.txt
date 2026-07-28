@@ -1,0 +1,18 @@
+🌙 <b>DAY DONE — Mon, Jul 27</b>
+<b>Fires (last 24h) (2):</b>
+• F-F1PF0 — LaunchAgent health: 1 confirmed critical(s)
+• F-27C87 — Google Ads fire: BWM Core - High-Intent Search spent $239.31 in  (×4)
+<b>Shipped (last 24h):</b> 10
+<b>Waiting on you (45):</b>
+• S-S4C83 — Social publisher phase 0 is built, merged, deployed and producti · <b>rec:</b> Nudge Rodel or Emiliya to approve or reject any  · <a href="https://design2sell.pages.dev/approvals/">open</a>
+• C-MTPF2 — Design2Sell approval buttons broke with today's security update  · <b>rec:</b> Say go — I'll merge + deploy PR #39 now to fix t · 1=Go — push the fix live n · 2=Wait for Sol's cross-che · 3=Something else · <a href="https://github.com/buildwisemedia/design2sell/pull/39">open</a> <i>(held: budget)</i>
+• S-B37RS — Email ready to send as you → dap@decaturatlantaprinting.com: "Re · <b>rec:</b> Tap the link to send it now. To discard instead, · <a href="https://bwm-gmail-send.robert-ba0.workers.dev/approve?token=[REDACTED] <i>(held: budget)</i>
+…+42 more — answer by ref anytime
+<b>Notes (234):</b>
+• 🔴 Bob: incident.opened (done-check regression) [P3] bwm-clarity-relay: 
+• Asap Pest Wildlife: a client message reached the 2-hour team follow-up m — <a href="https://buildwise-media.slack.com/archives/C095LRRFAUE/p1784922113893999?thread_ts=1784902199.765559&amp;cid=C095LRRFAUE">open</a>
+• P1 bob-orchestrator: bob-dry-tank
+• 🔴 Bob: incident.opened (done-check regression) unspecified
+• Approvals tracker: 1 item(s) pending over 48h — oldest: "Award records:  — <a href="https://design2sell.pages.dev/approvals/">open</a>
+…+229 more (next digest)
+<i>Reply to anything by ref ("C-003: go") — or just type what you want.</i>

@@ -1,0 +1,28 @@
+{
+  "provenance": {
+    "kind": "live",
+    "source_table": "operational_events",
+    "source_row_id": "01KYHVVXX82W3J52W4QP28NGWF",
+    "captured_at": "2026-07-28T22:44:24.060Z",
+    "note": "Shape B build.shipped, 'Review preview only - NOT live' in prose → renders NOTHING"
+  },
+  "observed": {
+    "event_type": "build.shipped",
+    "payload": {
+      "note": "prospect/goodwill build, no client row. Review preview only - NOT live at pattimoynihan.com; domain zone active but zero DNS records pending her final approval",
+      "repo": "moynihantherapy.com",
+      "commit": "aa474065630fb142d716d612f2b915bfa552a864",
+      "source": "log-event-cli session=f0246f27-057c-455f-ab44-a0547d5978d7",
+      "node_id": "patti-moynihan-site",
+      "summary": "Patti Moynihan Version C updated with her 7/24 feedback (green-version wording merged into yellow, methods corrected) and redeployed to review preview",
+      "ship_tag": "v9-patti-feedback-round2-2026-07-27",
+      "artifacts": [
+        "https://moynihantherapy-kimi-c.pages.dev"
+      ],
+      "build_kind": "patch",
+      "verification": "live curl + playwright render check at 1440x900 and 390x844: copy present, no horizontal scroll, images object-fit cover"
+    },
+    "client_id": null,
+    "occurred_at": "2026-07-27T13:22:43.900604+00:00"
+  }
+}

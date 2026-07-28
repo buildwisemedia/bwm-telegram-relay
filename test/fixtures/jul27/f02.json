@@ -1,0 +1,24 @@
+{
+  "provenance": {
+    "kind": "live",
+    "source_table": "telegram_outbound",
+    "source_row_id": "01KYHT0925Y9GP0EJ7S2A79BEV",
+    "captured_at": "2026-07-28T22:44:23.608Z",
+    "note": "Google Ads fire, coalesced x4, no automation-state field"
+  },
+  "observed": {
+    "created_at": "2026-07-27T12:50:09.346592+00:00",
+    "status": "sent",
+    "source_route": "/notify",
+    "metadata": {
+      "wire": {
+        "key": "gads-guard-9793789968",
+        "ref": "F-27C87",
+        "type": "fire",
+        "count": 4,
+        "action": "edited"
+      }
+    },
+    "text_redacted": "🔴 <b>Urgent: Google Ads fire: BWM Core - High-Intent Search spent $239.31 in 7d for 17 clicks and 0 conversions at $14.08 CPC. We'd check search terms, ad relevance, landing-page match, and bid controls now.</b>\n<b>Updates:</b>\n↻ 08:50 ET — Google Ads fire: BWM Core - High-Intent Search spent $263.23 in 7d for 20 clicks and 0 conversions at $13.16 CPC. We'd check search terms, ad relevanc\n↻ 08:50 ET — Google Ads fire: BWM Core - High-Intent Search spent $253.34 in 7d for 19 clicks and 0 conversions at $13.33 CPC. We'd check search terms, ad relevanc\n↻ 08:50 ET — Google Ads fire: BWM Core - High-Intent Search spent $263.25 in 7d for 20 clicks and 0 conversions at $13.16 CPC. We'd check search terms, ad relevanc"
+  }
+}

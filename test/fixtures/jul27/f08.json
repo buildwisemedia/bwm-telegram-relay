@@ -1,0 +1,23 @@
+{
+  "provenance": {
+    "kind": "live",
+    "source_table": "telegram_outbound",
+    "source_row_id": "01KYDVQ506S96V5FPJ17PT3V67",
+    "captured_at": "2026-07-28T22:44:24.280Z",
+    "note": "Bob incident.opened done-check — raw event name leaked"
+  },
+  "observed": {
+    "created_at": "2026-07-26T00:03:09.717259+00:00",
+    "status": "queued",
+    "source_route": "/send",
+    "metadata": {
+      "wire": {
+        "key": null,
+        "type": "fyi",
+        "origin": "legacy:/send",
+        "queued": "digest"
+      }
+    },
+    "text_redacted": "🟢 <b>Update: 🔴 Bob: incident.opened (done-check regression) [P3] bwm-clarity-relay: Clarity API fetch failed</b>"
+  }
+}

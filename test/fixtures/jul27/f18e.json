@@ -1,0 +1,19 @@
+{
+  "provenance": {
+    "kind": "synthetic",
+    "captured_at": "2026-07-28T22:44:26.539Z",
+    "note": "Tier-C control (money_commit) — expiring, MUST batch, MUST never ring the phone"
+  },
+  "wire_input": {
+    "type": "call",
+    "punchline": "The ad account will overspend the matched commitment by Friday unless you approve the raise.",
+    "authority": "money_commit",
+    "origin": "fixture-harness",
+    "expires_at": "2026-07-27"
+  },
+  "expected": {
+    "live_sends": 0,
+    "in_decision_digest": true,
+    "approval_task_status": "queued"
+  }
+}

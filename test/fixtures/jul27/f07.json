@@ -1,0 +1,22 @@
+{
+  "provenance": {
+    "kind": "live",
+    "source_table": "telegram_outbound",
+    "source_row_id": "01KYEA1F0A6ZGYXX50DE0RHM2W",
+    "captured_at": "2026-07-28T22:44:24.224Z",
+    "note": "P1 bob-orchestrator bob-dry-tank — raw internal jargon"
+  },
+  "observed": {
+    "created_at": "2026-07-26T04:13:27.674024+00:00",
+    "status": "skipped",
+    "source_route": "/event",
+    "metadata": {
+      "wire": {
+        "type": "fyi",
+        "queued": "digest"
+      },
+      "reason": "p7_digest"
+    },
+    "text_redacted": "P1 bob-orchestrator: bob-dry-tank"
+  }
+}
