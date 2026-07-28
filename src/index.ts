@@ -4137,6 +4137,11 @@ export function waitingOnYouLines(openItems: Array<Record<string, unknown> & { r
   // NO "+N more" (§2.3, finding 6): undisplayed backlog is not Robert's work and is
   // never appended to his list. Unanswered items resurface in a later digest on their
   // own; the standing backlog is a budget/scorecard problem, not a rendering one.
+  if (renderedRefs.length === 0) {
+    // Items exist but none could be rendered whole. A bare header with nothing under it
+    // is worse than either outcome, and claiming "all clear" would be a lie.
+    return { lines: ["<b>Waiting on you:</b> nothing that renders cleanly this run."], renderedRefs };
+  }
   return { lines, renderedRefs };
 }
 
@@ -4252,7 +4257,7 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
   // internal build events is not an outcome Robert can use, and §2.2 makes the recap
   // completed-outcomes-only. The count survives in metadata for telemetry. Phase 6
   // replaces this with path-bound outcome rendering; until then, honest silence.
-  void shippedCount; void shippedOk;
+  // (shippedCount / shippedOk are carried into the outbound metadata below.)
   // Friday scorecard (Phase 2): the weekly comms SLO rides the Day Done digest
   // + lands as narrative kind=comms-slo so the trend is queryable. Fail-soft:
   // an unavailable substrate renders as unavailable, never a false zero.
