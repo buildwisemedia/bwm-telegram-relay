@@ -53,3 +53,44 @@ enabled = true
 #                                  (enables directive handler to append silent_handle overrides)
 #
 # TELEGRAM_BOT_TOKEN is minted via CRED_BROKER at runtime — not stored as a direct secret here.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [env.capture] — the acceptance-drill worker (One Wire remediation plan v6 §2.10)
+#
+# A SEPARATE worker (bwm-telegram-relay-capture) with its OWN KV namespace, so a drill
+# can exercise production-shaped code paths — the real dispatch, the real composers,
+# the real registries — without touching one production row, one production KV key, or
+# Robert's phone.
+#
+#   · CAPTURE_MODE=true diverts EVERY operational-event emission to KV capture:events:*
+#     and stamps metadata.capture=true on outbound rows, so capture rows are excluded
+#     from every denominator.
+#   · Telegram I/O is short-circuited in-code (see CAPTURE_BOT_TOKEN): sends and edits
+#     are recorded with synthetic message ids and never reach the Telegram API.
+#   · No [triggers]: the capture worker has no crons. Drills invoke it explicitly.
+#
+# test/live/capture-pollution-check.sh is the standing proof, and it fails on ANY
+# production hit AND on any query failure — a dead query must never read as clean.
+# ─────────────────────────────────────────────────────────────────────────────
+[env.capture]
+workers_dev = true
+
+[env.capture.vars]
+ENVIRONMENT = "capture"
+CAPTURE_MODE = "true"
+
+[[env.capture.kv_namespaces]]
+binding = "BWM_TELEGRAM_KV"
+id = "3d94fc6c6fcb4da088bc2d0227595211"
+
+[[env.capture.services]]
+binding = "CRED_BROKER"
+service = "bwm-cred-broker"
+
+[[env.capture.services]]
+binding = "ATTENTION_ROUTER"
+service = "bwm-attention-router"
+
+[[env.capture.services]]
+binding = "CONTENT_CLASSIFIER"
+service = "bwm-content-classifier"

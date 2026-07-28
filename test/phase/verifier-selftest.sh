@@ -40,8 +40,8 @@ run_case() {
   local out rc=0
   # .selftest-env lets a mutation prepend a failing stub to PATH for exactly one
   # inner command, without touching any repo file.
-  out="$(cd "$sb" && [ -f .selftest-env ] && . ./.selftest-env; cd "$sb" && \
-        BWM_SELFTEST=1 BWM_ACCEPT_ROOT="$sb" bash "test/phase/${PHASE}-accept.sh" 2>&1)" || rc=$?
+  out="$(cd "$sb"; [ -f .selftest-env ] && . ./.selftest-env; \
+        BWM_SELFTEST=1 BWM_ACCEPT_OFFLINE=1 BWM_ACCEPT_ROOT="$sb" bash "test/phase/${PHASE}-accept.sh" 2>&1)" || rc=$?
   rm -rf "$sb"
 
   if [ "$rc" -eq 0 ]; then
@@ -109,7 +109,40 @@ m_stub_cmp() {
   printf 'export PATH="%s/.stub:$PATH"\n' "$1" >> "$1/.selftest-env"
 }
 
-m_forbidden_token()    { printf '\nWaiting on you (45)\n' >> "$1/src/index.ts"; }
+# Valid TypeScript that reintroduces a Robert-visible count template. It must trip the
+# SOURCE-mode rule, not the compiler — a mutation that merely breaks the build would
+# prove nothing about the count gate.
+m_forbidden_token()    { printf '\nexport const __selftestCount = (items: string[]) => `<b>Waiting on you (${items.length}):</b>`;\n' >> "$1/src/index.ts"; }
+m_killlist_stripped()  { python3 - "$1/src/index.ts" <<'PY2'
+import sys
+p = sys.argv[1]; s = open(p).read()
+s = s.replace("scrubEmailAsRobert(fitDigest(lines))", "({ text: fitDigest(lines), removed: 0 })")
+open(p, "w").write(s)
+PY2
+}
+m_fire_ttl_restored()  { python3 - "$1/src/index.ts" <<'PY2'
+import sys
+p = sys.argv[1]; s = open(p).read()
+s = s.replace("const WIRE_FIRE_STALE_MS =", "const WIRE_FIRE_TTL_SECONDS = 86_400;\nconst WIRE_FIRE_STALE_MS =")
+open(p, "w").write(s)
+PY2
+}
+m_sender_random_key()  {
+  # Point the check at a throwaway copy of the sender whose key is random again — the
+  # real ops-events repo is never mutated by a self-test.
+  local fake="$1/.fake-ops/launchagent-health"
+  mkdir -p "$fake"
+  cp "$HOME/bwm-ops-events/launchagent-health/remediation.py" "$fake/remediation.py"
+  python3 - "$fake/remediation.py" <<'PY2'
+import sys, re
+p = sys.argv[1]; s = open(p).read()
+s = s.replace(
+    'return f"launchagent-health:{slug}:{kind}"[:180]',
+    'import secrets as _s\n        return f"launchagent-health:{slug}:{kind}-{_s.token_hex(4)}"[:180]')
+open(p, "w").write(s)
+PY2
+  printf 'export BWM_OPS_EVENTS_REPO="%s/.fake-ops"\n' "$1" >> "$1/.selftest-env"
+}
 m_health_no_sha()      { python3 - "$1/src/index.ts" <<'PY'
 import sys, re
 p = sys.argv[1]; s = open(p).read()
@@ -133,6 +166,9 @@ case "$PHASE" in
     run_case "forbidden-token"       "forbidden-tokens"   m_forbidden_token
     run_case "health-missing-git-sha" "health-git-sha"    m_health_no_sha
     run_case "unit-tests-broken"     "unit-tests"         m_break_tests
+    run_case "killlist-layer3-removed" "kill-list-layers" m_killlist_stripped
+    run_case "fire-ttl-restored"     "fire-lifecycle"     m_fire_ttl_restored
+    run_case "sender-random-key"     "sender-stable-key"  m_sender_random_key
     ;;
   *) echo "verifier-selftest: unknown phase '$PHASE'" >&2; exit 64 ;;
 esac
