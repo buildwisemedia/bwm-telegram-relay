@@ -1,0 +1,35 @@
+{
+  "_comment": "One Wire remediation Phase 1 immutable facts (plan v6 \u00a72.11). Written ONCE by scripts/refresh-facts.sh; re-verified read-only by --assert. Per-deploy values live in scripts/.runtime/deploy-receipt.json (gitignored) and are NEVER stored here.",
+  "delivery_state_values": [
+    "deployed",
+    "merged",
+    "pr_created",
+    "shipped"
+  ],
+  "fixture_manifest_sha": "a4e15430633ee598a0265a7884100451d0dab341cd21e49bde53d528c523595e",
+  "ops_events_graph_at_pin": "0 0",
+  "responder_window_hours": 24,
+  "telegram_inbound_columns": [
+    "chat_id",
+    "classifier_error",
+    "classifier_status",
+    "entities",
+    "event_id",
+    "forward_error",
+    "forward_status",
+    "forwarded_to_classifier_at",
+    "forwarded_to_router_at",
+    "from_id",
+    "message_id",
+    "raw_update",
+    "received_at",
+    "responded_at",
+    "responder_claimed_at",
+    "responder_error",
+    "responder_session",
+    "responder_status",
+    "response_outbound_id",
+    "router_status",
+    "text"
+  ]
+}

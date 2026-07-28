@@ -1,0 +1,23 @@
+{
+  "provenance": {
+    "kind": "live",
+    "source_table": "telegram_outbound",
+    "source_row_id": "01KYB2APRA3MX16AYJT2V564M3",
+    "captured_at": "2026-07-28T22:44:24.170Z",
+    "note": "ASAP threshold fyi — a team-owned SLA note rendered as Robert's work"
+  },
+  "observed": {
+    "created_at": "2026-07-24T22:00:59.074399+00:00",
+    "status": "queued",
+    "source_route": "/notify",
+    "metadata": {
+      "wire": {
+        "key": "feedback-sla:asap-pest-wildlife:4bdbbe0a-2786-4bae-8e7c-581b33761992",
+        "type": "fyi",
+        "origin": "bwm-feedback-closeout",
+        "queued": "digest"
+      }
+    },
+    "text_redacted": "🟢 <b>Update: Asap Pest Wildlife: a client message reached the 2-hour team follow-up mark</b>\nhttps://buildwise-media.slack.com/archives/C095LRRFAUE/p1784922113893999?thread_ts=1784902199.765559&amp;cid=C095LRRFAUE"
+  }
+}

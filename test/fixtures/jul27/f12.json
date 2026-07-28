@@ -1,0 +1,24 @@
+{
+  "provenance": {
+    "kind": "synthetic",
+    "captured_at": "2026-07-28T22:44:26.538Z",
+    "note": "eligible batched call — the POSITIVE control: a real Robert-only decision"
+  },
+  "wire_input": {
+    "type": "call",
+    "punchline": "Cathryn wants 10 client slots at the Pilot price — approve the block booking or hold the line at list.",
+    "stakes": "Ten Pilot installs at once against the Phase-1 cap of 30 clients through May 2027.",
+    "rec": "Hold list price; offer the block as sequential starts instead of a discount.",
+    "options": [
+      "Hold list price",
+      "Approve the block at Pilot price"
+    ],
+    "origin": "bwm-revenue-desk",
+    "authority": "pricing_or_offer",
+    "expires_at": "2026-07-27"
+  },
+  "expected": {
+    "verdict": "allow",
+    "lane": "batched"
+  }
+}

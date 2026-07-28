@@ -77,6 +77,19 @@ export interface Env {
    * Required for directive auto-handling: append silent_handle rule to Attention-Routing-Spec.
    */
   BRAIN_WRITE_KEY?: string;
+  /**
+   * Deployed commit SHA, injected by scripts/deploy-verified.sh as
+   * `--var GIT_SHA:$(git rev-parse HEAD)`. Surfaced on /health so a deploy can be
+   * PROVEN to carry the intended code instead of merely reported as "deployed".
+   */
+  GIT_SHA?: string;
+  /**
+   * "true" ONLY in the [env.capture] worker. Diverts every operational-event emission
+   * to KV `capture:events:*` and stamps `metadata.capture=true` on outbound rows, so
+   * acceptance drills can exercise production-shaped code paths without writing a
+   * single row into the production substrate (plan v6 §2.10).
+   */
+  CAPTURE_MODE?: string;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -107,7 +120,12 @@ const KV_WIRE_FIRE_PREFIX = "wire:fire:"; // wire:fire:<hash> → live incident 
 const KV_WIRE_OPEN_PREFIX = "wire:open:"; // wire:open:<ref> → unanswered call/signoff
 const KV_WIRE_DIGESTQ_PREFIX = "wire:digestq:"; // wire:digestq:<ulid> → queued digest item
 const KV_WIRE_BUDGET_PREFIX = "wire:budget:"; // wire:budget:<ET date> → live interrupts today
-const WIRE_FIRE_TTL_SECONDS = 86_400; // edit-in-place window per incident key
+// The fire registry is RESOLUTION-bound, not time-bound (plan v6 §2.5). There is no
+// TTL: an unresolved incident that aged out of a 24h window was free to open a NEW
+// message, which is the "no re-pings" promise breaking itself. Anything still open
+// past this staleness goes to the TEAM as a task via the collapse sweep — Robert is
+// never pinged a second time for the same fingerprint.
+const WIRE_FIRE_STALE_MS = 7 * 24 * 60 * 60 * 1000;
 const WIRE_OPEN_TTL_SECONDS = 7 * 24 * 60 * 60; // unanswered items resurface via digest
 const WIRE_DIGESTQ_TTL_SECONDS = 3 * 24 * 60 * 60; // queue survives a missed digest run
 const WIRE_BUDGET_TTL_SECONDS = 48 * 60 * 60;
@@ -275,11 +293,14 @@ function formatEventMessage(eventType: string, payload: EventPayload): string {
   const scope = payload["scope"];
   if (scope) lines.push(escapeMd(`Scope: ${scope}`));
 
+  // Whole unit or omit it (plan v6 §2.6) — a symptom cut at 200 chars is the
+  // "…and producti" fragment class Robert rejected. Over-long values are dropped
+  // rather than mangled; the full value stays in operational_events.
   const symptom = payload["symptom"];
-  if (symptom) lines.push(escapeMd(String(symptom).slice(0, 200)));
+  if (symptom && String(symptom).length <= 400) lines.push(escapeMd(String(symptom)));
 
   const description = payload["description"] ?? payload["message"];
-  if (description) lines.push(escapeMd(String(description).slice(0, 300)));
+  if (description && String(description).length <= 600) lines.push(escapeMd(String(description)));
 
   const daemon = payload["daemon"];
   if (daemon) lines.push(escapeMd(`Daemon: ${daemon}`));
@@ -366,6 +387,21 @@ function json(body: unknown, status = 200): Response {
 
 function supabaseConfigured(env: Env): boolean {
   return !!env.SUPABASE_URL && !!env.SUPABASE_SERVICE_KEY;
+}
+
+/** Guard for the THREE remaining direct operational_events writers (the reaction
+ *  wire-decision, the reaction ack narrative, and the heartbeat). emitOperationalEvent
+ *  already diverts to the KV sink in capture mode; these three predate it and still
+ *  POST directly, so without this they would write straight into the production
+ *  substrate from a drill worker. §2.9 consolidates them onto the single hardened
+ *  helper in Phase 3 — until then, this is the seal.
+ *
+ *  Note this is deliberately NOT folded into supabaseConfigured(): telegram_outbound
+ *  audit rows MUST still be written in capture mode (stamped metadata.capture=true) —
+ *  they are the evidence the acceptance drills read. Only fan-out-bearing
+ *  operational_events writes are blocked. */
+function canWriteOperationalEventsDirectly(env: Env): boolean {
+  return supabaseConfigured(env) && !isCaptureMode(env);
 }
 
 function supabaseRestUrl(env: Env, path: string): string {
@@ -619,7 +655,14 @@ interface MintResponse {
   secret: string;
 }
 
+/** Sentinel returned by mintToken in the capture worker. A real bot token can never
+ *  equal this literal, so the short-circuit below cannot fire in production. */
+const CAPTURE_BOT_TOKEN = "capture-mode:no-telegram-io";
+
 async function mintToken(env: Env, secretName: string): Promise<string> {
+  // CAPTURE (§2.10): never mint a real credential in the drill worker, and never let
+  // a drill reach the Telegram API. Robert's phone is not a test fixture.
+  if (isCaptureMode(env)) return CAPTURE_BOT_TOKEN;
   const res = await env.CRED_BROKER.fetch(BROKER_INTERNAL_URL, {
     method: "POST",
     headers: {
@@ -652,6 +695,11 @@ interface TelegramSendResult {
   response?: unknown;
 }
 
+/** Synthetic Telegram message ids for capture drills — monotonic within an isolate so
+ *  a send/edit pair is observably ONE message, which is exactly what flap-replay
+ *  asserts. */
+let captureMessageSeq = 9_000_000;
+
 async function sendTelegramMessage(
   botToken: string,
   chatId: string | number,
@@ -659,6 +707,11 @@ async function sendTelegramMessage(
   parseMode?: string,
   replyToMessageId?: number,
 ): Promise<TelegramSendResult> {
+  // CAPTURE short-circuit (§2.10): record the send, contact nobody.
+  if (botToken === CAPTURE_BOT_TOKEN) {
+    const id = ++captureMessageSeq;
+    return { ok: true, status: 200, telegramMessageId: id, response: { capture: true, message_id: id } };
+  }
   const body: Record<string, unknown> = { chat_id: chatId, text };
   if (parseMode) body.parse_mode = parseMode;
   if (replyToMessageId) body.reply_to_message_id = replyToMessageId;
@@ -712,6 +765,10 @@ async function handleHealth(env: Env): Promise<Response> {
   return json({
     status: ok ? "ok" : "degraded",
     version: VERSION,
+    // The deployed commit. scripts/deploy-verified.sh asserts this equals the SHA it
+    // deployed — "deployed" is a claim, a matching git_sha is the proof.
+    git_sha: env.GIT_SHA ?? null,
+    capture_mode: isCaptureMode(env),
     ...checks,
     last_send_at: lastSendAt ?? null,
   }, ok ? 200 : 503);
@@ -810,7 +867,7 @@ async function handleEvent(
     if (scope === "bob-orchestrator" && severity !== "P0") {
       await enqueueDigestItem(env, {
         wire_type: "fyi",
-        punchline: `${severity} ${scope}: ${kind}`.slice(0, 200),
+        punchline: `${severity} ${scope}: ${kind}`,
         origin: "incident.opened",
         reason: "p7_autonomous",
       });
@@ -820,7 +877,7 @@ async function handleEvent(
         originEventType: eventType,
         originSessionId: event.session_id ?? null,
         parseMode: "HTML",
-        text: `${severity} ${scope}: ${kind}`.slice(0, 300),
+        text: `${severity} ${scope}: ${kind}`,
         status: "skipped",
         metadata: { reason: "p7_digest", wire: { type: "fyi", queued: "digest" } },
       });
@@ -833,11 +890,17 @@ async function handleEvent(
       }
       return json({ ok: true, action: "queued_digest_p7", event_type: eventType });
     }
+    // STRUCTURAL identity (plan v6 §2.5): evt|client_id|scope|kind. SEVERITY is
+    // deliberately absent — a P1 that escalates to P0 is the SAME unresolved condition
+    // and must EDIT the open message rather than open a second one. The old key
+    // carried severity, so every escalation opened a fresh ping.
+    // The .slice() calls on punchline/stakes are gone: source units are carried whole
+    // and the renderer drops a whole line it cannot fit (§2.6).
     const fireInput: WireInput = {
       type: "fire",
-      punchline: `${severity ? `${severity} ` : ""}${client || scope || "incident"} — ${kind.slice(0, 140)}`,
-      stakes: String(payload["symptom"] ?? payload["description"] ?? "").slice(0, 300) || undefined,
-      key: `${client}\x00${severity}\x00${kind}\x00${scope}`,
+      punchline: `${severity ? `${severity} ` : ""}${client || scope || "incident"} — ${kind}`,
+      stakes: String(payload["symptom"] ?? payload["description"] ?? "") || undefined,
+      key: `${EVENT_IDENTITY_PREFIX}${client}|${scope}|${kind}`,
       origin: `event:${eventType}${eventId ? `:${eventId}` : ""}`,
       session_id: event.session_id,
     };
@@ -866,6 +929,23 @@ async function handleEvent(
   }
 
   const text = formatEventMessage(eventType, payload);
+  // Kill list, layer 1 on the legacy /event lane (plan v6 §2.8). dispatchWire guards
+  // the wire routes; this guards the one route that does not pass through it, so the
+  // prohibition holds at EVERY door rather than most of them.
+  if (isEmailAsRobert(text)) {
+    await createOutboundLog(env, {
+      sourceRoute: "/event",
+      originEventId: eventId || null,
+      originEventType: eventType,
+      originSessionId: event.session_id ?? null,
+      parseMode: "MarkdownV2",
+      text,
+      status: "skipped",
+      metadata: { reason: "email_as_robert_disabled", killed_at: "ingress", ...(isCaptureMode(env) ? { capture: true } : {}) },
+    });
+    console.warn(JSON.stringify({ where: "handleEvent.killList", warn: "email_as_robert_blocked_at_ingress", event_type: eventType }));
+    return json({ ok: true, action: "skipped_email_as_robert", event_type: eventType });
+  }
   const dedupeKey = eventId ? `${KV_DEDUP_PREFIX}${eventId}` : null;
 
   // Dedup check (24h TTL per event_id)
@@ -1184,7 +1264,9 @@ export function legacyDigestPunchline(text: string): string {
   if (/lane capacity/i.test(plain)) {
     return "The team's workload changed; details are in the work queue.";
   }
-  return plain.slice(0, 300);
+  // Whole unit or nothing (§2.6): a legacy note cut at 300 chars produced the
+  // dangling-clause notes on the reviewed digest.
+  return plain.length <= 300 ? plain : "";
 }
 
 async function handleSend(request: Request, env: Env): Promise<Response> {
@@ -1226,9 +1308,25 @@ async function handleSend(request: Request, env: Env): Promise<Response> {
     });
   }
 
+  // legacyDigestPunchline returns "" when the source unit is too long to render
+  // WHOLE (§2.6). Queueing that would put an empty bullet on the digest — worse than
+  // the clipped one it replaces. Skip the item and say so, auditably.
+  const legacyPunchline = legacyDigestPunchline(text);
+  if (!legacyPunchline) {
+    await createOutboundLog(env, {
+      sourceRoute: "/send", text, parseMode: body.parse_mode ?? null, status: "skipped",
+      metadata: {
+        reason: "source_unit_too_long_to_render_whole",
+        wire: { type: "fyi", hard_wrapped: true, suppressed: true },
+        ...(isCaptureMode(env) ? { capture: true } : {}),
+      },
+    });
+    return json({ ok: true, action: "suppressed", hard_wrapped: true, suppressed: true, reason: "source_unit_too_long_to_render_whole" });
+  }
+
   const result = await dispatchWire(env, {
     type: "fyi",
-    punchline: legacyDigestPunchline(text),
+    punchline: legacyPunchline,
     origin: typeof body.origin === "string" && body.origin.trim()
       ? body.origin.trim().slice(0, 120)
       : "legacy:/send",
@@ -1601,6 +1699,18 @@ async function emitOperationalEvent(
 ): Promise<string | null> {
   try {
     const id = ulid();
+    // CAPTURE (plan v6 §2.10): every emission is diverted to KV `capture:events:*`.
+    // Nothing reaches operational_events, so an acceptance drill exercises the real
+    // code path without writing one row into the production substrate. The pollution
+    // check fails on ANY production hit AND on any query failure.
+    if (isCaptureMode(env)) {
+      await env.BWM_TELEGRAM_KV.put(
+        `capture:events:${id}`,
+        JSON.stringify({ id, event_type: eventType, payload, session_id: sessionId, occurred_at: new Date().toISOString() }),
+        { expirationTtl: 7 * 24 * 60 * 60 },
+      );
+      return id;
+    }
     const resp = await fetch(`${env.SUPABASE_URL.replace(/\/+$/, "")}/rest/v1/operational_events`, {
       method: "POST",
       headers: {
@@ -1710,8 +1820,23 @@ async function processTelegramReply(
     // ("you handle this") both end in an incident-resolved emit, and both must
     // clear the registry on success (codex r4). Non-resolving replies never
     // reach the gated delete.
+    // Prefer the STORED fingerprint (metadata.wire.fingerprint) — never re-derive it
+    // from the raw key, because re-hashing silently misses whenever the fingerprint
+    // recipe changes, and a resolved fire that never clears re-renders in every later
+    // digest.
+    //
+    // MIGRATION FALLBACK: fires opened BEFORE the fingerprint deploy have no stored
+    // fingerprint, and there are live ones in the registry right now. For those, and
+    // only for DELETION of an already-existing entry, fall back to the legacy
+    // shortHash(rawKey) slot. This mints no identity — it just lets Robert resolve an
+    // in-flight incident instead of stranding it.
+    const storedFp = (wireMeta as { fingerprint?: string }).fingerprint;
     const fireRawKey = (wireMeta as { key?: string }).key;
-    if (fireRawKey) fireRegistryKeyToClear = `${KV_WIRE_FIRE_PREFIX}${shortHash(fireRawKey)}`;
+    if (storedFp) {
+      fireRegistryKeyToClear = `${KV_WIRE_FIRE_PREFIX}${storedFp}`;
+    } else if (fireRawKey) {
+      fireRegistryKeyToClear = `${KV_WIRE_FIRE_PREFIX}${shortHash(fireRawKey)}`;
+    }
     // ORIGINLESS fires (created via /notify, no operational-event identity)
     // would dead-end at the missing-origin guard below — resolve them inline
     // (codex r6): persist the decision, clear the registry, confirm.
@@ -1762,8 +1887,10 @@ async function processTelegramReply(
           const raw = await env.BWM_TELEGRAM_KV.get(k.name);
           if (!raw) continue;
           try {
-            const reg = JSON.parse(raw) as { ref?: string; base?: { origin?: string } };
+            const reg = JSON.parse(raw) as { ref?: string; base?: { origin?: string }; fingerprint?: string };
             if (reg.ref !== ref) continue;
+            // Same rule as the direct-reply path: the key to delete is the registry
+            // entry we actually found (k.name), which IS the fingerprint slot.
             const originStr = reg.base?.origin ?? "";
             const idMatch = /^event:incident\.opened:(.+)$/.exec(originStr);
             const logged = await emitOperationalEvent(env, "narrative", {
@@ -2382,7 +2509,7 @@ async function handleReactionUpdate(env: Env, update: TelegramUpdate): Promise<v
   // already-answered item stays a plain ack (codex r2, idempotency).
   if (wireOnAck?.ref && (wireOnAck.type === "call" || wireOnAck.type === "signoff") && emojis.includes("👍") && ackRefStillOpen) {
     let decisionLogged = false;
-    if (supabaseConfigured(env)) {
+    if (canWriteOperationalEventsDirectly(env)) {
       try {
         const resp = await fetch(supabaseRestUrl(env, "operational_events"), {
           method: "POST",
@@ -2428,7 +2555,7 @@ async function handleReactionUpdate(env: Env, update: TelegramUpdate): Promise<v
   }
 
   // Narrative so the ack is visible in operational_events (Bob/Sarah/sweeps).
-  if (supabaseConfigured(env)) {
+  if (canWriteOperationalEventsDirectly(env)) {
     try {
       const preview = (origin?.text_redacted ?? "").slice(0, 160);
       const resp = await fetch(supabaseRestUrl(env, "operational_events"), {
@@ -2603,6 +2730,10 @@ async function emitHeartbeat(
     triggered_by: "cron:*/15",
   };
 
+  if (!canWriteOperationalEventsDirectly(env)) {
+    console.log(JSON.stringify({ where: "heartbeat", skipped: "capture_mode" }));
+    return;
+  }
   try {
     const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/operational_events`, {
       method: "POST",
@@ -2670,13 +2801,158 @@ function escapeHtml(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-/** Truncate rendered Telegram HTML without cutting inside an entity or tag —
- *  a mid-entity slice makes Telegram REJECT the message (codex r4). Handles
- *  every tag the wire renderers produce (<b>/<i>/<a href>): strips a trailing
- *  partial tag, then closes whatever the cut left open, innermost first
- *  (Phase 2 codex review — a link cut mid-<a> was rejecting whole digests). */
+// ─────────────────────────────────────────────────────────────────────────────
+// Email-as-Robert kill list (plan v6 §2.8) — THREE layers, active in EVERY mode
+//
+// Robert's standing capability prohibition: "I told you I don't want any more
+// motherfucking automatic replies… that's not a capability we need to focus on for
+// the time being." The queue did not enforce it, so auto-drafted email "as you" kept
+// consuming his attention (canonical finding 4; rule 5).
+//
+// Layer 1 — INGRESS: /notify and /event drop a matching item before it can be queued
+//           or sent. Layer 2 — SOURCE: the Day Ahead ea_drafts section is gone (query
+//           and render both). Layer 3 — FINAL RENDER: the composed payload is scrubbed
+//           immediately before send, so a signature arriving by a path nobody
+//           enumerated still cannot reach the phone.
+//
+// Evaluation FAILS CLOSED: a throw anywhere in matching is treated as a match.
+// Re-enabling this capability is a reviewed PR that deletes these patterns, never a
+// config flag.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const EMAIL_AS_ROBERT_SIGNATURES: RegExp[] = [
+  /\bemail\s+ready\s+to\s+send\s+as\s+you\b/i,
+  /\b(?:send|sent|sending|reply|replied|respond|responded)\b[^.\n]{0,40}\bas\s+(?:you|robert)\b/i,
+  /\bdrafted?\s+(?:an?\s+)?(?:email|reply|response)\b[^.\n]{0,40}\b(?:as|on behalf of)\s+(?:you|robert)\b/i,
+  /\btap\s+the\s+link\s+to\s+send\s+it\s+now\b/i,
+  /\bdrafts?\s+ready\s+to\s+send\b/i,
+  /\bapprove\s+(?:and\s+)?send\s+(?:this\s+)?(?:email|reply|draft)\b/i,
+  /\bthe\s+draft\s+expires\s+in\b/i,
+];
+
+/** True when any part of an item carries an email-as-Robert signature.
+ *  FAILS CLOSED — an exception counts as a match (plan v6 §2.1 typed failure posture). */
+export function isEmailAsRobert(...parts: Array<string | null | undefined>): boolean {
+  try {
+    const hay = parts.filter(Boolean).join("\n");
+    if (!hay) return false;
+    return EMAIL_AS_ROBERT_SIGNATURES.some((re) => re.test(hay));
+  } catch {
+    return true;
+  }
+}
+
+/** Layer 3. Drop every LINE carrying a signature from an already-composed payload,
+ *  then REPAIR what the removal left behind.
+ *
+ *  Removing a line is not enough on its own. A scrubbed item can leave:
+ *    · a section header with nothing under it, and
+ *    · a reply footer naming a ref that is no longer on screen —
+ *  which is finding 12 ("the reply instruction demonstrates a reference that does not
+ *  exist") reintroduced by the very guard meant to clean the surface. Observed while
+ *  rendering a real pre-deploy wire:open entry through the composer, so it is repaired
+ *  here rather than left for Robert to find.
+ *
+ *  Returns the finished text plus how many signature lines were removed — a nonzero
+ *  count means an un-enumerated ingress path exists and must be found. */
+export function scrubEmailAsRobert(text: string): { text: string; removed: number } {
+  const kept: string[] = [];
+  let removed = 0;
+  for (const line of text.split("\n")) {
+    if (isEmailAsRobert(line)) { removed += 1; continue; }
+    kept.push(line);
+  }
+  if (removed === 0) return { text: kept.join("\n"), removed };
+
+  // Drop a footer whose named ref no longer appears anywhere else on screen.
+  const isFooter = (l: string) => /^<i>Reply by ref/.test(l);
+  const refIn = (l: string) => (/"([FCS]-[0-9A-Z]{3,6}):/.exec(l) ?? [])[1];
+  const repaired = kept.filter((l) => {
+    if (!isFooter(l)) return true;
+    const ref = refIn(l);
+    if (!ref) return true;
+    return kept.some((other) => other !== l && other.includes(ref));
+  });
+
+  // Drop a section header with no bullet under it.
+  const isHeader = (l: string) => /^<b>[^<]+:<\/b>$/.test(l);
+  const isBullet = (l: string) => l.startsWith("•");
+  const final = repaired.filter((l, i) => {
+    if (!isHeader(l)) return true;
+    for (let j = i + 1; j < repaired.length; j++) {
+      if (isBullet(repaired[j])) return true;
+      if (isHeader(repaired[j])) break;
+    }
+    return false;
+  });
+  return { text: final.join("\n"), removed };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Capture environment (plan v6 §2.10)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** True only inside the [env.capture] worker. Never infer capture from anything
+ *  else — a false positive here would silently stop production event emission. */
+function isCaptureMode(env: Env): boolean {
+  return String(env.CAPTURE_MODE ?? "") === "true";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Source-unit preservation (plan v6 §2.6)
+//
+// Finding 11: "built, merged, deployed and producti", "now to fix t",
+// "2=Wait for Sol's cross-che". Fixed character slicing cut source fields mid-word.
+// The rule that replaces it: INCLUDE THE WHOLE UNIT OR DROP THE WHOLE UNIT. A unit is
+// one source field (a punchline, a rec, a note). It is never cut, ever. If it does not
+// fit the budget, the whole unit is omitted and the message stays honest.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Assemble lines under a character budget WITHOUT ever cutting one. Returns the
+ *  lines that fit whole, plus the ones dropped (for telemetry / rollover). */
+export function fitWholeUnits(units: string[], budget: number): { kept: string[]; dropped: string[] } {
+  const kept: string[] = [];
+  const dropped: string[] = [];
+  let used = 0;
+  for (const u of units) {
+    const cost = u.length + 1;
+    if (used + cost > budget) { dropped.push(u); continue; }
+    kept.push(u);
+    used += cost;
+  }
+  return { kept, dropped };
+}
+
+/** Every included source unit must survive VERBATIM into the rendered output.
+ *  Throwing here is correct: a violated preservation invariant means the renderer is
+ *  about to show Robert a fragment, and a fragment is what he rejected. Callers run
+ *  this on the FINAL payload, after all length handling. */
+export function assertSourcePreservation(rendered: string, units: string[]): void {
+  const missing = units.filter((u) => u && !rendered.includes(u));
+  if (missing.length > 0) {
+    throw new Error(
+      `source_unit_preservation_violated: ${missing.length} unit(s) were altered or cut; ` +
+      `first=${JSON.stringify(missing[0].slice(0, 60))}`,
+    );
+  }
+}
+
+/** Truncate rendered Telegram HTML without cutting inside an entity or tag.
+ *
+ *  TRIPWIRE (plan v6 §2.6): this is no longer a rendering strategy — it is the guard
+ *  of last resort. Every composer above it must already have fitted whole units into
+ *  the budget, so reaching the truncating branch means a composer has a bug. When that
+ *  happens we still return valid HTML (a REJECTED message helps nobody) but we log
+ *  loudly, and the unit tests assert the branch is never taken. */
 function safeHtmlTruncate(text: string, max: number): string {
   if (text.length <= max) return text;
+  console.error(JSON.stringify({
+    where: "safeHtmlTruncate",
+    error: "truncation_tripwire_fired",
+    detail: "a composer emitted over-budget text; source units may have been cut",
+    length: text.length,
+    max,
+  }));
   let cut = text.slice(0, max);
   cut = cut.replace(/&[a-zA-Z]{0,6}$/, ""); // trailing partial entity
   cut = cut.replace(/<[^>]*$/, ""); // trailing partial tag (any)
@@ -2875,9 +3151,73 @@ export function isConversationalReply(input: Pick<WireInput, "origin">): boolean
   return /^telegram-responder(?:-|$)/i.test(input.origin ?? "");
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Incident identity (plan v6 §2.5)
+//
+// Finding 10: the same unresolved LaunchAgent alert posted twice ("no re-pings")
+// because its sender appended secrets.token_hex(4) to the notification key, so each
+// occurrence hashed to a different registry slot. Live proof, telegram_outbound:
+//   launchagent-health-4126371745a9-b7be76f9   (Jul 27 14:07)
+//   launchagent-health-4126371745a9-d1db1829   (Jul 28 00:36)
+//   launchagent-health-4126371745a9-ce77dd6d   (Jul 28 09:05)
+// Same 12-char condition signature, three random suffixes, three separate pings.
+//
+// Two — and only two — identity sources are permitted:
+//   1. A SENDER-SUPPLIED key, bound to its sender:  ntf|<origin>|<key>
+//   2. The STRUCTURAL /event identity:              evt|<client_id>|<scope>|<kind>
+//      Severity is deliberately NOT in it: a P1 that escalates to P0 is the SAME
+//      unresolved condition and must EDIT the open message, not open a second one.
+//
+// NO PROSE FOLDING. The old `shortHash(input.key ?? input.punchline)` fallback meant
+// two unrelated fires with one shared sentence collapsed into each other, while one
+// condition whose wording drifted split into two. A fire with no key gets no
+// fingerprint and therefore no edit-in-place — honest, and non-regressive: every fire
+// sender observed in the last 30 days supplies a key.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Marker prefix for the structural /event identity. */
+const EVENT_IDENTITY_PREFIX = "evt|";
+
+/** Stable incident fingerprint, or null when the item has no admissible identity.
+ *  Contains no random, timestamped, or prose-derived material by construction. */
+export function fireFingerprint(input: Pick<WireInput, "key" | "origin">): string | null {
+  const key = input.key;
+  if (!key) return null;
+  if (key.startsWith(EVENT_IDENTITY_PREFIX)) {
+    // Structural identity is already fully qualified — binding it to the /event
+    // origin would be WRONG: that origin carries the per-event ULID.
+    return shortHash(key);
+  }
+  // Sender-bound. A null origin degrades to a shared unattributed namespace rather
+  // than losing edit-in-place for the senders that do not declare one yet (13 of 52
+  // observed fire rows). The Phase 4 SENDER_REGISTRY closes that namespace.
+  return shortHash(`ntf|${input.origin ?? ""}|${key}`);
+}
+
+/** KV registry key for a fingerprint. */
+function fireRegistryKey(fingerprint: string): string {
+  return `${KV_WIRE_FIRE_PREFIX}${fingerprint}`;
+}
+
+/** Per-field hard limits. A unit is included WHOLE or not at all — these are the
+ *  boundary at which "not at all" begins, never a slice point. Every value sits far
+ *  above the 90-day observed maximum (punchline max 304, rec max 300) so the change
+ *  rejects nothing that production actually sends. */
+const WIRE_LIMITS = {
+  punchline: 1000,
+  stakes: 1200,
+  rec: 1000,
+  ask: 1000,
+  option: 120,
+  link: 500,
+  key: 200,
+  origin: 120,
+  session_id: 120,
+} as const;
+
 function parseWireInput(
   raw: Record<string, unknown>,
-): { ok: true; input: WireInput; judgmentDropped?: string } | { ok: false; error: string } {
+): { ok: true; input: WireInput; judgmentDropped?: string; droppedFields?: string[] } | { ok: false; error: string } {
   const type = String(raw["type"] ?? "").toLowerCase();
   if (!["fire", "call", "signoff", "fyi"].includes(type)) {
     return { ok: false, error: "type must be one of fire|call|signoff|fyi" };
@@ -2892,14 +3232,39 @@ function parseWireInput(
     const v = str(k);
     return v ? decodeLegacyHtml(v) : undefined;
   };
+  // ── Source-unit preservation at INGRESS (plan v6 §2.6) ────────────────────
+  // The old caps silently sliced: a 304-char punchline became 300 chars with the last
+  // word cut in half, and 4 of 50 real punchlines over 90 days hit that cap. Nothing
+  // is cut here any more.
+  //   · the REQUIRED field (punchline) over its limit is an explicit 400 — the sender
+  //     learns immediately instead of Robert receiving a fragment;
+  //   · an OPTIONAL field over its limit is DROPPED WHOLE and reported, so the item
+  //     still reaches Robert, minus the field nobody could render honestly.
+  // Limits sit far above every observed value (max punchline 304 over 90 days), so no
+  // production sender is rejected by this change.
+  if (punchline.length > WIRE_LIMITS.punchline) {
+    return { ok: false, error: `punchline exceeds ${WIRE_LIMITS.punchline} chars (${punchline.length}); shorten it at the source — the relay will not cut it` };
+  }
+  const droppedFields: string[] = [];
+  const whole = (k: string, limit: number, decode: boolean): string | undefined => {
+    const v = decode ? plainStr(k) : str(k);
+    if (v === undefined) return undefined;
+    if (v.length > limit) { droppedFields.push(`${k}:${v.length}>${limit}`); return undefined; }
+    return v;
+  };
   let options: string[] | undefined;
   const rawOpts = raw["options"];
   if (Array.isArray(rawOpts)) {
     options = rawOpts
       .map((o) => (typeof o === "string" ? o : String((o as Record<string, unknown>)?.["label"] ?? "")))
-      .map((s) => decodeLegacyHtml(s).slice(0, 80))
+      .map((s) => decodeLegacyHtml(s))
       .filter(Boolean)
       .slice(0, 4);
+    // An over-long option is dropped WHOLE. "2=Wait for Sol's cross-che" is exactly
+    // the half-sentence choice Robert could not act on.
+    const before = options.length;
+    options = options.filter((o) => o.length <= WIRE_LIMITS.option);
+    if (options.length !== before) droppedFields.push(`options:${before - options.length}_over_${WIRE_LIMITS.option}`);
     if (options.length === 0) options = undefined;
   }
   const jr = parseWireJudgment(raw["judgment"], type as WireType, Boolean(str("rec")));
@@ -2907,19 +3272,20 @@ function parseWireInput(
     ok: true,
     input: {
       type: type as WireType,
-      punchline: punchline.slice(0, 300),
-      stakes: plainStr("stakes")?.slice(0, 400),
-      rec: plainStr("rec")?.slice(0, 300),
-      ask: plainStr("ask")?.slice(0, 300),
+      punchline,
+      stakes: whole("stakes", WIRE_LIMITS.stakes, true),
+      rec: whole("rec", WIRE_LIMITS.rec, true),
+      ask: whole("ask", WIRE_LIMITS.ask, true),
       options,
-      link: str("link")?.slice(0, 500),
-      key: str("key")?.slice(0, 200),
+      link: whole("link", WIRE_LIMITS.link, false),
+      key: whole("key", WIRE_LIMITS.key, false),
       expires_at: str("expires_at"),
-      origin: str("origin")?.slice(0, 120),
-      session_id: str("session_id")?.slice(0, 120),
+      origin: whole("origin", WIRE_LIMITS.origin, false),
+      session_id: whole("session_id", WIRE_LIMITS.session_id, false),
       judgment: jr.judgment,
     },
     judgmentDropped: jr.dropped,
+    droppedFields: droppedFields.length ? droppedFields : undefined,
   };
 }
 
@@ -2957,43 +3323,83 @@ function nextWireRef(type: WireType): string {
 
 const WIRE_EMOJI: Record<WireType, string> = { fire: "🔴", call: "🟡", signoff: "🔵", fyi: "🟢" };
 
+/** Telegram's own hard ceiling is 4096; 3800 leaves headroom for the edit path's
+ *  appended update lines. Lines are fitted WHOLE to this budget — never sliced. */
+const WIRE_RENDER_BUDGET = 3800;
+/** Digest budget. Same rule: whole lines in, or the line is omitted. */
+const DIGEST_RENDER_BUDGET = 2200;
+
 /** Render the wire format (Telegram HTML parse mode). One shape per type so
  *  Robert's eye learns it: tag+ref+punchline / stakes / rec / reply protocol / link. */
 export function renderWire(input: WireInput, ref: string, updates: string[] = []): string {
-  const lines: string[] = [];
   const label: Record<WireType, string> = {
     fire: "Urgent",
     call: "Decision",
     signoff: "Approval",
     fyi: "Update",
   };
+  // Each rendered line carries the source units it must reproduce VERBATIM. Tracking
+  // the pairing explicitly (rather than inferring it from the finished string) is what
+  // makes the preservation assertion exact: a DROPPED line takes its units out of the
+  // assertion set, while a MUTATED line keeps them in and trips.
+  type Line = { text: string; units: string[] };
+  const lines: Line[] = [];
+  const plain = (t: string, units: string[] = []) => lines.push({ text: t, units });
+
   // The wire ref remains in stored metadata for direct-reply resolution. It is
   // intentionally hidden from a live message: Robert replies to the message,
   // not to an internal code. Digests still show refs where one message contains
   // multiple answerable decisions.
-  lines.push(`${WIRE_EMOJI[input.type]} <b>${label[input.type]}: ${escapeHtml(input.punchline)}</b>`);
-  if (input.stakes) lines.push(escapeHtml(input.stakes));
-  if (input.rec) lines.push(`<b>My rec: ${escapeHtml(input.rec)}</b>`);
-  if (input.ask) lines.push(escapeHtml(input.ask));
+  plain(`${WIRE_EMOJI[input.type]} <b>${label[input.type]}: ${escapeHtml(input.punchline)}</b>`, [escapeHtml(input.punchline)]);
+  if (input.stakes) plain(escapeHtml(input.stakes), [escapeHtml(input.stakes)]);
+  if (input.rec) plain(`<b>My rec: ${escapeHtml(input.rec)}</b>`, [escapeHtml(input.rec)]);
+  if (input.ask) plain(escapeHtml(input.ask), [escapeHtml(input.ask)]);
   if (input.type === "call" || input.type === "signoff") {
     if (input.options && input.options.length > 0) {
-      lines.push(`Reply: ${input.options.map((o, i) => `${i + 1} = ${escapeHtml(o)}`).join(" · ")}`);
+      plain(
+        `Reply: ${input.options.map((o, i) => `${i + 1} = ${escapeHtml(o)}`).join(" · ")}`,
+        input.options.map((o) => escapeHtml(o)),
+      );
     } else if (input.type === "signoff") {
-      lines.push("Reply: 1 = approve · 2 = changes (say what)");
+      plain("Reply: 1 = approve · 2 = changes (say what)");
     } else {
-      lines.push("Reply with your call — or 👍 to take my rec.");
+      plain("Reply with your call — or 👍 to take my rec.");
     }
   }
-  if (input.link) lines.push(escapeHtml(input.link));
+  if (input.link) plain(escapeHtml(input.link), [escapeHtml(input.link)]);
   if (input.type === "fire") {
     if (updates.length > 0) {
-      lines.push("<b>Updates:</b>");
-      for (const u of updates.slice(-WIRE_FIRE_MAX_UPDATES)) lines.push(escapeHtml(u));
+      plain("<b>Updates:</b>");
+      for (const u of updates.slice(-WIRE_FIRE_MAX_UPDATES)) plain(escapeHtml(u), [escapeHtml(u)]);
     } else {
-      lines.push("<i>Updates will edit this message — no re-pings.</i>");
+      plain("<i>Updates will edit this message — no re-pings.</i>");
     }
   }
-  return safeHtmlTruncate(lines.join("\n"), 3800);
+
+  // Fit WHOLE lines to the Telegram budget instead of slicing the joined string.
+  // The header (which carries the punchline — the required field) is never a drop
+  // candidate: an item that cannot show its punchline is deferred by the caller, never
+  // half-rendered.
+  const header = lines[0];
+  const rest = lines.slice(1);
+  const budget = WIRE_RENDER_BUDGET - header.text.length - 1;
+  const kept: Line[] = [];
+  let used = 0;
+  let droppedCount = 0;
+  for (const l of rest) {
+    const cost = l.text.length + 1;
+    if (used + cost > budget) { droppedCount += 1; continue; }
+    kept.push(l);
+    used += cost;
+  }
+  if (droppedCount > 0) {
+    console.warn(JSON.stringify({
+      where: "renderWire", warn: "units_dropped_whole", ref, type: input.type, dropped: droppedCount,
+    }));
+  }
+  const text = [header, ...kept].map((l) => l.text).join("\n");
+  assertSourcePreservation(text, [header, ...kept].flatMap((l) => l.units));
+  return safeHtmlTruncate(text, WIRE_RENDER_BUDGET);
 }
 
 async function editTelegramMessage(
@@ -3002,6 +3408,11 @@ async function editTelegramMessage(
   messageId: number,
   text: string,
 ): Promise<TelegramSendResult> {
+  // CAPTURE short-circuit (§2.10): the edit is recorded against the SAME message id
+  // the capture send returned, which is what makes "one post, then edits" observable.
+  if (botToken === CAPTURE_BOT_TOKEN) {
+    return { ok: true, status: 200, telegramMessageId: messageId, response: { capture: true, edited: true, message_id: messageId } };
+  }
   const res = await fetch(`${TELEGRAM_API_BASE}/bot${botToken}/editMessageText`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -3071,11 +3482,55 @@ interface WireResult {
   error?: string;
 }
 
+/** Guarded entry point (plan v6 §2.1 typed failure posture).
+ *
+ *  assertSourcePreservation THROWS by design — a violated invariant means the renderer
+ *  is about to show Robert a fragment, and a fragment is the defect. But an uncaught
+ *  throw here would surface as a request-wide 500 from the top-level fetch handler, and
+ *  the relay is a production surface Robert depends on: it must never go dark.
+ *
+ *  So the invariant fails CLOSED rather than loudly: the item is NOT sent (no fragment
+ *  reaches the phone), a typed result comes back, and the failure is logged for repair.
+ *  Unit tests still call renderWire directly and still get the throw. */
+async function dispatchWire(
+  env: Env,
+  input: WireInput,
+  sourceRoute: string,
+  origin?: { originEventId?: string | null; originEventType?: string | null },
+): Promise<WireResult> {
+  try {
+    return await dispatchWireInner(env, input, sourceRoute, origin);
+  } catch (e) {
+    const detail = String(e).slice(0, 300);
+    console.error(JSON.stringify({
+      where: "dispatchWire.guard", error: "dispatch_failed_closed", detail,
+      source_route: sourceRoute, type: input.type, origin: input.origin ?? null,
+    }));
+    try {
+      await createOutboundLog(env, {
+        sourceRoute,
+        originEventId: origin?.originEventId ?? null,
+        originEventType: origin?.originEventType ?? null,
+        originSessionId: input.session_id ?? null,
+        parseMode: "HTML",
+        text: input.punchline,
+        status: "skipped",
+        metadata: {
+          reason: "dispatch_failed_closed", detail,
+          wire: { type: input.type, origin: input.origin ?? null },
+          ...(isCaptureMode(env) ? { capture: true } : {}),
+        },
+      });
+    } catch { /* audit is best-effort here; never re-throw out of the guard */ }
+    return { ok: false, action: "deferred_dispatch_failed_closed", error: detail };
+  }
+}
+
 /** Core wire dispatch. Self-contained (mints its own token) so it can run
  *  synchronously from /notify or inside waitUntil from /event. `origin` carries
  *  the operational-event identity for /event fires so replies like "resolved"
  *  keep resolving the underlying incident (codex review 2026-07-12). */
-async function dispatchWire(
+async function dispatchWireInner(
   env: Env,
   input: WireInput,
   sourceRoute: string,
@@ -3086,6 +3541,32 @@ async function dispatchWire(
   const interactionMeta = conversationalReply
     ? { interaction: "conversational_reply" }
     : {};
+
+  // ── Kill list, layer 1: INGRESS (plan v6 §2.8) ────────────────────────────
+  // Active in EVERY mode and on EVERY route that reaches dispatchWire, so there is
+  // exactly one door. A match is dropped here — never queued, never sent, never
+  // resurfaced by a later digest — and leaves an auditable skipped row.
+  if (isEmailAsRobert(input.punchline, input.stakes, input.rec, input.ask, ...(input.options ?? []))) {
+    await createOutboundLog(env, {
+      sourceRoute,
+      originEventId: origin?.originEventId ?? null,
+      originEventType: origin?.originEventType ?? null,
+      originSessionId: input.session_id ?? null,
+      parseMode: "HTML",
+      text: input.punchline,
+      status: "skipped",
+      metadata: {
+        reason: "email_as_robert_disabled",
+        wire: { type: input.type, origin: input.origin ?? null, killed_at: "ingress" },
+        ...(isCaptureMode(env) ? { capture: true } : {}),
+      },
+    });
+    console.warn(JSON.stringify({
+      where: "dispatchWire.killList", warn: "email_as_robert_blocked_at_ingress",
+      origin: input.origin ?? null, type: input.type, source_route: sourceRoute,
+    }));
+    return { ok: true, action: "skipped_email_as_robert" };
+  }
   let budgetReservedKey: string | null = null;
   const releaseBudget = async () => {
     if (!budgetReservedKey) return;
@@ -3172,10 +3653,13 @@ async function dispatchWire(
     return { ok: false, action: "failed", error: `token_mint_failed: ${String(e).slice(0, 200)}` };
   }
 
-  // FIRE edit-in-place: same key within 24h updates the existing message.
+  // FIRE edit-in-place, keyed on the STABLE FINGERPRINT (plan v6 §2.5). The registry
+  // entry is resolution-bound: no TTL, so an unresolved incident can never age out and
+  // re-ping. A fire with no admissible identity gets no registry entry at all.
+  const fingerprint = input.type === "fire" ? fireFingerprint(input) : null;
   let fireClaimKey: string | null = null;
-  if (input.type === "fire") {
-    const fireKey = `${KV_WIRE_FIRE_PREFIX}${shortHash(input.key ?? input.punchline)}`;
+  if (input.type === "fire" && fingerprint) {
+    const fireKey = fireRegistryKey(fingerprint);
     const existingRaw = await env.BWM_TELEGRAM_KV.get(fireKey);
     if (existingRaw) {
       try {
@@ -3188,12 +3672,19 @@ async function dispatchWire(
             sourceRoute, originEventId: origin?.originEventId ?? null, originEventType: origin?.originEventType ?? null,
             originSessionId: input.session_id ?? null, parseMode: "HTML",
             text: renderWire(input, reg.ref ?? "F-?"), status: "skipped",
-            metadata: { reason: "fire_claim_pending", wire: { type: "fire", key: input.key ?? input.punchline } },
+            metadata: { reason: "fire_claim_pending", wire: { type: "fire", key: input.key ?? null, fingerprint } },
           });
           return { ok: true, action: "skipped_claim_pending", ref: reg.ref };
         }
         reg.count += 1;
-        const updateLine = `↻ ${et.hhmm} ET — ${(input.punchline === reg.base.punchline ? (input.stakes ?? `repeat ×${reg.count}`) : input.punchline).slice(0, 150)}`;
+        // Whole unit or nothing: a sliced update line is exactly the mid-word
+        // fragment finding 11 is about. "repeat ×N" is a COUNT and is banned from
+        // Robert-visible text (§2.3) — an unchanged repeat renders a plain timestamp.
+        const changed = input.punchline !== reg.base.punchline;
+        const detail = changed ? input.punchline : (input.stakes ?? "");
+        const updateLine = detail && detail.length <= 300
+          ? `↻ ${et.hhmm} ET — ${detail}`
+          : `↻ ${et.hhmm} ET — still open`;
         reg.updates = [...reg.updates, updateLine].slice(-WIRE_FIRE_MAX_UPDATES);
         // Latest coalesced incident wins for BOTH resolve paths — digest
         // (base.origin) and direct reply (outbound row) stay consistent (r5).
@@ -3201,16 +3692,16 @@ async function dispatchWire(
         const text = renderWire(reg.base, reg.ref, reg.updates);
         const edit = await editTelegramMessage(botToken, chatId, reg.message_id, text);
         if (edit.ok) {
-          await env.BWM_TELEGRAM_KV.put(fireKey, JSON.stringify({ ...reg, last_at: new Date().toISOString() }), {
-            expirationTtl: WIRE_FIRE_TTL_SECONDS,
-          });
+          // NO expirationTtl: the registry entry is RESOLUTION-bound (§2.5). A TTL
+          // is a timer that silently re-arms the re-ping this whole change removes.
+          await env.BWM_TELEGRAM_KV.put(fireKey, JSON.stringify({ ...reg, fingerprint, last_at: new Date().toISOString() }));
           const editLogId = await createOutboundLog(env, {
             sourceRoute,
             originEventId: origin?.originEventId ?? null,
             originEventType: origin?.originEventType ?? null,
             originSessionId: input.session_id ?? null, chatId, parseMode: "HTML", text,
             status: "sent",
-            metadata: { wire: { type: "fire", ref: reg.ref, action: "edited", count: reg.count, key: input.key ?? input.punchline } },
+            metadata: { wire: { type: "fire", ref: reg.ref, action: "edited", count: reg.count, key: input.key ?? null, fingerprint } },
           });
           // Stamp the edited row with the message_id so reply lookup (newest-
           // first) resolves the LATEST coalesced incident (codex r2).
@@ -3232,7 +3723,7 @@ async function dispatchWire(
             sourceRoute, originEventId: origin?.originEventId ?? null, originEventType: origin?.originEventType ?? null,
             originSessionId: input.session_id ?? null, parseMode: "HTML", text, status: "failed",
             error: `edit_transient: ${(edit.error ?? "").slice(0, 150)}`,
-            metadata: { wire: { type: "fire", ref: reg.ref, action: "edit_failed_transient", key: input.key ?? input.punchline } },
+            metadata: { wire: { type: "fire", ref: reg.ref, action: "edit_failed_transient", key: input.key ?? null, fingerprint } },
           });
           return { ok: false, action: "edit_failed_transient", ref: reg.ref, error: edit.error };
         }
@@ -3249,13 +3740,13 @@ async function dispatchWire(
   }
 
   const ref = nextWireRef(input.type);
-  if (input.type === "fire") {
-    // First send of this key: claim BEFORE Telegram I/O so a concurrent
-    // same-key request skips instead of double-pinging (matches the old
-    // pre-send rate-limit stamp semantics); released on failure. Short TTL —
-    // the post-send registry write replaces it.
-    fireClaimKey = `${KV_WIRE_FIRE_PREFIX}${shortHash(input.key ?? input.punchline)}`;
-    await env.BWM_TELEGRAM_KV.put(fireClaimKey, JSON.stringify({ pending: true, ref, ts: new Date().toISOString() }), {
+  if (input.type === "fire" && fingerprint) {
+    // First send of this FINGERPRINT: claim before Telegram I/O so a concurrent
+    // same-fingerprint request skips instead of double-pinging; released on failure.
+    // The short TTL here is on the CLAIM only (a crashed request must not wedge the
+    // fingerprint forever) — the registry entry that replaces it carries no TTL.
+    fireClaimKey = fireRegistryKey(fingerprint);
+    await env.BWM_TELEGRAM_KV.put(fireClaimKey, JSON.stringify({ pending: true, ref, fingerprint, ts: new Date().toISOString() }), {
       expirationTtl: 120,
     });
   }
@@ -3271,7 +3762,7 @@ async function dispatchWire(
       originEventId: origin?.originEventId ?? null,
       originEventType: origin?.originEventType ?? null,
       originSessionId: input.session_id ?? null, chatId, parseMode: "HTML", text, status: "queued",
-      metadata: { wire: { type: input.type, ref, key: input.type === "fire" ? (input.key ?? input.punchline) : (input.key ?? null), origin: input.origin ?? null, ...interactionMeta, ...(judgmentMeta ? { judgment: judgmentMeta } : {}) } },
+      metadata: { wire: { type: input.type, ref, key: input.key ?? null, ...(fingerprint ? { fingerprint } : {}), origin: input.origin ?? null, ...interactionMeta, ...(judgmentMeta ? { judgment: judgmentMeta } : {}) }, ...(isCaptureMode(env) ? { capture: true } : {}) },
       requireSupabase: true,
     });
   } catch (e) {
@@ -3308,16 +3799,18 @@ async function dispatchWire(
   }
   await updateOutboundLog(env, outboundId, {
     status: "sent", telegramMessageId: result.telegramMessageId, telegramResponse: result.response, error: null,
-    metadata: { wire: { type: input.type, ref, key: input.type === "fire" ? (input.key ?? input.punchline) : (input.key ?? null), origin: input.origin ?? null, ...interactionMeta, ...(judgmentMeta ? { judgment: judgmentMeta } : {}) } },
+    metadata: { wire: { type: input.type, ref, key: input.key ?? null, ...(fingerprint ? { fingerprint } : {}), origin: input.origin ?? null, ...interactionMeta, ...(judgmentMeta ? { judgment: judgmentMeta } : {}) }, ...(isCaptureMode(env) ? { capture: true } : {}) },
   });
   await env.BWM_TELEGRAM_KV.put(KV_LAST_SEND_AT_KEY, new Date().toISOString());
 
-  if (input.type === "fire" && result.telegramMessageId) {
-    const fireKey = `${KV_WIRE_FIRE_PREFIX}${shortHash(input.key ?? input.punchline)}`;
-    await env.BWM_TELEGRAM_KV.put(fireKey, JSON.stringify({
-      message_id: result.telegramMessageId, ref, base: input, updates: [], count: 1,
+  if (input.type === "fire" && fingerprint && result.telegramMessageId) {
+    // NO expirationTtl (§2.5): the entry lives until the incident is RESOLVED. The
+    // 15-min collapse sweep escalates anything still open past WIRE_FIRE_STALE_MS to
+    // the team as a task — it never re-pings Robert.
+    await env.BWM_TELEGRAM_KV.put(fireRegistryKey(fingerprint), JSON.stringify({
+      message_id: result.telegramMessageId, ref, base: input, updates: [], count: 1, fingerprint,
       first_at: new Date().toISOString(), last_at: new Date().toISOString(), outbound_id: outboundId,
-    }), { expirationTtl: WIRE_FIRE_TTL_SECONDS });
+    }));
   }
 
   if (input.type === "call" || input.type === "signoff") {
@@ -3602,6 +4095,28 @@ async function handleNotify(request: Request, env: Env): Promise<Response> {
   return json(judgment ? { ...result, judgment } : result, result.ok ? 200 : 502);
 }
 
+/** The reply footer, bound to a ref that is ACTUALLY ON SCREEN (plan v6 §2.4).
+ *  Finding 12: the digest shipped `Reply to anything by ref ("C-003: go")` while the
+ *  visible refs were S-S4C83 / C-MTPF2 / S-B37RS — a demonstration of an identifier
+ *  that did not exist, in a shape the system does not even mint. Returns [] when
+ *  nothing answerable rendered, because an instruction with nothing to act on is
+ *  noise. Phase 6 replaces refs with 1./1A numbering; this is the interim honest form. */
+export function replyFooter(renderedRefs: string[]): string[] {
+  if (renderedRefs.length === 0) return [];
+  return [`<i>Reply by ref — for example "${escapeHtml(renderedRefs[0])}: go" — or just type what you want.</i>`];
+}
+
+/** Join digest lines under the budget by dropping WHOLE trailing lines (§2.6).
+ *  safeHtmlTruncate stays as the tripwire behind it, never as the strategy. */
+function fitDigest(lines: string[]): string {
+  const header = lines[0] ?? "";
+  const { kept, dropped } = fitWholeUnits(lines.slice(1), DIGEST_RENDER_BUDGET - header.length - 1);
+  if (dropped.length > 0) {
+    console.warn(JSON.stringify({ where: "fitDigest", warn: "lines_dropped_whole", dropped: dropped.length }));
+  }
+  return safeHtmlTruncate([header, ...kept].join("\n"), DIGEST_RENDER_BUDGET);
+}
+
 /** Read + parse every wire:open registry entry, oldest first by enqueue time —
  *  refs carry random suffixes, so a ref sort could hide an old item behind the
  *  display cap forever (codex r3). Shared by Day Done, Day Ahead, redelivery. */
@@ -3632,45 +4147,54 @@ async function listOpenWireItems(env: Env): Promise<Array<Record<string, unknown
 /** Render the "Waiting on you" bullet list (shared: Day Done + Day Ahead).
  *  10 oldest shown; a standing backlog past that is a budget/scorecard failure
  *  the Friday line exposes — not something to hide in rendering (codex r4). */
-function waitingOnYouLines(openItems: Array<Record<string, unknown> & { ref: string }>): string[] {
+export function waitingOnYouLines(openItems: Array<Record<string, unknown> & { ref: string }>): { lines: string[]; renderedRefs: string[] } {
   const lines: string[] = [];
+  const renderedRefs: string[] = [];
   if (openItems.length === 0) {
     lines.push("<b>Waiting on you:</b> nothing — all clear.");
-    return lines;
+    return { lines, renderedRefs };
   }
-  lines.push(`<b>Waiting on you (${openItems.length}):</b>`);
-  // Char budget inside the section: three decisions are enough for one
-  // attention pass. The rest stay answerable by ref and roll into later
-  // digests instead of turning the digest into a backlog dump.
-  // links can alone exceed the whole message allowance, and the final
-  // truncation would then cut refs WITHOUT an explicit "+N more" (codex r7).
+  // NO COUNT (plan v6 §2.3, finding 6). "Waiting on you (45)" told Robert he was 45
+  // items behind while showing three, and 42 of those 45 were never his work. The
+  // header now labels what is actually on screen, and nothing else.
+  lines.push("<b>Waiting on you:</b>");
   const CHAR_BUDGET = 900;
   let used = 0;
-  let shown = 0;
   for (const o of openItems.slice(0, 3)) {
-    const rec = String(o["rec"] ?? "").slice(0, 48);
-    const deferred = String(o["deferred"] ?? "");
-    const opts = Array.isArray(o["options"])
-      ? (o["options"] as unknown[]).map((v, i) => `${i + 1}=${String(v).slice(0, 24)}`).join(" · ").slice(0, 90)
-      : "";
+    // Every field is included WHOLE or omitted (§2.6). No .slice() anywhere: the
+    // reviewed digest showed "rec: Say go — I'll merge + deploy PR #39 now to fix t"
+    // and "2=Wait for Sol's cross-che", which is a decision Robert cannot act on.
+    const punchline = String(o["punchline"] ?? "");
+    if (!punchline) continue;
+    const rec = String(o["rec"] ?? "");
+    const optsArr = Array.isArray(o["options"]) ? (o["options"] as unknown[]).map(String) : [];
+    const opts = optsArr.map((v, i) => `${i + 1}=${v}`).join(" · ");
     // Full href, short label — a truncated URL is worse than none (codex r6).
     const linkRaw = String(o["link"] ?? "");
     const link = linkRaw
       ? `<a href="${linkRaw.replace(/&/g, "&amp;").replace(/"/g, "&quot;")}">open</a>`
       : "";
-    const line =
-      `• ${escapeHtml(o.ref)} — ${escapeHtml(String(o["punchline"] ?? "").slice(0, 64))}` +
-      (rec ? ` · <b>rec:</b> ${escapeHtml(rec)}` : "") +
-      (opts ? ` · ${escapeHtml(opts)}` : "") +
-      (link ? ` · ${link}` : "") +
-      (deferred ? ` <i>(held: ${escapeHtml(deferred)})</i>` : "");
+    // The internal hold-state label ("(held: budget)") is a queue token, not business
+    // meaning — banned from Robert-visible text (finding 9, rule 6).
+    const parts = [`• ${escapeHtml(o.ref)} — ${escapeHtml(punchline)}`];
+    if (rec && rec.length <= 240) parts.push(`<b>rec:</b> ${escapeHtml(rec)}`);
+    if (opts && opts.length <= 240) parts.push(escapeHtml(opts));
+    if (link) parts.push(link);
+    const line = parts.join(" · ");
     if (used + line.length > CHAR_BUDGET) break;
     lines.push(line);
     used += line.length + 1;
-    shown += 1;
+    renderedRefs.push(o.ref);
   }
-  if (openItems.length > shown) lines.push(`…+${openItems.length - shown} more — answer by ref anytime`);
-  return lines;
+  // NO "+N more" (§2.3, finding 6): undisplayed backlog is not Robert's work and is
+  // never appended to his list. Unanswered items resurface in a later digest on their
+  // own; the standing backlog is a budget/scorecard problem, not a rendering one.
+  if (renderedRefs.length === 0) {
+    // Items exist but none could be rendered whole. A bare header with nothing under it
+    // is worse than either outcome, and claiming "all clear" would be a lie.
+    return { lines: ["<b>Waiting on you:</b> nothing that renders cleanly this run."], renderedRefs };
+  }
+  return { lines, renderedRefs };
 }
 
 /** Append the queued-notes section under an explicit LENGTH budget: only notes
@@ -3678,7 +4202,7 @@ function waitingOnYouLines(openItems: Array<Record<string, unknown> & { ref: str
  *  Deleting a note the truncation swallowed would silently discard it (codex
  *  r6). Returns the KV keys of the notes actually rendered — the caller deletes
  *  them ONLY after the digest send succeeds. Shared: Day Done + Day Ahead. */
-function appendNotesSection(
+export function appendNotesSection(
   lines: string[],
   qItems: Array<Record<string, unknown> & { key: string }>,
   header: string,
@@ -3690,20 +4214,25 @@ function appendNotesSection(
   let used = lines.reduce((n, l) => n + l.length + 1, 0);
   for (const it of qItems) {
     if (renderedNoteKeys.length >= 5) break;
+    // Whole unit or drop it (§2.6). "oldest: \"Award records:" was a note cut at 72
+    // characters, mid-quote, leaving a dangling colon.
+    const punchline = String(it["punchline"] ?? "");
+    if (!punchline || punchline.length > 240) continue;
     const noteLinkRaw = String(it["link"] ?? "");
     const noteLink = noteLinkRaw
       ? ` — <a href="${noteLinkRaw.replace(/&/g, "&amp;").replace(/"/g, "&quot;")}">open</a>`
       : "";
-    const line = `• ${escapeHtml(String(it["punchline"] ?? "").slice(0, 72))}${noteLink}`;
+    const line = `• ${escapeHtml(punchline)}${noteLink}`;
     if (used + line.length > 1800) break; // keep the digest human-scannable
     lines.push(line);
     used += line.length + 1;
     renderedNoteKeys.push(it.key);
   }
-  lines[headerIdx] = `<b>${header} (${qItems.length}):</b>`;
-  if (qItems.length > renderedNoteKeys.length) {
-    lines.push(`…+${qItems.length - renderedNoteKeys.length} more (next digest)`);
-  }
+  // NO COUNT and NO "+N more" (§2.3): "Notes (234)" plus "…+229 more (next digest)"
+  // was 229 system records presented as Robert's personal backlog (finding 6).
+  // Un-rendered notes simply stay queued.
+  if (renderedNoteKeys.length === 0) { lines.splice(headerIdx, 1); return renderedNoteKeys; }
+  lines[headerIdx] = `<b>${header}:</b>`;
   return renderedNoteKeys;
 }
 
@@ -3766,16 +4295,21 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
   const lines: string[] = [];
   lines.push(`🌙 <b>DAY DONE — ${escapeHtml(et.label)}</b>`);
   if (fireItems.length > 0) {
-    // The registry is the 24h edit/coalesce window, NOT the incident system of
-    // record (command_alerts owns lifecycle) — label to match (codex r4).
-    lines.push(`<b>Fires (last 24h) (${fireItems.length}):</b>`);
+    // NO COUNT in the header and NO "(×N)" repeat marker (plan v6 §2.3). The ×4 on the
+    // Google Ads line told Robert an alarm had fired four times without telling him
+    // whether anything had been done about it — pure stress, zero decision value
+    // (finding 5). Punchlines render WHOLE or the line is dropped (§2.6).
+    lines.push("<b>Still open:</b>");
     for (const f of fireItems.slice(0, 3)) {
-      lines.push(`• ${escapeHtml(f.ref)} — ${escapeHtml(f.base.punchline.slice(0, 64))}${f.count > 1 ? ` (×${f.count})` : ""}`);
+      if (!f.base.punchline || f.base.punchline.length > 240) continue;
+      lines.push(`• ${escapeHtml(f.ref)} — ${escapeHtml(f.base.punchline)}`);
     }
   }
-  // "nothing new" only when the query SUCCEEDED — an unreachable source renders
-  // as unavailable, never as a false zero (codex r3; verify-before-claiming).
-  lines.push(`<b>Shipped (last 24h):</b> ${!shippedOk ? "(data unavailable)" : shippedCount === 0 ? "nothing new" : shippedCount}`);
+  // The raw "Shipped (last 24h): 10" line is REMOVED (plan v6 §2.3): a bare count of
+  // internal build events is not an outcome Robert can use, and §2.2 makes the recap
+  // completed-outcomes-only. The count survives in metadata for telemetry. Phase 6
+  // replaces this with path-bound outcome rendering; until then, honest silence.
+  // (shippedCount / shippedOk are carried into the outbound metadata below.)
   // Friday scorecard (Phase 2): the weekly comms SLO rides the Day Done digest
   // + lands as narrative kind=comms-slo so the trend is queryable. Fail-soft:
   // an unavailable substrate renders as unavailable, never a false zero.
@@ -3790,11 +4324,27 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
       lines.push("<b>Comms scorecard:</b> (data unavailable)");
     }
   }
-  lines.push(...waitingOnYouLines(openItems));
+  const waiting = waitingOnYouLines(openItems);
+  lines.push(...waiting.lines);
   const renderedNoteKeys = appendNotesSection(lines, qItems, "Notes");
   if (BOARD_URL) lines.push(`<i>Detail: ${escapeHtml(BOARD_URL)}</i>`);
-  lines.push(`<i>Reply to anything by ref ("C-003: go") — or just type what you want.</i>`);
-  const text = safeHtmlTruncate(lines.join("\n"), 2200);
+  // Interim footer fix (plan v6 §2.4 / finding 12): the hard-coded "C-003" example was
+  // never on screen and did not even match the live ref shape, so it could not be used.
+  // The footer now names the FIRST ref that actually rendered, and is omitted entirely
+  // when nothing answerable is on screen.
+  lines.push(...replyFooter(waiting.renderedRefs));
+  // Kill list, layer 3: FINAL RENDER (plan v6 §2.8). Anything carrying an
+  // email-as-Robert signature is removed from the composed payload immediately before
+  // send — so a signature arriving through a path nobody enumerated still cannot reach
+  // the phone. A nonzero removal count is a defect signal, not routine hygiene.
+  const scrubbed = scrubEmailAsRobert(fitDigest(lines));
+  if (scrubbed.removed > 0) {
+    console.error(JSON.stringify({
+      where: "composeDayDone", error: "email_as_robert_reached_final_render",
+      removed: scrubbed.removed, detail: "an ingress path is unaccounted for",
+    }));
+  }
+  const text = scrubbed.text;
 
   let botToken: string;
   try {
@@ -3804,7 +4354,11 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
   }
   const outboundId = await createOutboundLog(env, {
     sourceRoute: "/digest", chatId, parseMode: "HTML", text, status: "queued",
-    metadata: { wire: { type: "digest", kind: "day-done", trigger, notes: qItems.length, waiting: openItems.length, fires: fireItems.length } },
+    // Counts live HERE, in metadata, where telemetry can use them — never on screen.
+    metadata: {
+      wire: { type: "digest", kind: "day-done", trigger, notes: qItems.length, waiting: openItems.length, fires: fireItems.length, shipped_24h: shippedOk ? shippedCount : null, killed_at_final_render: scrubbed.removed },
+      ...(isCaptureMode(env) ? { capture: true } : {}),
+    },
     requireSupabase: true,
   });
   const result = await sendTelegramMessage(botToken, chatId, text, "HTML");
@@ -3822,6 +4376,69 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
   // overflow (count OR length) rolls to the next digest (codex r6).
   await Promise.all(renderedNoteKeys.map((k) => env.BWM_TELEGRAM_KV.delete(k)));
   return { ok: true, action: "sent", items: qItems.length };
+}
+
+/** Fire collapse sweep (plan v6 §2.5), run on the 15-min cron.
+ *
+ *  The registry is resolution-bound and carries no TTL, so an incident nobody closes
+ *  would otherwise sit in it forever. This sweep is the bounded end of that lifecycle:
+ *  an entry still open past WIRE_FIRE_STALE_MS is handed to the TEAM as a task exactly
+ *  once (`escalated` latches) and is then left alone. Robert is never pinged a second
+ *  time for the same fingerprint — that is the whole point of the fingerprint.
+ *
+ *  Also collapses the debris a crashed dispatch can leave: a {pending:true} claim whose
+ *  120s TTL has passed but whose key is still readable.
+ *
+ *  Emits telemetry (open / stale / escalated / collapsed) so a rising open count is
+ *  visible before it becomes a backlog. Fail-soft throughout: a sweep problem must
+ *  never take down the heartbeat cron it shares. */
+async function sweepFireRegistry(env: Env): Promise<void> {
+  const now = Date.now();
+  let open = 0, stale = 0, escalated = 0, collapsed = 0;
+  const list = await env.BWM_TELEGRAM_KV.list({ prefix: KV_WIRE_FIRE_PREFIX, limit: 1000 });
+  for (const k of list.keys) {
+    let raw: string | null;
+    try { raw = await env.BWM_TELEGRAM_KV.get(k.name); } catch { continue; }
+    if (!raw) continue;
+    let reg: Record<string, unknown>;
+    try { reg = JSON.parse(raw) as Record<string, unknown>; } catch {
+      await env.BWM_TELEGRAM_KV.delete(k.name).catch(() => undefined);
+      collapsed += 1;
+      continue;
+    }
+    // Stranded pre-send claim: no message ever landed, so nothing can edit it.
+    if (reg["pending"] === true) {
+      const ts = Date.parse(String(reg["ts"] ?? ""));
+      if (Number.isFinite(ts) && now - ts > 5 * 60 * 1000) {
+        await env.BWM_TELEGRAM_KV.delete(k.name).catch(() => undefined);
+        collapsed += 1;
+      }
+      continue;
+    }
+    open += 1;
+    const first = Date.parse(String(reg["first_at"] ?? ""));
+    if (!Number.isFinite(first) || now - first <= WIRE_FIRE_STALE_MS) continue;
+    stale += 1;
+    if (reg["escalated"] === true) continue;
+    const base = (reg["base"] ?? {}) as { punchline?: string; origin?: string };
+    const taskId = await emitOperationalEvent(env, "task.queued", {
+      assignee: "team",
+      priority: "P2",
+      title: `Unresolved incident open >7d: ${String(base.punchline ?? "(no punchline)").slice(0, 140)}`,
+      description: "Opened on the wire and never resolved. Routed to the team by the fire collapse sweep — Robert is deliberately NOT re-pinged (plan v6 §2.5).",
+      source: "telegram-relay:fire-collapse-sweep",
+      fingerprint: String(reg["fingerprint"] ?? k.name.slice(KV_WIRE_FIRE_PREFIX.length)),
+      wire_ref: String(reg["ref"] ?? ""),
+      origin: base.origin ?? null,
+    }, `fire-collapse-sweep-${new Date().toISOString().slice(0, 10)}`);
+    if (taskId) {
+      // Latch so the escalation happens exactly once per fingerprint.
+      await env.BWM_TELEGRAM_KV.put(k.name, JSON.stringify({ ...reg, escalated: true, escalated_at: new Date().toISOString(), escalation_event_id: taskId }))
+        .catch(() => undefined);
+      escalated += 1;
+    }
+  }
+  console.log(JSON.stringify({ where: "sweepFireRegistry", open, stale, escalated, collapsed, capture: isCaptureMode(env) }));
 }
 
 async function handleDigestFlush(request: Request, env: Env): Promise<Response> {
@@ -3945,7 +4562,15 @@ async function redeliverDeferredDecisions(env: Env, chatId: string): Promise<num
     // accepted-tradeoff as dispatchWire — KV has no CAS).
     spent += 1;
     await env.BWM_TELEGRAM_KV.put(budgetKey, String(spent), { expirationTtl: WIRE_BUDGET_TTL_SECONDS });
-    const text = renderWire(input, entry.ref);
+    // Guarded for the same reason as dispatchWire: a preservation violation must skip
+    // ONE item, never abort the whole Day Ahead digest mid-loop.
+    let text: string;
+    try {
+      text = renderWire(input, entry.ref);
+    } catch (e) {
+      console.error(JSON.stringify({ where: "redeliverDeferred.render", error: "render_failed_closed", detail: String(e).slice(0, 200), ref: entry.ref }));
+      continue;
+    }
     const redeliveredJudgment = wireJudgmentMeta(input);
     const outboundId = await createOutboundLog(env, {
       sourceRoute: "/digest/day-ahead",
@@ -4110,11 +4735,11 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
     env,
     `ea_escalations?select=sender_email,sarah_reason,scope&status=eq.open&order=opened_at.desc&limit=8`,
   );
-  const drafts = await fetchRows<{ gmail_thread_id: string | null }>(
-    env,
-    `ea_drafts?select=gmail_thread_id&sent_message_id=is.null&resolved_at=is.null` +
-    `&created_at=gte.${encodeURIComponent(since7d)}&limit=50`,
-  );
+  // ea_drafts is NOT queried (plan v6 §2.8, layer 2). Send-as-Robert auto-drafting is
+  // a capability Robert disabled: "I told you I don't want any more motherfucking
+  // automatic replies." Counting the drafts it still produces and putting that number
+  // on his phone is the prohibition failing at the one door that is supposed to
+  // enforce it. Re-enabling is a reviewed PR that restores this query, not a flag.
   // Overdue waiting-on rows (Sarah's "you owe a reply" tracker) — part of her
   // retired morning brief's needs-you surface; without it an owed reply that
   // is neither a recent escalation nor a handoff would vanish from Telegram
@@ -4152,12 +4777,13 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
     if (events.length === 0) {
       calSection.push("<b>Calendar:</b> clear.");
     } else {
-      calSection.push(`<b>Calendar (${events.length}):</b>`);
+      calSection.push("<b>Calendar:</b>");
       for (const ev of events.slice(0, 3)) {
         const when = ev.all_day ? "all day" : etTimeShort(ev.start_at);
-        calSection.push(`• ${escapeHtml(when)} — ${escapeHtml((ev.summary ?? "(no title)").slice(0, 70))}`);
+        const summary = ev.summary ?? "(no title)";
+        if (summary.length > 160) continue; // whole unit or nothing (§2.6)
+        calSection.push(`• ${escapeHtml(when)} — ${escapeHtml(summary)}`);
       }
-      if (events.length > 3) calSection.push(`…+${events.length - 3} more`);
     }
   }
 
@@ -4173,17 +4799,26 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
     inboxSection.push("<b>Inbox needs you:</b> (data unavailable)");
   } else {
     const inboxLines: string[] = [];
+    // Whole unit or drop the line (§2.6) — no more 40/60-char slices that cut a
+    // subject mid-word and leave Robert guessing what the message was about.
+    const fits = (v: string, max: number) => v.length > 0 && v.length <= max;
     for (const t of needsThreads ?? []) {
       const verb = t.action_taken === "halt" ? "halted — needs you" : "escalated";
-      inboxLines.push(`• ${escapeHtml((t.sender_email ?? "unknown").slice(0, 40))} — ${escapeHtml((t.subject ?? "(no subject)").slice(0, 60))} <i>(${verb})</i>`);
+      const who = t.sender_email ?? "unknown"; const subj = t.subject ?? "(no subject)";
+      if (!fits(who, 80) || !fits(subj, 160)) continue;
+      inboxLines.push(`• ${escapeHtml(who)} — ${escapeHtml(subj)} <i>(${verb})</i>`);
     }
     for (const e of escalations ?? []) {
-      inboxLines.push(`• ${escapeHtml((e.sender_email ?? "unknown").slice(0, 40))} — ${escapeHtml((e.sarah_reason ?? e.scope ?? "handoff").slice(0, 60))} <i>(with Bob)</i>`);
+      const who = e.sender_email ?? "unknown"; const why = e.sarah_reason ?? e.scope ?? "handoff";
+      if (!fits(who, 80) || !fits(why, 160)) continue;
+      inboxLines.push(`• ${escapeHtml(who)} — ${escapeHtml(why)} <i>(with Bob)</i>`);
     }
     for (const w of overdue ?? []) {
       const label = w.direction === "owed_by_us" ? "you owe a reply" : "awaiting their reply";
       const since = String(w.due_at ?? "").slice(0, 10);
-      inboxLines.push(`• ${escapeHtml((w.sender_email ?? "unknown").slice(0, 40))} — ${escapeHtml((w.subject ?? "(no subject)").slice(0, 60))} <i>(${label}${since ? ` since ${escapeHtml(since)}` : ""})</i>`);
+      const who = w.sender_email ?? "unknown"; const subj = w.subject ?? "(no subject)";
+      if (!fits(who, 80) || !fits(subj, 160)) continue;
+      inboxLines.push(`• ${escapeHtml(who)} — ${escapeHtml(subj)} <i>(${label}${since ? ` since ${escapeHtml(since)}` : ""})</i>`);
     }
     const failedSources = [needsThreads, escalations, overdue].filter((s) => s === null).length;
     const partial = failedSources > 0;
@@ -4192,20 +4827,14 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
         ? `<b>Inbox needs you:</b> (${failedSources} source${failedSources === 1 ? "" : "s"} unavailable this run — nothing visible in the rest)`
         : "<b>Inbox needs you:</b> nothing — Sarah's lanes are clear.");
     } else {
-      inboxSection.push(`<b>Inbox needs you (${inboxLines.length}${partial ? "+?" : ""}):</b>`);
+      // NO COUNT, NO "+N more" (§2.3). A partial read is still reported honestly —
+      // that is a data-availability fact, not a backlog tally.
+      inboxSection.push("<b>Inbox needs you:</b>");
       inboxSection.push(...inboxLines.slice(0, 3));
-      if (inboxLines.length > 3) inboxSection.push(`…+${inboxLines.length - 3} more`);
       if (partial) inboxSection.push(`<i>(${failedSources} inbox source${failedSources === 1 ? "" : "s"} unavailable this run)</i>`);
     }
   }
-  // Drafts render independently of the inbox sources (codex r3): a working
-  // ea_drafts read must show even when both inbox lanes are down, and a
-  // failed one gets an honest marker. Zero drafts = no line (non-signal).
-  if (drafts === null) {
-    inboxSection.push("✍️ Drafts: (data unavailable)");
-  } else if (drafts.length > 0) {
-    inboxSection.push(`✍️ Drafts ready to send: ${drafts.length}`);
-  }
+  // No Drafts line: see the ea_drafts note above (§2.8 layer 2).
 
   // Plan section (command queue) — wire-mirror rows are excluded in the query
   // because the same asks render as refs under Waiting on you.
@@ -4215,13 +4844,15 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
   } else if (plan.length === 0) {
     planSection.push("<b>Plan:</b> queue is empty.");
   } else {
-    // The query caps at 50 — render "50+" rather than an exact-looking total
-    // that understates a deeper backlog (post-deploy codex round).
-    planSection.push(`<b>Plan (${plan.length}${plan.length === 50 ? "+" : ""} queued):</b>`);
+    // NO COUNT (§2.3): "Plan (50+ queued)" is the single line that most directly told
+    // Robert he was fifty items behind. The priority TOKEN ("P2") is also gone —
+    // internal severity labels are banned from Robert-visible text (rule 6).
+    planSection.push("<b>Plan:</b>");
     for (const p of plan.slice(0, 3)) {
-      planSection.push(`• ${escapeHtml((p.priority ?? "P2").slice(0, 3))} · ${escapeHtml((p.title ?? "(untitled)").slice(0, 70))}`);
+      const title = p.title ?? "(untitled)";
+      if (title.length > 160) continue; // whole unit or nothing (§2.6)
+      planSection.push(`• ${escapeHtml(title)}`);
     }
-    if (plan.length > 3) planSection.push(`…+${plan.length - 3}${plan.length === 50 ? "+" : ""} more`);
   }
 
   // Overnight section (Sarah's log, data-derived from her real dispositions).
@@ -4241,15 +4872,12 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
       counts.set(a, (counts.get(a) ?? 0) + 1);
     }
     const total = [...counts.values()].reduce((a, b) => a + b, 0);
-    if (total === 0) {
-      overnightSection.push("<b>Overnight:</b> quiet — nothing needed auto-handling.");
-    } else {
-      const breakdown = [...counts.entries()]
-        .sort((a, b) => b[1] - a[1])
-        .map(([k, v]) => `${v} ${k}`)
-        .join(" · ");
-      overnightSection.push(`<b>Overnight:</b> Sarah handled ${total} (${escapeHtml(breakdown)}) — full brief on file.`);
-    }
+    // NO COUNT and no per-action breakdown (§2.3): "Sarah handled 12 (8 archive · 4
+    // label)" is machine-room volume. What Robert needs is the binary — did anything
+    // need him? — and the answer is already "no", or it would be listed above.
+    overnightSection.push(total === 0
+      ? "<b>Overnight:</b> quiet — nothing needed auto-handling."
+      : "<b>Overnight:</b> handled without you — full brief on file.");
   }
 
   // ── Assemble: header → decisions (always full) → sections by priority ──
@@ -4261,7 +4889,8 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
   // Highest priority: the decision list is the point of One Wire and is never
   // squeezed out by informational sections.
   const openItems = await listOpenWireItems(env);
-  lines.push(...waitingOnYouLines(openItems));
+  const waiting = waitingOnYouLines(openItems);
+  lines.push(...waiting.lines);
   const SECTION_CEILING = 1800; // one human-scannable attention pass
   const pushSection = (section: string[], label: string) => {
     if (section.length === 0) return;
@@ -4289,8 +4918,18 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
   const renderedNoteKeys = appendNotesSection(lines, qItems, "Overnight notes");
 
   if (BOARD_URL) lines.push(`<i>Detail: ${escapeHtml(BOARD_URL)}</i>`);
-  lines.push(`<i>Reply to anything by ref ("C-003: go") — or just type what you want.</i>`);
-  const text = safeHtmlTruncate(lines.join("\n"), 2200);
+  // Same interim footer rule as Day Done (§2.4): bound to a ref on screen, or absent.
+  lines.push(...replyFooter(waiting.renderedRefs));
+  // Kill list, layer 3 (§2.8) — same guard as Day Done. This is the composer that
+  // actually surfaced the inbound-email state, so the scrub matters most here.
+  const scrubbed = scrubEmailAsRobert(fitDigest(lines));
+  if (scrubbed.removed > 0) {
+    console.error(JSON.stringify({
+      where: "composeDayAhead", error: "email_as_robert_reached_final_render",
+      removed: scrubbed.removed, detail: "an ingress path is unaccounted for",
+    }));
+  }
+  const text = scrubbed.text;
 
   let botToken: string;
   try {
@@ -4304,7 +4943,9 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
       wire: {
         type: "digest", kind: "day-ahead", trigger,
         redelivered, notes: qItems.length, waiting: openItems.length,
+        killed_at_final_render: scrubbed.removed,
       },
+      ...(isCaptureMode(env) ? { capture: true } : {}),
     },
     requireSupabase: true,
   });
@@ -4572,6 +5213,12 @@ export default {
     ctx.waitUntil(
       emitHeartbeat(env, 0, 0).catch((e) =>
         console.error("scheduled heartbeat failed:", (e as Error)?.message ?? e),
+      ),
+    );
+    // Fire collapse sweep (plan v6 §2.5), on the 15-min cron.
+    ctx.waitUntil(
+      sweepFireRegistry(env).catch((e) =>
+        console.error("fire collapse sweep failed:", (e as Error)?.message ?? e),
       ),
     );
   },

@@ -1,0 +1,23 @@
+{
+  "provenance": {
+    "kind": "live",
+    "source_table": "telegram_outbound",
+    "source_row_id": "01KYGAGKGTYN6J83T2FPVKQDRR",
+    "captured_at": "2026-07-28T22:44:24.335Z",
+    "note": "clipped note — the source unit the digest cut mid-word"
+  },
+  "observed": {
+    "created_at": "2026-07-26T23:00:12.988076+00:00",
+    "status": "queued",
+    "source_route": "/notify",
+    "metadata": {
+      "wire": {
+        "key": null,
+        "type": "fyi",
+        "origin": "bwm-command-api",
+        "queued": "digest"
+      }
+    },
+    "text_redacted": "🟢 <b>Update: Approvals tracker: 9 item(s) pending over 48h — oldest: \"Award records: which years was Design2Sell ranked national Top 10?\" (10d)</b>\nhttps://design2sell.pages.dev/approvals/"
+  }
+}

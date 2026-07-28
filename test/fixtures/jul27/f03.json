@@ -1,0 +1,24 @@
+{
+  "provenance": {
+    "kind": "live",
+    "source_table": "telegram_outbound",
+    "source_row_id": "01KY29J7YT0A4A40ZJQ4JX514G",
+    "captured_at": "2026-07-28T22:44:23.684Z",
+    "note": "Social publisher signoff — team-owned nudge routed to Robert"
+  },
+  "observed": {
+    "created_at": "2026-07-21T12:14:15.753529+00:00",
+    "status": "sent",
+    "source_route": "/notify",
+    "metadata": {
+      "wire": {
+        "key": null,
+        "ref": "S-S4C83",
+        "type": "signoff",
+        "origin": "claude-peer-4",
+        "task_event_id": "01KY29J9D4W782AYW4VNXWCM0G"
+      }
+    },
+    "text_redacted": "🔵 <b>Approval: Social publisher phase 0 is built, merged, deployed and production-verified. One human click is all that's left.</b>\nCloses the approvals identity hole (anyone could previously assert who they were). Phase 0 gates all 8 later phases of the Henry-gated auto-publish engine.\n<b>My rec: Nudge Rodel or Emiliya to approve or reject any one of the 6 pending D2S items. The moment one lands I verify the recorded identity, ship the phase, and move the pointer to phase 1.</b>\nOne real D2S approval decision from Rodel, Emiliya, or Barbara at the link. I will not decide client items or click as someone else.\nReply: 1 = approve · 2 = changes (say what)\nhttps://design2sell.pages.dev/approvals/"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "provenance": {
+    "kind": "live",
+    "source_table": "telegram_outbound",
+    "source_row_id": "01KYHTJRMXCE09EVRPHBNGHVC7",
+    "captured_at": "2026-07-28T22:44:23.919Z",
+    "note": "Day Ahead of Jul 27 — inbound-email state surface"
+  },
+  "observed": {
+    "created_at": "2026-07-27T13:00:15.433103+00:00",
+    "status": "sent",
+    "source_route": "/digest",
+    "metadata": {
+      "wire": {
+        "kind": "day-ahead",
+        "type": "digest",
+        "notes": 125,
+        "trigger": "cron",
+        "waiting": 51,
+        "redelivered": 0
+      }
+    },
+    "text_redacted": "🌅 <b>DAY AHEAD — Mon, Jul 27</b>\n<b>Waiting on you (51):</b>\n• S-6C685 — Tom's 5 new money pages are live on townrg.com — OK to keep them · <b>rec:</b> Keep them live — QA passed and all 5 pages load  · 1=Keep live (recommended) · 2=Revert to v12.17 · <a href=\"https://townrg.com/appraiser/\">open</a> <i>(held: budget)</i>\n• S-9J13S — TRG review machine is built and tested — need your OK on the ask · <b>rec:</b> Approve as-is. The texts and emails are short, w · 1=Approve — turn sends on · 2=Approve with edits — tel · 3=Hold · <a href=\"https://github.com/buildwisemedia/townsend-realty-group/blob/465c802/review-engine/dryrun-log.md\">open</a> <i>(held: budget)</i>\n• C-SH1P1 — HARD STOP: [GitHub] A new public key was added to buildwisemedia <i>(held: budget)</i>\n…+48 more — answer by ref anytime\n<b>Calendar:</b> clear.\n<b>Inbox needs you (10):</b>\n• contact@comms.tailorbrands.com — Something new for Buildwise media <i>(escalated)</i>\n• support@signwell.com — 48 hours left on your SignWell Business trial <i>(escalated)</i>\n• notifications@buildwisemedia.com — New Contact Form Submission — ASAP Pest &amp; Wildlife <i>(you owe a reply since 2026-06-24)</i>\n…+7 more\n✍️ Drafts ready to send: 21\n<b>Plan (50+ queued):</b>\n• P0 · Review blocked Bob message for asap-pest-wildlife\n• P0 · Review blocked Bob message for rutherfordmade\n• P1 · Townsend: GBP manager invite from Tom for Google stack setup\n…+47+ more\n<b>Overnight:</b> Sarah handled 15 (14 archive · 1 label) — full brief on file.\n<b>Overnight notes (125):</b>\n• Bob has items waiting for team triage in the work queue.\n• Escalate: Verify your email address on Crunchbase — from support@crunchb\n• 📊 GBP readout — 2026-06-24→2026-07-21 (28 dates, data through 2026-07-2\n• Workflow Miner — 2026-07-24 Mined 14d ops history (excl. heartbeat/telem\n…+121 more (next digest)\n<i>Reply to anything by ref (\"C-003: go\") — or just type what you want.</i>"
+  }
+}

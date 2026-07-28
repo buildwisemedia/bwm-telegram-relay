@@ -1,0 +1,47 @@
+{
+  "provenance": {
+    "kind": "synthetic",
+    "captured_at": "2026-07-28T22:44:26.538Z",
+    "note": "spoof / replay / double-use triplet against the conversational lane"
+  },
+  "cases": [
+    {
+      "name": "spoof",
+      "wire_input": {
+        "type": "call",
+        "punchline": "spoofed reply",
+        "origin": "not-telegram-responder",
+        "reply_to_inbound": "01SPOOF00000000000000000000"
+      },
+      "expected": {
+        "verdict": "reject",
+        "reason": "unregistered_sender"
+      }
+    },
+    {
+      "name": "replay",
+      "wire_input": {
+        "type": "call",
+        "punchline": "replayed reply",
+        "origin": "telegram-responder",
+        "reply_to_inbound": "01REPLAY0000000000000000000"
+      },
+      "expected": {
+        "verdict": "reject",
+        "reason": "consume_returned_zero_rows"
+      }
+    },
+    {
+      "name": "double_use",
+      "wire_input": {
+        "type": "call",
+        "punchline": "double-used reply",
+        "origin": "telegram-responder",
+        "reply_to_inbound": "01DOUBLE0000000000000000000"
+      },
+      "expected": {
+        "verdict": "exactly_one_winner"
+      }
+    }
+  ]
+}

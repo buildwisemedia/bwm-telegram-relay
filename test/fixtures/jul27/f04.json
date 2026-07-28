@@ -1,0 +1,24 @@
+{
+  "provenance": {
+    "kind": "live",
+    "source_table": "telegram_outbound",
+    "source_row_id": "01KY2AVM8H19NZ5JABEMNBMECH",
+    "captured_at": "2026-07-28T22:44:23.759Z",
+    "note": "D2S approval-buttons call — reversible internal merge routed to Robert"
+  },
+  "observed": {
+    "created_at": "2026-07-21T12:36:51.84193+00:00",
+    "status": "queued",
+    "source_route": "/notify",
+    "metadata": {
+      "wire": {
+        "ref": "C-MTPF2",
+        "type": "call",
+        "origin": "spe-phase0-qa",
+        "queued": "digest",
+        "reason": "budget"
+      }
+    },
+    "text_redacted": "🟡 <b>Decision: Design2Sell approval buttons broke with today's security update — 6 client items can't be approved. One-line fix is tested + CI-green (PR #39); needs your OK to push live on their site.</b>\n6 D2S approvals stuck (incl. outreach go-live + website copy). Also Sol/Codex is logged out, so the final cross-model security check on this work is on hold until it's logged back in.\n<b>My rec: Say go — I'll merge + deploy PR #39 now to fix the buttons, then finish the security cross-check once Codex is logged back in.</b>\nReply: 1 = Go — push the fix live now · 2 = Wait for Sol's cross-check first (buttons stay broken longer) · 3 = Something else\nhttps://github.com/buildwisemedia/design2sell/pull/39"
+  }
+}

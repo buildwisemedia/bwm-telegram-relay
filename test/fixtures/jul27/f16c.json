@@ -1,0 +1,28 @@
+{
+  "provenance": {
+    "kind": "live",
+    "source_table": "operational_events",
+    "source_row_id": "01KYJ6FYX3DK59ECD1CKRQCGQV",
+    "captured_at": "2026-07-28T22:44:24.115Z",
+    "note": "Shape B build.shipped, 'REVIEW PREVIEW ONLY' in prose → renders NOTHING"
+  },
+  "observed": {
+    "event_type": "build.shipped",
+    "payload": {
+      "note": "REVIEW PREVIEW ONLY - not live at pattimoynihan.com. Domain registered, zone active, deliberately unpointed pending client approval. Cutover runbook in repo CUTOVER.md.",
+      "repo": "moynihantherapy.com",
+      "commit": "b8796c3b845f71d1bad10c56d26010961d09e9c6",
+      "source": "log-event-cli session=f0246f27-057c-455f-ab44-a0547d5978d7",
+      "node_id": "patti-moynihan-site",
+      "summary": "Patti Moynihan launch-readiness: working contact intake on the standard lead pipeline, fail-closed indexing control, production identity + sitemap, favicon, SC licence verified, and all 7 cross-model QA findings fixed (2 blockers were false-success paths on her only contact channel)",
+      "ship_tag": "v13-sol-qa-round2-2026-07-27",
+      "artifacts": [
+        "https://moynihantherapy-kimi-c.pages.dev"
+      ],
+      "build_kind": "patch",
+      "verification": "Pre-Ship Grep Gate ALL PASS; bwm-website-qa 59 pass/3 known-explained fails/20 warn, Lighthouse 100, W3C 0 errors; all 15 client-requested edits verified live and verbatim; all 8 worker response shapes proven not to falsely claim delivery; lead pipeline verified end to end with delivered:true"
+    },
+    "client_id": null,
+    "occurred_at": "2026-07-27T16:28:25.982298+00:00"
+  }
+}

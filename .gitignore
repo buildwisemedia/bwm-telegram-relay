@@ -6,3 +6,7 @@ node_modules/
 *.log
 .DS_Store
 .bwm-ship-check-skip
+
+# One Wire remediation: per-deploy receipts are runtime-only (plan v6 §2.11).
+# Committed facts live in scripts/pinned-facts.json; deploys must never dirty the tree.
+scripts/.runtime/
