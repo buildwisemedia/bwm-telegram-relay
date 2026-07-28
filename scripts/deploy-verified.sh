@@ -50,14 +50,31 @@ fi
 step_ok "deploy-run" "$RELAY"
 
 # Cloudflare propagation is fast but not instantaneous; poll rather than sleep-and-hope.
+#
+# NOTE: curl WITHOUT -f. The question this step answers is "which code is live", and
+# /health answers that on a 503 exactly as well as on a 200 — the capture worker is
+# legitimately "degraded" because a drill worker has no classifier keys by design. Using
+# -f here made a correct deploy read as unverified. The SHA comparison itself stays
+# strict; only the HTTP status is tolerated, and the status is reported below.
 LIVE=""
+HEALTH=""
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-  LIVE="$(curl -fsS "$RELAY/health" 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("git_sha") or "")' 2>/dev/null || true)"
+  HEALTH="$(curl -sS --max-time 15 "$RELAY/health" 2>/dev/null || true)"
+  LIVE="$(printf '%s' "$HEALTH" | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("git_sha") or "")
+except Exception:
+    print("")' 2>/dev/null || true)"
   [ "$LIVE" = "$SHA" ] && break
   sleep 3
 done
 [ "$LIVE" = "$SHA" ] || step_fail "deploy-sha-verified" "live /health.git_sha='$LIVE' != deployed '$SHA'"
-step_ok "deploy-sha-verified" "$SHA"
+HEALTH_STATUS="$(printf '%s' "$HEALTH" | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("status") or "?")
+except Exception:
+    print("?")' 2>/dev/null || echo "?")"
+step_ok "deploy-sha-verified" "$SHA (health status: $HEALTH_STATUS)"
 
 mkdir -p "$ROOT/scripts/.runtime"
 python3 - "$ROOT/scripts/.runtime/deploy-receipt.json" "$SHA" "$RELAY" "${WRANGLER_ENV:-production}" <<'PY'
