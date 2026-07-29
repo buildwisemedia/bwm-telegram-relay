@@ -108,8 +108,15 @@ else
 fi
 
 # ⑧ The live checkout must equal origin/main (the plan's landing procedure).
+# `git -C` on a non-repo exits nonzero and, under set -e, would kill this script with NO
+# step marker — which is how a self-test case once "failed" with nothing to point at.
+# Every step must resolve to a marker, including this one.
 if [ -d "$OPS" ]; then
-  GRAPH="$(git -C "$OPS" rev-list --left-right --count origin/main...HEAD | tr '\t' ' ')"
+  git -C "$OPS" rev-parse --git-dir >/dev/null 2>&1 \
+    || step_fail "ops-checkout-synced" "$OPS is not a git repository"
+  GRAPH="$(git -C "$OPS" rev-list --left-right --count origin/main...HEAD 2>/dev/null | tr '\t' ' ')" \
+    || step_fail "ops-checkout-synced" "could not read the git graph in $OPS"
+  [ -n "$GRAPH" ] || step_fail "ops-checkout-synced" "empty git graph for $OPS"
   AHEAD="$(echo "$GRAPH" | awk '{print $2}')"
   [ "$AHEAD" = "0" ] || step_fail "ops-checkout-synced" "live checkout has $AHEAD commit(s) not on origin/main (graph '$GRAPH')"
   step_ok "ops-checkout-synced" "graph '$GRAPH'"

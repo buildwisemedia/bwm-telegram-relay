@@ -134,13 +134,20 @@ m_sender_random_key()  {
   mkdir -p "$fake"
   cp "$HOME/bwm-ops-events/launchagent-health/remediation.py" "$fake/remediation.py"
   python3 - "$fake/remediation.py" <<'PY2'
-import sys, re
+import sys
 p = sys.argv[1]; s = open(p).read()
-s = s.replace(
-    'return f"launchagent-health:{slug}:{kind}"[:180]',
-    'import secrets as _s\n        return f"launchagent-health:{slug}:{kind}-{_s.token_hex(4)}"[:180]')
-open(p, "w").write(s)
+a = 'return f"launchagent-health:{slug}:{kind}"[:180]'
+# ASSERT the mutation landed. A silent no-op here produced an UNMUTATED copy, the check
+# under test passed, and the case then died at a later step with no marker at all — a
+# self-test that quietly stops testing anything is the exact failure mode this suite
+# exists to prevent.
+if s.count(a) != 1:
+    sys.stderr.write(f"selftest mutation target not found ({s.count(a)} matches)\n")
+    raise SystemExit(3)
+open(p, "w").write(s.replace(a,
+    'import secrets as _s\n        return f"launchagent-health:{slug}:{kind}-{_s.token_hex(4)}"[:180]'))
 PY2
+  [ $? -eq 0 ] || { echo "SELFTEST-SETUP:FAIL could not apply the sender-random-key mutation" >&2; return 1; }
   printf 'export BWM_OPS_EVENTS_REPO="%s/.fake-ops"\n' "$1" >> "$1/.selftest-env"
 }
 m_health_no_sha()      { python3 - "$1/src/index.ts" <<'PY'
