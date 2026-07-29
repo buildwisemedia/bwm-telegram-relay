@@ -112,7 +112,9 @@ fi
 echo "    unstamped drill outbound rows: 0"
 
 # ── 3. No drill row was ever actually delivered to Telegram ─────────────────
-# Proof is the MESSAGE ID, not the stored response. The capture worker short-circuits
+# Proof is the MESSAGE ID, not the stored response. Anything a drill mints — a capture
+# send, an edit, or a seeded registry — must sit at or above 9,000,000. The capture worker
+# short-circuits
 # Telegram I/O and mints synthetic ids from 9,000,000 up; real ids in Robert's chat are
 # four digits. An earlier version keyed on telegram_response->>capture being null, which
 # flagged every edit-path row (those simply never store a response) as "reached

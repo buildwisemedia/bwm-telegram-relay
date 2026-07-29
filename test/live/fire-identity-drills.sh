@@ -47,6 +47,11 @@ fi
 [ -n "$KEY_ARG" ] || step_fail "fire-identity" "BWM_INTERNAL_KEY unavailable"
 
 RUN="fireid-$(date -u +%Y%m%dT%H%M%SZ)"
+# Seeded message ids MUST sit above 9,000,000, the floor
+# test/live/capture-pollution-check.sh uses to distinguish a synthetic capture id from a
+# real Telegram one (real ids in Robert's chat are four digits). Seeding below it made the
+# drill's own rows read as "reached the real Telegram API" — a self-inflicted false alarm
+# that would have masked a genuine one.
 kvput() { npx --no-install wrangler kv key put "$1" "$2" --namespace-id "$CAP_NS" --remote >/dev/null 2>&1; }
 kvget() { npx --no-install wrangler kv key get "$1" --namespace-id "$CAP_NS" --remote 2>/dev/null || true; }
 kvlist() { npx --no-install wrangler kv key list --prefix "$1" --namespace-id "$CAP_NS" --remote 2>/dev/null || echo "[]"; }
@@ -79,7 +84,7 @@ FP="$(fingerprint "$OLDKEY" "launchagent-health")"
 [ -n "$FP" ] || step_fail "drillA-seed" "could not compute a fingerprint"
 kvput "wire:fire:$FP" "$(python3 -c '
 import json,sys
-print(json.dumps({"message_id":8100001,"ref":"F-SEED1","count":1,
+print(json.dumps({"message_id":9900001,"ref":"F-SEED1","count":1,
  "first_at":"2026-07-27T14:07:46.000Z","last_at":"2026-07-27T14:07:46.000Z",
  "base":{"type":"fire","punchline":"LaunchAgent health: 1 confirmed critical(s)",
          "origin":"launchagent-health","key":sys.argv[1]},"updates":[]}))' "$OLDKEY")"
@@ -110,7 +115,7 @@ TFP="$(fingerprint "$TKEY" "launchagent-health")"
 OLD_ISO="$(python3 -c 'import datetime;print((datetime.datetime.now(datetime.timezone.utc)-datetime.timedelta(days=15)).isoformat().replace("+00:00","Z"))')"
 kvput "wire:fire:$TFP" "$(python3 -c '
 import json,sys
-print(json.dumps({"message_id":8100002,"ref":"F-SEED2","count":1,
+print(json.dumps({"message_id":9900002,"ref":"F-SEED2","count":1,
  "first_at":sys.argv[1],"last_at":sys.argv[1],
  "escalated":True,"escalated_at":sys.argv[1],"escalation_event_id":"01DRILL0000000000000000000",
  "fingerprint":sys.argv[2],
