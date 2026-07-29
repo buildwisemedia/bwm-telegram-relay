@@ -197,6 +197,25 @@ b = ('    const nFailed = [needsThreads, escalations, overdue].filter((x) => x =
 open(p, "w").write(s.replace(a, b))
 PY2
 }
+# Sol QA r4 fresh bypasses. Each puts a tally into the Day Ahead partial-status slot in a
+# form the previous digit regexes could not see: the count trailing its label, the count
+# written as a word, and the count wrapped in markup so the regex and the reader saw
+# different documents. All three are now closed by approved-shape pinning.
+_mutate_partial_status() { python3 - "$1/src/index.ts" "$2" <<'PY2'
+import sys
+p, repl = sys.argv[1], sys.argv[2]
+s = open(p).read()
+a = '    if (partial) inboxSection.push("<i>(some inbox sources were unavailable this run)</i>");'
+if s.count(a) != 1:
+    sys.stderr.write(f"selftest mutation target not found ({s.count(a)} matches)\n")
+    raise SystemExit(3)
+open(p, "w").write(s.replace(a, repl))
+PY2
+}
+m_suffix_tally()       { _mutate_partial_status "$1" '    if (partial) inboxSection.push("<i>(some inbox sources were unavailable this run \u2014 failed reads: 2)</i>");' || return 1; }
+m_written_tally()      { _mutate_partial_status "$1" '    if (partial) inboxSection.push("<i>(two inbox sources were unavailable this run)</i>");' || return 1; }
+m_markup_tally()       { _mutate_partial_status "$1" '    if (partial) inboxSection.push(`<i>(<b>${[needsThreads, escalations, overdue].filter((x) => x === null).length}</b> inbox sources were unavailable this run)</i>`);' || return 1; }
+
 # Restore the sweep's delete-an-unresolved-incident behaviour.
 m_sweep_deletes()      { python3 - "$1/src/index.ts" <<'PY2'
 import sys
@@ -226,6 +245,9 @@ case "$PHASE" in
     run_case "count-reintroduced"    "composer-output"    m_reintroduce_count
     run_case "scorecard-backlog-line" "composer-output"   m_scorecard_backlog
     run_case "inline-source-count"   "composer-output"    m_inline_source_count
+    run_case "suffix-tally"          "composer-output"    m_suffix_tally
+    run_case "written-number-tally"  "composer-output"    m_written_tally
+    run_case "markup-wrapped-tally"  "composer-output"    m_markup_tally
     run_case "sweep-deletes-unresolved" "fire-lifecycle"  m_sweep_deletes
     ;;
   *) echo "verifier-selftest: unknown phase '$PHASE'" >&2; exit 64 ;;
