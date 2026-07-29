@@ -151,6 +151,27 @@ open(p, "w").write(s)
 PY
 }
 m_break_tests()        { printf '\nthrow new Error("selftest-injected failure");\n' >> "$1/test/render-preservation.test.ts"; }
+# Reintroduce the Day Ahead partial-source COUNT. This branch needs a failed data source
+# to render, so no unit test reaches it and the source grep does not recognise its shape —
+# executing the composer check is the only thing that catches it. Exactly the class that
+# let the Friday scorecard and the partial-source lines ship (Sol QA r1, P1-3).
+m_reintroduce_count()  { python3 - "$1/src/index.ts" <<'PY2'
+import sys
+p = sys.argv[1]; s = open(p).read()
+s = s.replace(
+    '"<i>(some inbox sources were unavailable this run)</i>"',
+    '`<i>(${failedSources} inbox source${failedSources === 1 ? "" : "s"} unavailable this run)</i>`')
+open(p, "w").write(s)
+PY2
+}
+# Restore the sweep's delete-an-unresolved-incident behaviour.
+m_sweep_deletes()      { python3 - "$1/src/index.ts" <<'PY2'
+import sys
+p = sys.argv[1]; s = open(p).read()
+s = s.replace("tombstone: true,", "tombstone_disabled: true,")
+open(p, "w").write(s)
+PY2
+}
 
 case "$PHASE" in
   phase1)
@@ -169,6 +190,8 @@ case "$PHASE" in
     run_case "killlist-layer3-removed" "kill-list-layers" m_killlist_stripped
     run_case "fire-ttl-restored"     "fire-lifecycle"     m_fire_ttl_restored
     run_case "sender-random-key"     "sender-stable-key"  m_sender_random_key
+    run_case "count-reintroduced"    "composer-output"    m_reintroduce_count
+    run_case "sweep-deletes-unresolved" "fire-lifecycle"  m_sweep_deletes
     ;;
   *) echo "verifier-selftest: unknown phase '$PHASE'" >&2; exit 64 ;;
 esac

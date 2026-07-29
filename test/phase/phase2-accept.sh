@@ -55,9 +55,21 @@ grep -qE '\`ea_drafts\?select' src/index.ts                     && MISSING="$MIS
 step_ok "kill-list-layers" "ingress(/notify+/event) · source(ea_drafts removed) · final-render"
 
 # ⑥ §2.5 — the fire lifecycle is resolution-bound, not time-bound.
+# Asserting the ABSENCE of a constant is how the sweep's own delete-after-14-days timer
+# went unnoticed (Sol QA r1, P0-2), so this now also checks that no delete path can reach
+# an escalated entry. The BEHAVIOURAL proof is test/live/fire-identity-drills.sh below.
 grep -q "WIRE_FIRE_TTL_SECONDS" src/index.ts && step_fail "fire-lifecycle" "a TTL still governs the fire registry"
 grep -q "sweepFireRegistry" src/index.ts || step_fail "fire-lifecycle" "no collapse sweep is wired"
-step_ok "fire-lifecycle" "no TTL; collapse sweep on the 15-min cron"
+grep -q "tombstone: true" src/index.ts || step_fail "fire-lifecycle" "the sweep does not compact to a tombstone — it may still delete unresolved identity"
+step_ok "fire-lifecycle" "no TTL; sweep compacts to a tombstone rather than deleting"
+
+# ⑥b §2.3 — counts, proven by EXECUTING the composers rather than grepping for shapes.
+node --experimental-strip-types scripts/check-composer-output.mjs 2>/dev/null \
+  || step_fail "composer-output" "an executed composer branch renders an aggregate count"
+
+# ⑥c The live fire registry must carry deterministic identities and NO expirations.
+node --experimental-strip-types scripts/reconcile-fire-registry.mjs --verify 2>/dev/null \
+  || step_fail "fire-registry-reconciled" "a live registry is at a legacy slot, unstamped, or still carries a TTL"
 
 # ⑦ The launchagent-health sender emits a STABLE key (the flap at its source).
 OPS="${BWM_OPS_EVENTS_REPO:-$HOME/bwm-ops-events}"
@@ -115,6 +127,24 @@ else
   step_ok "deploy-capture"
   bash test/live/flap-replay.sh capture || step_fail "flap-replay" "the flap reproduced, or the negative control did not split"
   step_ok "flap-replay"
+  # EXECUTABLE identity drills: sender-key change must edit; a tombstoned incident must
+  # never send again. Both run the real deployed worker end to end (Sol QA r1).
+  bash test/live/fire-identity-drills.sh capture || step_fail "fire-identity" "a changed sender key re-pinged, or a tombstoned incident sent again"
+  step_ok "fire-identity"
+  # The capture worker must have NO schedules. A named Cloudflare environment inherits
+  # the top-level [triggers] unless it declares its own; the LIVE schedules API is the
+  # only source of truth (a `deploy --dry-run` grep reported this wrong once).
+  CAP_SCHED="$(curl -sS "https://api.cloudflare.com/client/v4/accounts/ba00448499190431e6e4a00820f2200d/workers/scripts/bwm-telegram-relay-capture/schedules" \
+    -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN:-}" 2>/dev/null \
+    | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+    if not d.get("success"): print("QUERY_FAILED"); raise SystemExit
+    print(",".join(s["cron"] for s in d["result"]["schedules"]) or "EMPTY")
+except Exception:
+    print("QUERY_FAILED")')"
+  [ "$CAP_SCHED" = "EMPTY" ] || step_fail "capture-no-crons" "capture worker schedules = '$CAP_SCHED' (expected EMPTY; QUERY_FAILED means unproven, not clean)"
+  step_ok "capture-no-crons" "live schedules API returns []"
   bash test/live/capture-pollution-check.sh || step_fail "capture-pollution" "a drill polluted production, or the check could not run"
   step_ok "capture-pollution"
 fi

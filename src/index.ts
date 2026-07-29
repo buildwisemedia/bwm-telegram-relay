@@ -3197,6 +3197,47 @@ export function isConversationalReply(input: Pick<WireInput, "origin">): boolean
 /** Marker prefix for the structural /event identity. */
 const EVENT_IDENTITY_PREFIX = "evt|";
 
+/** Per-ORIGIN compatibility shims for senders that appended volatile material to an
+ *  otherwise stable dedup key.
+ *
+ *  Rule 9 forbids random or timestamp-derived material in a deduplication key. The live
+ *  registry showed the cost of enforcing that by asking nicely:
+ *  `launchagent-health-4126371745a9-d1db1829` and `launchagent-health-4126371745a9-ce77dd6d`
+ *  are the SAME condition an hour apart, and each opened its own Telegram message.
+ *
+ *  WHY THIS IS AN ALLOWLIST AND NOT A GENERAL RULE. A generic "strip a trailing hex
+ *  token" normalizer was written first and its own negative control killed it: it also
+ *  strips the last group of a UUID, so
+ *  `feedback-sla:design2sell:e20a71c9-46d4-47dc-a032-3ae88b1c8100` would collapse into
+ *  every other feedback-SLA incident for that client. There are a dozen such live
+ *  registries and the UUID is the only thing telling them apart. Merging two distinct
+ *  incidents HIDES one of them — strictly worse than the re-ping being fixed, and
+ *  undetectable from the outside. A trailing hex run is structurally identical in the
+ *  two cases, so no suffix-shape rule can separate them.
+ *
+ *  So: named origins only, each with the exact pattern that origin emitted, each
+ *  removable once its keys have drained. Every other sender's key is used verbatim. */
+const VOLATILE_KEY_SHIMS: Array<{ origin: RegExp; volatile: RegExp; note: string }> = [
+  {
+    origin: /^launchagent-health$/i,
+    // The pre-#158 sender: `launchagent-health-<12hex signature>-<8hex random>`.
+    // Anchored to that whole shape so it cannot match the post-#158 colon-delimited key.
+    volatile: /^(launchagent-health-[0-9a-f]{12})-[0-9a-f]{8}$/i,
+    note: "pre-PR#158 secrets.token_hex(4) suffix; removable once these keys drain",
+  },
+];
+
+/** Apply an origin's shim, if it has one. Returns the key unchanged otherwise. */
+export function stripVolatileKeySuffix(key: string, origin?: string | null): string {
+  if (!origin) return key;
+  for (const shim of VOLATILE_KEY_SHIMS) {
+    if (!shim.origin.test(origin)) continue;
+    const m = shim.volatile.exec(key);
+    if (m) return m[1];
+  }
+  return key;
+}
+
 /** Stable incident fingerprint, or null when the item has no admissible identity.
  *  Contains no random, timestamped, or prose-derived material by construction. */
 export function fireFingerprint(input: Pick<WireInput, "key" | "origin">): string | null {
@@ -3207,10 +3248,12 @@ export function fireFingerprint(input: Pick<WireInput, "key" | "origin">): strin
     // origin would be WRONG: that origin carries the per-event ULID.
     return shortHash(key);
   }
-  // Sender-bound. A null origin degrades to a shared unattributed namespace rather
-  // than losing edit-in-place for the senders that do not declare one yet (13 of 52
-  // observed fire rows). The Phase 4 SENDER_REGISTRY closes that namespace.
-  return shortHash(`ntf|${input.origin ?? ""}|${key}`);
+  // Sender-bound, with volatile suffixes stripped so a sender that still appends random
+  // material cannot fragment one condition across several messages.
+  // A null origin degrades to a shared unattributed namespace rather than losing
+  // edit-in-place for senders that do not declare one yet. The Phase 4 SENDER_REGISTRY
+  // closes that namespace.
+  return shortHash(`ntf|${input.origin ?? ""}|${stripVolatileKeySuffix(key, input.origin)}`);
 }
 
 /** KV registry key for a fingerprint. */
@@ -3719,7 +3762,7 @@ async function dispatchWireInner(
       try {
         const reg = JSON.parse(existingRaw) as {
           message_id: number; ref: string; base: WireInput; updates: string[]; count: number; first_at: string;
-          pending?: boolean;
+          pending?: boolean; tombstone?: boolean;
         };
         if (reg.pending) {
           await createOutboundLog(env, {
@@ -3771,6 +3814,23 @@ async function dispatchWireInner(
         // same-key occurrence retries the edit (codex r5: a storm of 429s
         // must not recreate the re-ping flood).
         const permanent = /message to edit not found|message can't be edited|MESSAGE_ID_INVALID/i.test(edit.error ?? "");
+        // A TOMBSTONED incident never falls through to a fresh send, even on a permanent
+        // edit failure (Sol QA r1, P0-2). It has already been escalated to the team and
+        // Robert has already been told once; a new post would be the re-ping. If the
+        // original message is genuinely gone there is nothing to update, so suppress and
+        // record it — silence is the correct outcome, not a second alarm.
+        if (permanent && reg.tombstone === true) {
+          await createOutboundLog(env, {
+            sourceRoute, originEventId: origin?.originEventId ?? null, originEventType: origin?.originEventType ?? null,
+            originSessionId: input.session_id ?? null, parseMode: "HTML", text, status: "skipped",
+            metadata: {
+              reason: "tombstoned_incident_recurred",
+              wire: { type: "fire", ref: reg.ref, key: input.key ?? null, origin: input.origin ?? null, fingerprint },
+              ...(isCaptureMode(env) ? { capture: true } : {}),
+            },
+          });
+          return { ok: true, action: "skipped_tombstoned", ref: reg.ref };
+        }
         if (!permanent) {
           console.warn(JSON.stringify({ where: "dispatchWire.fireEdit", warn: "transient_edit_failure", detail: edit.error, ref: reg.ref }));
           await createOutboundLog(env, {
@@ -4319,6 +4379,7 @@ interface FireRegistryEntry {
   first_at?: string;
   last_at?: string;
   escalated?: boolean;
+  tombstone?: boolean;
 }
 
 async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireResult & { items?: number }> {
@@ -4378,6 +4439,9 @@ async function composeAndSendDayDone(env: Env, trigger: string): Promise<WireRes
     // effectively random, so without this an old escalated fire can crowd out today's.
     const fireBullets = fireItems
       .slice()
+      // A tombstoned incident is team-owned and months old; it keeps its identity so a
+      // recurrence still edits, but it stops occupying the 3-item preview.
+      .filter((f) => f.tombstone !== true)
       .sort((a, b) => String(b.last_at ?? b.first_at ?? "").localeCompare(String(a.last_at ?? a.first_at ?? "")))
       .filter((f) => f.base.punchline && f.base.punchline.length <= 240)
       .slice(0, 3)
@@ -4502,14 +4566,33 @@ async function sweepFireRegistry(env: Env): Promise<void> {
     if (!Number.isFinite(first) || now - first <= WIRE_FIRE_STALE_MS) continue;
     stale += 1;
     if (reg["escalated"] === true) {
-      // TERMINAL CLEANUP (adversarial review, P2). Removing the TTL was deliberate, but
-      // an escalated entry that never gets a reply would otherwise live forever and
-      // eventually crowd newer fires out of the 3-item digest preview. Once the team has
-      // owned it for a full stale window, the registry entry has done its job: the
-      // incident lives in command_tasks now, which is its real system of record.
-      const escalatedAt = Date.parse(String(reg["escalated_at"] ?? ""));
-      if (Number.isFinite(escalatedAt) && now - escalatedAt > WIRE_FIRE_STALE_MS) {
-        await env.BWM_TELEGRAM_KV.delete(k.name).catch(() => undefined);
+      // COMPACT TO A TOMBSTONE — never delete (Sol QA r1, P0-2).
+      //
+      // The previous version deleted an escalated entry one stale window after
+      // escalation. At a 7-day window that meant a continuously unresolved fire lost its
+      // identity after ~14 days and its next recurrence SENT FRESH — re-arming the exact
+      // re-ping this phase exists to remove. The argument that "the incident lives in
+      // command_tasks now" was wrong about which artifact carries the guarantee: the KV
+      // registry is what suppresses the second post, so deleting it reopens the defect
+      // no matter what other system has a record.
+      //
+      // Compaction is still worthwhile — the digest should not show a months-old fire —
+      // so the entry SHRINKS to a tombstone (identity + message id + resolution state)
+      // and drops out of the digest preview via `tombstone`. It keeps no TTL and is
+      // removed only by an actual resolution reply.
+      if (reg["tombstone"] !== true) {
+        const base = (reg["base"] ?? {}) as { punchline?: string; origin?: string; key?: string; type?: string };
+        await env.BWM_TELEGRAM_KV.put(k.name, JSON.stringify({
+          fingerprint: reg["fingerprint"] ?? k.name.slice(KV_WIRE_FIRE_PREFIX.length),
+          ref: reg["ref"], message_id: reg["message_id"],
+          first_at: reg["first_at"], last_at: reg["last_at"],
+          escalated: true, escalated_at: reg["escalated_at"],
+          escalation_event_id: reg["escalation_event_id"],
+          tombstone: true,
+          // Keep the minimum the edit path needs to update the open message in place.
+          base: { type: "fire", punchline: base.punchline, origin: base.origin, key: base.key },
+          updates: [], count: reg["count"] ?? 1,
+        })).catch(() => undefined);
         collapsed += 1;
       }
       continue;
@@ -4533,6 +4616,26 @@ async function sweepFireRegistry(env: Env): Promise<void> {
     }
   }
   console.log(JSON.stringify({ where: "sweepFireRegistry", open, stale, escalated, collapsed, capture: isCaptureMode(env) }));
+}
+
+/** POST /sweep/fires — run the fire collapse sweep on demand (internal-key protected).
+ *
+ *  Exists because the sweep is otherwise reachable only from the 15-min cron, which makes
+ *  its behaviour untestable against a deployed worker: `POST /__scheduled` is a
+ *  `wrangler dev` affordance and does not exist in production. Sol QA r1 found the sweep
+ *  deleting unresolved incidents precisely because acceptance could only assert on the
+ *  ABSENCE of a constant rather than on what the sweep actually did.
+ *
+ *  This calls the SAME function the cron calls — no test-only branch, no forced path — so
+ *  a drill against it is a drill against production behaviour. It is also a useful manual
+ *  operational lever. */
+async function handleSweepFires(request: Request, env: Env): Promise<Response> {
+  const key = request.headers.get("X-BWM-Internal-Key") ?? "";
+  if (!env.BWM_INTERNAL_KEY || key !== env.BWM_INTERNAL_KEY) {
+    return json({ ok: false, error: "unauthorized" }, 401);
+  }
+  await sweepFireRegistry(env);
+  return json({ ok: true, action: "swept" });
 }
 
 async function handleDigestFlush(request: Request, env: Env): Promise<Response> {
@@ -4929,8 +5032,10 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
     const failedSources = [needsThreads, escalations, overdue].filter((s) => s === null).length;
     const partial = failedSources > 0;
     if (inboxLines.length === 0) {
+      // No count (§2.3): "some sources were unavailable" carries the identical honest
+      // signal — the read was partial — without putting a number on screen.
       inboxSection.push(partial
-        ? `<b>Inbox needs you:</b> (${failedSources} source${failedSources === 1 ? "" : "s"} unavailable this run — nothing visible in the rest)`
+        ? "<b>Inbox needs you:</b> some sources were unavailable this run — nothing visible in the rest."
         : "<b>Inbox needs you:</b> nothing — Sarah's lanes are clear.");
     } else {
       // NO COUNT, NO "+N more" (§2.3). A partial read is still reported honestly —
@@ -4939,7 +5044,7 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
       // a bullet under it.
       inboxSection.push("<b>Inbox needs you:</b>");
       inboxSection.push(...inboxLines.slice(0, 3));
-      if (partial) inboxSection.push(`<i>(${failedSources} inbox source${failedSources === 1 ? "" : "s"} unavailable this run)</i>`);
+      if (partial) inboxSection.push("<i>(some inbox sources were unavailable this run)</i>");
     }
   }
   // No Drafts line: see the ea_drafts note above (§2.8 layer 2).
@@ -5210,12 +5315,27 @@ async function computeCommsScorecard(env: Env): Promise<CommsScorecard | null> {
   };
 }
 
-function scorecardLines(sc: CommsScorecard): string[] {
+// @count-exemption:comms-scorecard — DELIBERATE, NARROW CARVE-OUT from §2.3.
+//
+// Ruled 2026-07-28. §2.3 bans aggregate counts because they presented system records as
+// Robert's personal backlog ("Waiting on you (45)", "Notes (234)"). These numbers are the
+// opposite of that: they measure THE WIRE ITSELF, not Robert's work. Interrupts/day
+// falling is how he sees this remediation working at all, so removing it would delete the
+// feedback signal for the fix.
+//
+// The exemption is narrow and must stay narrow: only the three lines below, only on
+// Friday, only describing the channel's own behaviour. It is named here and matched by
+// name in scripts/check-forbidden-strings.mjs, so the checker passes it DELIBERATELY
+// rather than by accident — an accidental pass would be indistinguishable from a hole.
+//
+// "refs" is gone: an internal token is finding-8 jargon regardless of which line it sits
+// on. The plain word is "unanswered".
+export function scorecardLines(sc: CommsScorecard): string[] {
   const med = sc.median_call_response_hours;
   return [
     `📊 <b>Comms scorecard (${sc.window_days}d):</b>`,
     `• ${sc.sends_per_day.toFixed(1)} sends/day · ${sc.interrupts_per_day.toFixed(1)} live interrupts/day (target ≤3)`,
-    `• CALL response: ${med !== null ? `median ${med.toFixed(1)}h over ${sc.decisions_total}` : "no answered calls this week"} · ${sc.unanswered_refs} unanswered ref${sc.unanswered_refs === 1 ? "" : "s"}`,
+    `• Decisions answered: ${med !== null ? `median ${med.toFixed(1)}h over ${sc.decisions_total}` : "none answered this week"} · ${sc.unanswered_refs} still unanswered`,
   ];
 }
 
@@ -5267,6 +5387,9 @@ export default {
       }
       if (method === "POST" && path === "/notify") {
         return handleNotify(request, env);
+      }
+      if (method === "POST" && path === "/sweep/fires") {
+        return handleSweepFires(request, env);
       }
       if (method === "POST" && path === "/digest/flush") {
         return handleDigestFlush(request, env);

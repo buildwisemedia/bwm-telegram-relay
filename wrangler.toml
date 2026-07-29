@@ -75,6 +75,16 @@ enabled = true
 [env.capture]
 workers_dev = true
 
+# NO CRONS (Sol QA r1, P1-4). A named Cloudflare environment INHERITS the top-level
+# [triggers] block unless it declares its own — the capture worker had all three
+# production schedules live, and scheduled activity can mutate capture KV and outbound
+# evidence in the middle of an acceptance drill. An earlier claim that capture had no
+# crons was made from a `wrangler deploy --dry-run` grep, which does not report the
+# schedules API state; the live API is the only source of truth here, and
+# test/phase/phase2-accept.sh now asserts against it.
+[env.capture.triggers]
+crons = []
+
 [env.capture.vars]
 ENVIRONMENT = "capture"
 CAPTURE_MODE = "true"

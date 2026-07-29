@@ -22,6 +22,7 @@ import {
   isEmailAsRobertOrigin,
   scrubEmailAsRobert,
   fireFingerprint,
+  stripVolatileKeySuffix,
   parseWireInput,
 } from "../src/index.ts";
 
@@ -139,18 +140,67 @@ test("the fingerprint is stable across repeats and carries no random material", 
   assert.ok(a && /^[0-9a-f]{16}$/.test(a));
 });
 
-test("the live Jul 27/28 random-suffix keys are exactly what split one incident into three", () => {
+test("the live Jul 27/28 random-suffix keys now collapse to ONE incident", () => {
   // Real telegram_outbound keys — same 12-char condition signature, three random tails.
+  // These produced three separate Telegram posts under a message reading "no re-pings".
+  // Rule 9 forbids random material in a dedup key; the relay now ENFORCES that at the
+  // door instead of trusting the sender, so all three resolve to one identity.
   const fps = [
     "launchagent-health-4126371745a9-b7be76f9",
     "launchagent-health-4126371745a9-d1db1829",
     "launchagent-health-4126371745a9-ce77dd6d",
   ].map((k) => fireFingerprint({ key: k, origin: "launchagent-health" }));
-  assert.equal(new Set(fps).size, 3, "random suffixes DO split — which is why the sender must not add them");
-  // The deterministic key that replaced them collapses to one.
+  assert.equal(new Set(fps).size, 1, "a volatile suffix must not fragment one condition");
+
+  // A DIFFERENT condition signature is still a different incident — the normalizer
+  // strips randomness, it does not flatten distinct conditions together.
+  const other = fireFingerprint({ key: "launchagent-health-5915534ccd74-4e7db728", origin: "launchagent-health" });
+  assert.notEqual(other, fps[0], "distinct condition signatures stay distinct");
+
   const stable = ["a", "b", "c"].map(() =>
     fireFingerprint({ key: "launchagent-health:com.buildwisemedia.aeo-probe:not-running", origin: "launchagent-health" }));
   assert.equal(new Set(stable).size, 1, "the stable key must collapse to ONE incident");
+});
+
+test("the volatile-key shim is origin-scoped and cannot touch another sender", () => {
+  // A generic "strip a trailing hex token" rule was written first and this control
+  // killed it: it also strips the last group of a UUID, which would collapse every
+  // feedback-SLA incident for a client into one and HIDE all but the first. A trailing
+  // hex run is structurally identical in both cases, so the shim is origin-scoped.
+  const untouched = [
+    ["feedback-sla:design2sell:e20a71c9-46d4-47dc-a032-3ae88b1c8100", "bwm-feedback-closeout"],
+    ["gads-guard-9442897025", "cli:robertechevarria"],
+    ["gads-guard-9793789968", "cli:robertechevarria"],
+    ["mention-escalate-fire:C0944QV645Q:1784246829.325659", "bwm-slack-listener"],
+    ["codex-auth-expired", "cli:robertechevarria"],
+    // Same volatile SHAPE, different origin — must NOT be shimmed.
+    ["launchagent-health-4126371745a9-b7be76f9", "some-other-sender"],
+  ] as const;
+  for (const [key, origin] of untouched) {
+    assert.equal(stripVolatileKeySuffix(key, origin), key, `must not rewrite ${key} from ${origin}`);
+  }
+
+  // The two live gads registries are distinguished ONLY by their campaign ids.
+  assert.notEqual(
+    fireFingerprint({ key: "gads-guard-9442897025", origin: "cli:robertechevarria" }),
+    fireFingerprint({ key: "gads-guard-9793789968", origin: "cli:robertechevarria" }),
+  );
+  // The dozen live feedback-SLA registries must stay distinct.
+  assert.notEqual(
+    fireFingerprint({ key: "feedback-sla:design2sell:e20a71c9-46d4-47dc-a032-3ae88b1c8100", origin: "bwm-feedback-closeout" }),
+    fireFingerprint({ key: "feedback-sla:design2sell:f2d6eb38-afda-4252-b0fe-c074332faed1", origin: "bwm-feedback-closeout" }),
+  );
+
+  // And the one shimmed origin, on the one shape it actually emitted.
+  assert.equal(
+    stripVolatileKeySuffix("launchagent-health-4126371745a9-b7be76f9", "launchagent-health"),
+    "launchagent-health-4126371745a9",
+  );
+  // The post-#158 key has no volatile tail and must pass through untouched.
+  assert.equal(
+    stripVolatileKeySuffix("launchagent-health:com.buildwisemedia.aeo-probe:not-running", "launchagent-health"),
+    "launchagent-health:com.buildwisemedia.aeo-probe:not-running",
+  );
 });
 
 test("severity is NOT part of the structural /event identity (P1→P0 edits, never re-pings)", () => {
