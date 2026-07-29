@@ -4216,6 +4216,66 @@ async function handleNotify(request: Request, env: Env): Promise<Response> {
   }, result.ok ? 200 : 502);
 }
 
+/** Day Ahead's "Inbox needs you" section.
+ *
+ *  EXTRACTED so it can be EXECUTED (Sol QA r2). It used to be inline in
+ *  composeAndSendDayAhead, which needs a live environment, so
+ *  scripts/check-composer-output.mjs could only search the source for approved literals
+ *  — and Sol slipped an inline-computed failed-source count past it by leaving an unused
+ *  copy of the approved literal elsewhere in the file. Literal presence is not branch
+ *  proof. A pure function with injected sources is.
+ *
+ *  A null argument means that source FAILED to load, which is what drives the
+ *  partial-read branches. */
+export function buildInboxSection(
+  needsThreads: Array<{ sender_email: string | null; subject: string | null; action_taken: string | null }> | null,
+  escalations: Array<{ sender_email: string | null; sarah_reason: string | null; scope: string | null }> | null,
+  overdue: Array<{ sender_email: string | null; subject: string | null; direction: string | null; due_at: string | null }> | null,
+): string[] {
+  const inboxSection: string[] = [];
+  if (needsThreads === null && escalations === null && overdue === null) {
+    inboxSection.push("<b>Inbox needs you:</b> (data unavailable)");
+    return inboxSection;
+  }
+  const inboxLines: string[] = [];
+  // Whole unit or drop the line (§2.6) — no more 40/60-char slices that cut a
+  // subject mid-word and leave Robert guessing what the message was about.
+  const fits = (v: string, max: number) => v.length > 0 && v.length <= max;
+  for (const t of needsThreads ?? []) {
+    const verb = t.action_taken === "halt" ? "halted — needs you" : "escalated";
+    const who = t.sender_email ?? "unknown"; const subj = t.subject ?? "(no subject)";
+    if (!fits(who, 80) || !fits(subj, 160)) continue;
+    inboxLines.push(`• ${escapeHtml(who)} — ${escapeHtml(subj)} <i>(${verb})</i>`);
+  }
+  for (const e of escalations ?? []) {
+    const who = e.sender_email ?? "unknown"; const why = e.sarah_reason ?? e.scope ?? "handoff";
+    if (!fits(who, 80) || !fits(why, 160)) continue;
+    inboxLines.push(`• ${escapeHtml(who)} — ${escapeHtml(why)} <i>(with Bob)</i>`);
+  }
+  for (const w of overdue ?? []) {
+    const label = w.direction === "owed_by_us" ? "you owe a reply" : "awaiting their reply";
+    const since = String(w.due_at ?? "").slice(0, 10);
+    const who = w.sender_email ?? "unknown"; const subj = w.subject ?? "(no subject)";
+    if (!fits(who, 80) || !fits(subj, 160)) continue;
+    inboxLines.push(`• ${escapeHtml(who)} — ${escapeHtml(subj)} <i>(${label}${since ? ` since ${escapeHtml(since)}` : ""})</i>`);
+  }
+  const partial = [needsThreads, escalations, overdue].some((s) => s === null);
+  if (inboxLines.length === 0) {
+    // No count (§2.3): "some sources were unavailable" carries the identical honest
+    // signal — the read was partial — without putting a number on screen.
+    inboxSection.push(partial
+      ? "<b>Inbox needs you:</b> some sources were unavailable this run — nothing visible in the rest."
+      : "<b>Inbox needs you:</b> nothing — Sarah's lanes are clear.");
+  } else {
+    // NO COUNT, NO "+N more" (§2.3). A partial read is still reported honestly —
+    // that is a data-availability fact, not a backlog tally.
+    inboxSection.push("<b>Inbox needs you:</b>");
+    inboxSection.push(...inboxLines.slice(0, 3));
+    if (partial) inboxSection.push("<i>(some inbox sources were unavailable this run)</i>");
+  }
+  return inboxSection;
+}
+
 /** The reply footer, bound to a ref that is ACTUALLY ON SCREEN (plan v6 §2.4).
  *  Finding 12: the digest shipped `Reply to anything by ref ("C-003: go")` while the
  *  visible refs were S-S4C83 / C-MTPF2 / S-B37RS — a demonstration of an identifier
@@ -5003,50 +5063,7 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
   // affordances (thread context here, answer-by-ref under Waiting on you).
   // "Clear" is claimed ONLY when ALL sources loaded and are empty (codex r2
   // P1; verify-before-claiming).
-  const inboxSection: string[] = [];
-  if (needsThreads === null && escalations === null && overdue === null) {
-    inboxSection.push("<b>Inbox needs you:</b> (data unavailable)");
-  } else {
-    const inboxLines: string[] = [];
-    // Whole unit or drop the line (§2.6) — no more 40/60-char slices that cut a
-    // subject mid-word and leave Robert guessing what the message was about.
-    const fits = (v: string, max: number) => v.length > 0 && v.length <= max;
-    for (const t of needsThreads ?? []) {
-      const verb = t.action_taken === "halt" ? "halted — needs you" : "escalated";
-      const who = t.sender_email ?? "unknown"; const subj = t.subject ?? "(no subject)";
-      if (!fits(who, 80) || !fits(subj, 160)) continue;
-      inboxLines.push(`• ${escapeHtml(who)} — ${escapeHtml(subj)} <i>(${verb})</i>`);
-    }
-    for (const e of escalations ?? []) {
-      const who = e.sender_email ?? "unknown"; const why = e.sarah_reason ?? e.scope ?? "handoff";
-      if (!fits(who, 80) || !fits(why, 160)) continue;
-      inboxLines.push(`• ${escapeHtml(who)} — ${escapeHtml(why)} <i>(with Bob)</i>`);
-    }
-    for (const w of overdue ?? []) {
-      const label = w.direction === "owed_by_us" ? "you owe a reply" : "awaiting their reply";
-      const since = String(w.due_at ?? "").slice(0, 10);
-      const who = w.sender_email ?? "unknown"; const subj = w.subject ?? "(no subject)";
-      if (!fits(who, 80) || !fits(subj, 160)) continue;
-      inboxLines.push(`• ${escapeHtml(who)} — ${escapeHtml(subj)} <i>(${label}${since ? ` since ${escapeHtml(since)}` : ""})</i>`);
-    }
-    const failedSources = [needsThreads, escalations, overdue].filter((s) => s === null).length;
-    const partial = failedSources > 0;
-    if (inboxLines.length === 0) {
-      // No count (§2.3): "some sources were unavailable" carries the identical honest
-      // signal — the read was partial — without putting a number on screen.
-      inboxSection.push(partial
-        ? "<b>Inbox needs you:</b> some sources were unavailable this run — nothing visible in the rest."
-        : "<b>Inbox needs you:</b> nothing — Sarah's lanes are clear.");
-    } else {
-      // NO COUNT, NO "+N more" (§2.3). A partial read is still reported honestly —
-      // that is a data-availability fact, not a backlog tally.
-      // inboxLines is non-empty here by the enclosing branch, so the header always has
-      // a bullet under it.
-      inboxSection.push("<b>Inbox needs you:</b>");
-      inboxSection.push(...inboxLines.slice(0, 3));
-      if (partial) inboxSection.push("<i>(some inbox sources were unavailable this run)</i>");
-    }
-  }
+  const inboxSection = buildInboxSection(needsThreads, escalations, overdue);
   // No Drafts line: see the ea_drafts note above (§2.8 layer 2).
 
   // Plan section (command queue) — wire-mirror rows are excluded in the query

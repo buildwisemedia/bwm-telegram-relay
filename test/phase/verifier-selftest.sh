@@ -151,17 +151,43 @@ open(p, "w").write(s)
 PY
 }
 m_break_tests()        { printf '\nthrow new Error("selftest-injected failure");\n' >> "$1/test/render-preservation.test.ts"; }
-# Reintroduce the Day Ahead partial-source COUNT. This branch needs a failed data source
-# to render, so no unit test reaches it and the source grep does not recognise its shape —
-# executing the composer check is the only thing that catches it. Exactly the class that
-# let the Friday scorecard and the partial-source lines ship (Sol QA r1, P1-3).
+# The OTHER partial-read branch: the empty-but-partial line. No unit test reaches it
+# (it needs zero visible items AND a failed source) and its shape is not a bold-header
+# `.length`, so only executing the composer catches a count here.
 m_reintroduce_count()  { python3 - "$1/src/index.ts" <<'PY2'
 import sys
 p = sys.argv[1]; s = open(p).read()
-s = s.replace(
-    '"<i>(some inbox sources were unavailable this run)</i>"',
-    '`<i>(${failedSources} inbox source${failedSources === 1 ? "" : "s"} unavailable this run)</i>`')
-open(p, "w").write(s)
+a = '      ? "<b>Inbox needs you:</b> some sources were unavailable this run \u2014 nothing visible in the rest."'
+assert s.count(a) == 1, s.count(a)
+b = ('      ? `<b>Inbox needs you:</b> ${[needsThreads, escalations, overdue].filter((x) => x === null).length}'
+     ' sources unavailable this run \u2014 nothing visible in the rest.`')
+open(p, "w").write(s.replace(a, b))
+PY2
+}
+# Sol QA r2 bypass A: a genuine backlog line added INSIDE scorecardLines(). The first
+# exemption was built from whatever that function returned, so the new line exempted
+# itself and the checker reported OK.
+m_scorecard_backlog()  { python3 - "$1/src/index.ts" <<'PY2'
+import sys
+p = sys.argv[1]; s = open(p).read()
+a = '    `\u2022 Decisions answered: ${med !== null ? `median ${med.toFixed(1)}h over ${sc.decisions_total}` : "none answered this week"} \u00b7 ${sc.unanswered_refs} still unanswered`,'
+assert s.count(a) == 1, s.count(a)
+open(p, "w").write(s.replace(a, a + '\n    `<b>Waiting on you (${sc.unanswered_refs}):</b>`,'))
+PY2
+}
+# Sol QA r2 bypass B: an inline-computed failed-source count, with an unused copy of the
+# APPROVED literal left in the file. The checker searched the source for that literal and
+# called the branch verified without ever running it.
+m_inline_source_count() { python3 - "$1/src/index.ts" <<'PY2'
+import sys
+p = sys.argv[1]; s = open(p).read()
+a = '    if (partial) inboxSection.push("<i>(some inbox sources were unavailable this run)</i>");'
+assert s.count(a) == 1, s.count(a)
+b = ('    const nFailed = [needsThreads, escalations, overdue].filter((x) => x === null).length;\n'
+     '    const approvedLiteralStillPresent = "<i>(some inbox sources were unavailable this run)</i>";\n'
+     '    void approvedLiteralStillPresent;\n'
+     '    if (partial) inboxSection.push(`<i>(${nFailed} inbox sources unavailable this run)</i>`);')
+open(p, "w").write(s.replace(a, b))
 PY2
 }
 # Restore the sweep's delete-an-unresolved-incident behaviour.
@@ -191,6 +217,8 @@ case "$PHASE" in
     run_case "fire-ttl-restored"     "fire-lifecycle"     m_fire_ttl_restored
     run_case "sender-random-key"     "sender-stable-key"  m_sender_random_key
     run_case "count-reintroduced"    "composer-output"    m_reintroduce_count
+    run_case "scorecard-backlog-line" "composer-output"   m_scorecard_backlog
+    run_case "inline-source-count"   "composer-output"    m_inline_source_count
     run_case "sweep-deletes-unresolved" "fire-lifecycle"  m_sweep_deletes
     ;;
   *) echo "verifier-selftest: unknown phase '$PHASE'" >&2; exit 64 ;;
