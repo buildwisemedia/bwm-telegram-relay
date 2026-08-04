@@ -30,6 +30,7 @@
  *   POST /capture-chat-id — Telegram bot webhook bootstrap. On first message from bot,
  *                           stores chat_id in KV under `bootstrap_chat_id`. One-time.
  *   GET  /health          — { status, version, telegram_configured, last_send_at }
+ *   GET  /decision-proof/:ref — relay-owned legal signoff evidence (internal-key).
  *   POST /send            — legacy compatibility input; hard-wraps to the FYI digest
  *                           and suppresses test/no-action payloads. Never sends live.
  *   POST /webhook         — legacy: Telegram update receiver (PROJ-ATTN-ROUTING-001 Phase 6).
@@ -96,7 +97,7 @@ export interface Env {
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-const VERSION = "2.6.1";
+const VERSION = "2.7.0";
 const BROKER_INTERNAL_URL = "https://internal/mint";
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 const KV_CHAT_ID_KEY = "robert_chat_id";
@@ -118,6 +119,7 @@ const OUTBOUND_TEXT_MAX = 4_000;
 // allowlist. Known smoke/no-action payloads are dropped before the digest queue.
 const KV_WIRE_FIRE_PREFIX = "wire:fire:"; // wire:fire:<hash> → live incident msg
 const KV_WIRE_OPEN_PREFIX = "wire:open:"; // wire:open:<ref> → unanswered call/signoff
+const KV_WIRE_DECISION_PROOF_PREFIX = "wire:decision-proof:"; // relay-owned legal approval evidence
 const KV_WIRE_DIGESTQ_PREFIX = "wire:digestq:"; // wire:digestq:<ulid> → queued digest item
 const KV_WIRE_BUDGET_PREFIX = "wire:budget:"; // wire:budget:<ET date> → live interrupts today
 // The fire registry is RESOLUTION-bound, not time-bound (plan v6 §2.5). There is no
@@ -127,6 +129,7 @@ const KV_WIRE_BUDGET_PREFIX = "wire:budget:"; // wire:budget:<ET date> → live 
 // never pinged a second time for the same fingerprint.
 const WIRE_FIRE_STALE_MS = 7 * 24 * 60 * 60 * 1000;
 const WIRE_OPEN_TTL_SECONDS = 7 * 24 * 60 * 60; // unanswered items resurface via digest
+const WIRE_DECISION_PROOF_TTL_SECONDS = 180 * 24 * 60 * 60;
 const WIRE_DIGESTQ_TTL_SECONDS = 3 * 24 * 60 * 60; // queue survives a missed digest run
 const WIRE_BUDGET_TTL_SECONDS = 48 * 60 * 60;
 // Robert-directed raise 2026-07-26 ("we run into that 3 limit a lot"): up to
@@ -1918,12 +1921,24 @@ async function processTelegramReply(
         let openType = "call";
         let digestTaskEventId: string | null = null;
         let digestJudgment: Record<string, unknown> | undefined;
+        let digestRegistry: Record<string, unknown> | null = null;
         try {
           const openReg = JSON.parse(openRaw) as Record<string, unknown>;
+          digestRegistry = openReg;
           openType = String(openReg["type"] ?? "call");
           digestTaskEventId = (openReg["task_event_id"] as string | null | undefined) ?? null;
           digestJudgment = registryJudgmentMeta(openReg);
         } catch { /* default */ }
+        const digestLegalApproval = registryLegalApproval(digestRegistry);
+        if (digestLegalApproval && !legalApprovalChoice(digestLegalApproval, answer)) {
+          try {
+            await sendTelegramMessage(
+              botToken, chatId, legalApprovalCorrection(ref, digestLegalApproval),
+              undefined, message.message_id,
+            );
+          } catch { /* fail-soft; the signoff remains open */ }
+          return false;
+        }
         const choiceNum = /^([1-9])\b/.exec(answer)?.[1] ?? null;
         const logged = await emitOperationalEvent(env, "narrative", {
           source: "telegram-reply",
@@ -1936,13 +1951,18 @@ async function processTelegramReply(
           note: `Robert answered ${ref} via digest reply${choiceNum ? ` with option ${choiceNum}` : ""}: "${answer.slice(0, 200)}"`,
           ...(digestJudgment ? { judgment: digestJudgment } : {}),
         }, `telegram-reply-${inboundEventId}`);
-        if (logged) {
+        const proofStored = logged
+          ? await persistRelayDecisionProof(
+            env, ref, openType, digestRegistry, answer || "(ack)", inboundEventId, "telegram-digest-reply",
+          )
+          : false;
+        if (logged && proofStored) {
           await env.BWM_TELEGRAM_KV.delete(`${KV_WIRE_OPEN_PREFIX}${ref}`);
           await emitWireTaskResolved(env, digestTaskEventId, ref, answer || "(ack)", `telegram-reply-${inboundEventId}`);
         }
         try {
           await sendTelegramMessage(botToken, chatId,
-            logged ? `✅ ${ref} logged. On it.` : `⚠️ Couldn't log ${ref} just now — it stays on your list; try again in a minute.`,
+            logged && proofStored ? `✅ ${ref} logged. On it.` : `⚠️ Couldn't seal ${ref} just now — it stays on your list; try again in a minute.`,
             undefined, message.message_id);
         } catch (e) {
           console.error(JSON.stringify({ where: "processTelegramReply.digestConfirm", error: String(e) }));
@@ -1994,9 +2014,11 @@ async function processTelegramReply(
     const stillOpen = openRawReply !== null;
     let replyTaskEventId: string | null = wireMeta.task_event_id ?? null;
     let replyJudgment: Record<string, unknown> | undefined;
+    let replyRegistry: Record<string, unknown> | null = null;
     if (openRawReply) {
       try {
         const replyReg = JSON.parse(openRawReply) as Record<string, unknown>;
+        replyRegistry = replyReg;
         if (!replyTaskEventId) {
           replyTaskEventId = (replyReg["task_event_id"] as string | null | undefined) ?? null;
         }
@@ -2038,6 +2060,16 @@ async function processTelegramReply(
       } catch { /* fail-soft */ }
       return false; // normal routing still delivers the text to the responder
     }
+    const directLegalApproval = registryLegalApproval(replyRegistry);
+    if (directLegalApproval && !legalApprovalChoice(directLegalApproval, text)) {
+      try {
+        await sendTelegramMessage(
+          botToken, chatId, legalApprovalCorrection(wireMeta.ref, directLegalApproval),
+          undefined, message.message_id,
+        );
+      } catch { /* fail-soft; the signoff remains open */ }
+      return false;
+    }
     const choiceNum = /^\s*([1-9])\b/.exec(text)?.[1] ?? null;
     // Persist the decision FIRST; only then clear the waiting-on-you entry and
     // confirm. If the insert fails (Supabase outage) the item stays open and
@@ -2059,7 +2091,12 @@ async function processTelegramReply(
       },
       `telegram-reply-${inboundEventId}`,
     );
-    if (decisionLogged) {
+    const proofStored = decisionLogged
+      ? await persistRelayDecisionProof(
+        env, wireMeta.ref, wireMeta.type, replyRegistry, text.trim(), inboundEventId, "telegram-reply",
+      )
+      : false;
+    if (decisionLogged && proofStored) {
       try {
         await env.BWM_TELEGRAM_KV.delete(`${KV_WIRE_OPEN_PREFIX}${wireMeta.ref}`);
       } catch (e) {
@@ -2071,9 +2108,9 @@ async function processTelegramReply(
       await sendTelegramMessage(
         botToken,
         chatId,
-        decisionLogged
+        decisionLogged && proofStored
           ? `✅ ${wireMeta.ref} logged${choiceNum ? ` — option ${choiceNum}` : ""}. On it.`
-          : `⚠️ Couldn't log ${wireMeta.ref} just now — it stays on your list; try again in a minute.`,
+          : `⚠️ Couldn't seal ${wireMeta.ref} just now — it stays on your list; try again in a minute.`,
         undefined,
         message.message_id,
       );
@@ -2498,16 +2535,19 @@ async function handleReactionUpdate(env: Env, update: TelegramUpdate): Promise<v
   const ackRefStillOpen = ackOpenRaw !== null;
   let ackTaskEventId: string | null = null;
   let ackJudgment: Record<string, unknown> | undefined;
+  let ackLegalApproval: LegalApprovalRequest | undefined;
   if (ackOpenRaw) {
     try {
       const ackReg = JSON.parse(ackOpenRaw) as Record<string, unknown>;
       ackTaskEventId = (ackReg["task_event_id"] as string | null | undefined) ?? null;
       ackJudgment = registryJudgmentMeta(ackReg);
+      ackLegalApproval = registryLegalApproval(ackReg);
     } catch { /* pre-Phase-2 registry rows have no task mirror */ }
   }
   // Only an OPEN ref accepts a reaction-decision — a late/accidental 👍 on an
   // already-answered item stays a plain ack (codex r2, idempotency).
-  if (wireOnAck?.ref && (wireOnAck.type === "call" || wireOnAck.type === "signoff") && emojis.includes("👍") && ackRefStillOpen) {
+  if (wireOnAck?.ref && (wireOnAck.type === "call" || wireOnAck.type === "signoff")
+      && emojis.includes("👍") && ackRefStillOpen && !ackLegalApproval) {
     let decisionLogged = false;
     if (canWriteOperationalEventsDirectly(env)) {
       try {
@@ -3164,6 +3204,54 @@ interface WireInput {
   session_id?: string;
   /** Judgment-capture opt-in (call/signoff). Absent = no capture, ever. */
   judgment?: WireJudgment;
+  /** Optional exact legal-packet approval identity. A proof is created only by
+   *  an authenticated Telegram reply; /notify can register a request but can
+   *  never create the decision proof. */
+  legal_approval?: LegalApprovalRequest;
+}
+
+export interface LegalApprovalRequest {
+  packet_id: string;
+  packet_digest: string;
+  request_digest: string;
+  expected_token: string;
+}
+
+export function parseLegalApprovalRequest(
+  raw: Record<string, unknown>, type: string,
+): { ok: true; approval?: LegalApprovalRequest } | { ok: false; error: string } {
+  const fields = [
+    "approval_packet_id", "approval_packet_digest", "approval_request_digest", "approval_expected_token",
+  ] as const;
+  const present = fields.filter((name) => raw[name] !== undefined && raw[name] !== null && raw[name] !== "");
+  if (present.length === 0) return { ok: true };
+  if (present.length !== fields.length) {
+    return { ok: false, error: "legal approval metadata must include all four approval fields" };
+  }
+  if (type !== "signoff") return { ok: false, error: "legal approval metadata is allowed only on signoff" };
+  const packetId = String(raw["approval_packet_id"]);
+  const packetDigest = String(raw["approval_packet_digest"]);
+  const requestDigest = String(raw["approval_request_digest"]);
+  const expectedToken = String(raw["approval_expected_token"]);
+  if (!/^[a-z0-9][a-z0-9-]{0,159}$/.test(packetId)) {
+    return { ok: false, error: "approval_packet_id is invalid" };
+  }
+  if (!/^[0-9a-f]{64}$/.test(packetDigest) || !/^[0-9a-f]{64}$/.test(requestDigest)) {
+    return { ok: false, error: "approval digests must be full lowercase SHA-256 values" };
+  }
+  const requiredToken = `APPROVE ${packetId} ${packetDigest.slice(0, 12)}`;
+  if (expectedToken !== requiredToken) {
+    return { ok: false, error: "approval_expected_token does not bind the packet id and 12-hex digest prefix" };
+  }
+  return {
+    ok: true,
+    approval: {
+      packet_id: packetId,
+      packet_digest: packetDigest,
+      request_digest: requestDigest,
+      expected_token: expectedToken,
+    },
+  };
 }
 
 export function isConversationalReply(input: Pick<WireInput, "origin">): boolean {
@@ -3336,6 +3424,8 @@ export function parseWireInput(
     }
   }
   const jr = parseWireJudgment(raw["judgment"], type as WireType, Boolean(str("rec")));
+  const legalApproval = parseLegalApprovalRequest(raw, type);
+  if (!legalApproval.ok) return legalApproval;
   return {
     ok: true,
     input: {
@@ -3351,6 +3441,7 @@ export function parseWireInput(
       origin: whole("origin", WIRE_LIMITS.origin, false),
       session_id: whole("session_id", WIRE_LIMITS.session_id, false),
       judgment: jr.judgment,
+      legal_approval: legalApproval.approval,
     },
     judgmentDropped: jr.dropped,
     droppedFields: droppedFields.length ? droppedFields : undefined,
@@ -3423,7 +3514,13 @@ export function renderWire(input: WireInput, ref: string, updates: string[] = []
   if (input.rec) plain(`<b>My rec: ${escapeHtml(input.rec)}</b>`, [escapeHtml(input.rec)]);
   if (input.ask) plain(escapeHtml(input.ask), [escapeHtml(input.ask)]);
   if (input.type === "call" || input.type === "signoff") {
-    if (input.options && input.options.length > 0) {
+    if (input.legal_approval) {
+      const rejectToken = `REJECT ${input.legal_approval.packet_id}`;
+      plain(
+        `Reply exactly: ${escapeHtml(input.legal_approval.expected_token)} · or ${escapeHtml(rejectToken)}`,
+        [escapeHtml(input.legal_approval.expected_token), escapeHtml(rejectToken)],
+      );
+    } else if (input.options && input.options.length > 0) {
       plain(
         `Reply: ${input.options.map((o, i) => `${i + 1} = ${escapeHtml(o)}`).join(" · ")}`,
         input.options.map((o) => escapeHtml(o)),
@@ -3540,6 +3637,101 @@ function registryJudgmentMeta(
     return wireJudgmentMeta(input);
   } catch {
     return undefined;
+  }
+}
+
+function registryLegalApproval(
+  reg: Record<string, unknown> | null | undefined,
+): LegalApprovalRequest | undefined {
+  if (!reg) return undefined;
+  try {
+    const input = reg["input"] as WireInput | undefined;
+    return input?.legal_approval;
+  } catch {
+    return undefined;
+  }
+}
+
+export interface RelayDecisionProof {
+  proof_version: "1.0";
+  verified: true;
+  ref: string;
+  wire_type: "signoff";
+  packet_id: string;
+  packet_digest: string;
+  request_digest: string;
+  choice_raw: string;
+  inbound_event_id: string;
+  source: "telegram-reply" | "telegram-digest-reply";
+  occurred_at: string;
+}
+
+export function legalApprovalChoice(
+  approval: LegalApprovalRequest,
+  choiceRaw: string,
+): "approve" | "reject" | null {
+  const choice = choiceRaw.trim();
+  if (choice === approval.expected_token) return "approve";
+  if (choice === `REJECT ${approval.packet_id}`) return "reject";
+  return null;
+}
+
+function legalApprovalCorrection(ref: string, approval: LegalApprovalRequest): string {
+  return `⚠️ ${ref} stays open. Reply exactly: ${approval.expected_token} — or REJECT ${approval.packet_id}`;
+}
+
+export function buildRelayDecisionProof(
+  ref: string,
+  approval: LegalApprovalRequest,
+  choiceRaw: string,
+  inboundEventId: string,
+  source: RelayDecisionProof["source"],
+  occurredAt: string,
+): RelayDecisionProof {
+  if (!/^S-[A-Z0-9]{3,6}$/.test(ref)) throw new Error("invalid signoff ref for decision proof");
+  if (!inboundEventId.trim()) throw new Error("decision proof requires inbound event id");
+  return {
+    proof_version: "1.0",
+    verified: true,
+    ref,
+    wire_type: "signoff",
+    packet_id: approval.packet_id,
+    packet_digest: approval.packet_digest,
+    request_digest: approval.request_digest,
+    choice_raw: choiceRaw.trim().slice(0, 500),
+    inbound_event_id: inboundEventId,
+    source,
+    occurred_at: occurredAt,
+  };
+}
+
+async function persistRelayDecisionProof(
+  env: Env,
+  ref: string,
+  wireType: string,
+  registry: Record<string, unknown> | null | undefined,
+  choiceRaw: string,
+  inboundEventId: string,
+  source: RelayDecisionProof["source"],
+): Promise<boolean> {
+  const approval = registryLegalApproval(registry);
+  if (!approval) return true;
+  if (wireType !== "signoff") return false;
+  const normalizedChoice = choiceRaw.trim();
+  if (!legalApprovalChoice(approval, normalizedChoice)) {
+    return false;
+  }
+  try {
+    const proof = buildRelayDecisionProof(ref, approval, normalizedChoice, inboundEventId, source, new Date().toISOString());
+    await env.BWM_TELEGRAM_KV.put(
+      `${KV_WIRE_DECISION_PROOF_PREFIX}${ref}`,
+      JSON.stringify(proof),
+      { expirationTtl: WIRE_DECISION_PROOF_TTL_SECONDS },
+    );
+    return true;
+  } catch (e) {
+    console.error(JSON.stringify({ where: "persistRelayDecisionProof", ref, error: String(e) }));
+    return false;
   }
 }
 
@@ -4214,6 +4406,27 @@ async function handleNotify(request: Request, env: Env): Promise<Response> {
     ...(judgment ? { judgment } : {}),
     ...(parsed.droppedFields ? { dropped_fields: parsed.droppedFields } : {}),
   }, result.ok ? 200 : 502);
+}
+
+async function handleDecisionProof(request: Request, env: Env, ref: string): Promise<Response> {
+  const key = request.headers.get("X-BWM-Internal-Key") ?? "";
+  if (!env.BWM_INTERNAL_KEY || key !== env.BWM_INTERNAL_KEY) {
+    return json({ ok: false, error: "unauthorized" }, 401);
+  }
+  if (!/^S-[A-Z0-9]{3,6}$/.test(ref)) {
+    return json({ ok: false, error: "invalid_ref" }, 400);
+  }
+  const raw = await env.BWM_TELEGRAM_KV.get(`${KV_WIRE_DECISION_PROOF_PREFIX}${ref}`);
+  if (!raw) return json({ ok: false, verified: false, error: "not_found" }, 404);
+  try {
+    const proof = JSON.parse(raw) as RelayDecisionProof;
+    if (proof.ref !== ref || proof.proof_version !== "1.0" || proof.verified !== true) {
+      return json({ ok: false, verified: false, error: "invalid_proof_record" }, 500);
+    }
+    return json({ ok: true, ...proof });
+  } catch {
+    return json({ ok: false, verified: false, error: "invalid_proof_record" }, 500);
+  }
 }
 
 /** Day Ahead's "Inbox needs you" section.
@@ -5395,6 +5608,10 @@ export default {
     try {
       if (method === "GET" && path === "/health") {
         return handleHealth(env);
+      }
+      const decisionProofMatch = /^\/decision-proof\/(S-[A-Z0-9]{3,6})$/.exec(path);
+      if (method === "GET" && decisionProofMatch) {
+        return handleDecisionProof(request, env, decisionProofMatch[1]);
       }
       if (method === "GET" && path === "/audit/outbound") {
         return handleOutboundAudit(request, env);
