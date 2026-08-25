@@ -41,6 +41,8 @@
  * PROJ-COMMS-CHANNEL-MIGRATION-001
  */
 
+import { hasInternalKey } from "./internal-auth.ts";
+
 export interface Env {
   /** KV namespace for chat_id + dedup + metadata */
   BWM_TELEGRAM_KV: KVNamespace;
@@ -54,6 +56,8 @@ export interface Env {
   BROKER_BEARER: string;
   /** Shared key for /send route auth (X-BWM-Internal-Key header) */
   BWM_INTERNAL_KEY: string;
+  /** Temporary overlap key used only during a governed rotation. */
+  BWM_INTERNAL_KEY_NEXT?: string;
   /** Shared key for calling bwm-attention-router /classify */
   ATTENTION_ROUTER_KEY: string;
   /** Shared key for calling bwm-content-classifier /classify */
@@ -783,7 +787,7 @@ async function handleHealth(env: Env): Promise<Response> {
 
 async function handleOutboundAudit(request: Request, env: Env): Promise<Response> {
   const key = request.headers.get("X-BWM-Internal-Key") ?? "";
-  if (!env.BWM_INTERNAL_KEY || key !== env.BWM_INTERNAL_KEY) {
+  if (!hasInternalKey(key, env)) {
     return json({ ok: false, error: "unauthorized" }, 401);
   }
 
@@ -1274,7 +1278,7 @@ export function legacyDigestPunchline(text: string): string {
 
 async function handleSend(request: Request, env: Env): Promise<Response> {
   const key = request.headers.get("X-BWM-Internal-Key") ?? "";
-  if (!env.BWM_INTERNAL_KEY || key !== env.BWM_INTERNAL_KEY) {
+  if (!hasInternalKey(key, env)) {
     return json({ ok: false, error: "unauthorized" }, 401);
   }
 
@@ -2651,7 +2655,7 @@ async function handleReactionUpdate(env: Env, update: TelegramUpdate): Promise<v
 
 async function handleRefreshWebhook(request: Request, env: Env): Promise<Response> {
   const key = request.headers.get("X-BWM-Internal-Key") ?? "";
-  if (!env.BWM_INTERNAL_KEY || key !== env.BWM_INTERNAL_KEY) {
+  if (!hasInternalKey(key, env)) {
     return json({ ok: false, error: "unauthorized" }, 401);
   }
   if (!env.TELEGRAM_WEBHOOK_SECRET) {
@@ -4379,7 +4383,7 @@ async function retryPendingTaskResolves(env: Env): Promise<void> {
 
 async function handleNotify(request: Request, env: Env): Promise<Response> {
   const key = request.headers.get("X-BWM-Internal-Key") ?? "";
-  if (!env.BWM_INTERNAL_KEY || key !== env.BWM_INTERNAL_KEY) {
+  if (!hasInternalKey(key, env)) {
     return json({ ok: false, error: "unauthorized" }, 401);
   }
   let raw: Record<string, unknown>;
@@ -4410,7 +4414,7 @@ async function handleNotify(request: Request, env: Env): Promise<Response> {
 
 async function handleDecisionProof(request: Request, env: Env, ref: string): Promise<Response> {
   const key = request.headers.get("X-BWM-Internal-Key") ?? "";
-  if (!env.BWM_INTERNAL_KEY || key !== env.BWM_INTERNAL_KEY) {
+  if (!hasInternalKey(key, env)) {
     return json({ ok: false, error: "unauthorized" }, 401);
   }
   if (!/^S-[A-Z0-9]{3,6}$/.test(ref)) {
@@ -4904,7 +4908,7 @@ async function sweepFireRegistry(env: Env): Promise<void> {
  *  operational lever. */
 async function handleSweepFires(request: Request, env: Env): Promise<Response> {
   const key = request.headers.get("X-BWM-Internal-Key") ?? "";
-  if (!env.BWM_INTERNAL_KEY || key !== env.BWM_INTERNAL_KEY) {
+  if (!hasInternalKey(key, env)) {
     return json({ ok: false, error: "unauthorized" }, 401);
   }
   await sweepFireRegistry(env);
@@ -4913,7 +4917,7 @@ async function handleSweepFires(request: Request, env: Env): Promise<Response> {
 
 async function handleDigestFlush(request: Request, env: Env): Promise<Response> {
   const key = request.headers.get("X-BWM-Internal-Key") ?? "";
-  if (!env.BWM_INTERNAL_KEY || key !== env.BWM_INTERNAL_KEY) {
+  if (!hasInternalKey(key, env)) {
     return json({ ok: false, error: "unauthorized" }, 401);
   }
   const result = await composeAndSendDayDone(env, "manual_flush");
@@ -5419,7 +5423,7 @@ async function composeAndSendDayAhead(env: Env, trigger: string): Promise<WireRe
 
 async function handleDayAheadTrigger(request: Request, env: Env): Promise<Response> {
   const key = request.headers.get("X-BWM-Internal-Key") ?? "";
-  if (!env.BWM_INTERNAL_KEY || key !== env.BWM_INTERNAL_KEY) {
+  if (!hasInternalKey(key, env)) {
     return json({ ok: false, error: "unauthorized" }, 401);
   }
   const result = await composeAndSendDayAhead(env, "manual_flush");
@@ -5586,7 +5590,7 @@ async function emitCommsSlo(env: Env, sc: CommsScorecard): Promise<string | null
 
 async function handleScorecardRun(request: Request, env: Env): Promise<Response> {
   const key = request.headers.get("X-BWM-Internal-Key") ?? "";
-  if (!env.BWM_INTERNAL_KEY || key !== env.BWM_INTERNAL_KEY) {
+  if (!hasInternalKey(key, env)) {
     return json({ ok: false, error: "unauthorized" }, 401);
   }
   const sc = await computeCommsScorecard(env);
