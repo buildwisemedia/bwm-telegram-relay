@@ -42,8 +42,14 @@ function writeVault(path: string, body: string, mode = 0o600) {
   chmodSync(path, mode);
 }
 
+function writeSettings(box: Sandbox, key: string) {
+  mkdirSync(join(box.home, ".claude"), { recursive: true });
+  writeFileSync(join(box.home, ".claude", "settings.json"), JSON.stringify({ env: { BWM_INTERNAL_KEY: key } }));
+}
+
+// The timeout turns a hang (for example a blocking vault open) into a failure.
 function run(box: Sandbox, args: string[], extra: NodeJS.ProcessEnv = {}) {
-  return spawnSync("bash", [SCRIPT, ...args], { env: { ...box.env, ...extra }, encoding: "utf8" });
+  return spawnSync("bash", [SCRIPT, ...args], { env: { ...box.env, ...extra }, encoding: "utf8", timeout: 20_000 });
 }
 
 const FYI = ["--type", "fyi", "--punchline", "test line"];
@@ -178,6 +184,50 @@ test("--help works without a key", () => {
     const r = run(box, ["--help"]);
     assert.equal(r.status, 0);
     assert.match(r.stdout, /Exit: 0 sent\/queued/);
+  } finally {
+    rmSync(box.root, { recursive: true, force: true });
+  }
+});
+
+test("a directory at the vault path falls back to settings.json", () => {
+  const box = sandbox();
+  try {
+    mkdirSync(box.vault);
+    writeSettings(box, "settings-key");
+    const r = run(box, FYI);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stderr, /not a regular file/);
+    assert.equal(readFileSync(join(box.record, "stdin"), "utf8").trim(), "X-BWM-Internal-Key: settings-key");
+  } finally {
+    rmSync(box.root, { recursive: true, force: true });
+  }
+});
+
+test("a FIFO at the vault path falls back without blocking", () => {
+  const box = sandbox();
+  try {
+    assert.equal(spawnSync("mkfifo", [box.vault]).status, 0, "mkfifo failed");
+    writeSettings(box, "settings-key");
+    const r = run(box, FYI);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stderr, /not a regular file/);
+    assert.equal(readFileSync(join(box.record, "stdin"), "utf8").trim(), "X-BWM-Internal-Key: settings-key");
+  } finally {
+    rmSync(box.root, { recursive: true, force: true });
+  }
+});
+
+test("a vault file that is not UTF-8 falls back without echoing its bytes", () => {
+  const box = sandbox();
+  try {
+    writeFileSync(box.vault, Buffer.concat([Buffer.from("BWM_INTERNAL_KEY=zq-secret-"), Buffer.from([0xff, 0xfe]), Buffer.from("\n")]));
+    chmodSync(box.vault, 0o600);
+    writeSettings(box, "settings-key");
+    const r = run(box, FYI);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stderr, /unreadable \(UnicodeDecodeError\)/);
+    assert.ok(!r.stderr.includes("zq-secret"), "vault bytes echoed on stderr");
+    assert.equal(readFileSync(join(box.record, "stdin"), "utf8").trim(), "X-BWM-Internal-Key: settings-key");
   } finally {
     rmSync(box.root, { recursive: true, force: true });
   }

@@ -90,8 +90,12 @@ def parse_env(text):
 
 def read_vault(path):
     # Same checks as log-event's secure reader: no symlink, regular file,
-    # owned by this user, no group or other permission bits.
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    # owned by this user, no group or other permission bits. The descriptor
+    # is checked before it is wrapped, and O_NONBLOCK keeps a FIFO from
+    # hanging the open, so a bad vault path falls through to the legacy
+    # fallback instead of stopping the resolver.
+    flags = (os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+             | getattr(os, "O_NOFOLLOW", 0))
     try:
         fd = os.open(path, flags)
     except FileNotFoundError:
@@ -99,18 +103,25 @@ def read_vault(path):
     except OSError as exc:
         print(f"bwm-robert-notify: ignoring {path}: {exc.strerror}", file=sys.stderr)
         return ""
-    with os.fdopen(fd, "r", encoding="utf-8") as handle:
-        meta = os.fstat(handle.fileno())
-        if not stat.S_ISREG(meta.st_mode):
-            print(f"bwm-robert-notify: ignoring {path}: not a regular file", file=sys.stderr)
-            return ""
-        if meta.st_uid != os.geteuid():
-            print(f"bwm-robert-notify: ignoring {path}: not owned by this user", file=sys.stderr)
-            return ""
-        if meta.st_mode & 0o077:
-            print(f"bwm-robert-notify: ignoring {path}: permissions too open (want 600)", file=sys.stderr)
-            return ""
-        return parse_env(handle.read())
+    meta = os.fstat(fd)
+    problem = ""
+    if not stat.S_ISREG(meta.st_mode):
+        problem = "not a regular file"
+    elif meta.st_uid != os.geteuid():
+        problem = "not owned by this user"
+    elif meta.st_mode & 0o077:
+        problem = "permissions too open (want 600)"
+    if problem:
+        os.close(fd)
+        print(f"bwm-robert-notify: ignoring {path}: {problem}", file=sys.stderr)
+        return ""
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            return parse_env(handle.read())
+    except (OSError, UnicodeDecodeError) as exc:
+        # Name the error class only: a decode error's text quotes file bytes.
+        print(f"bwm-robert-notify: ignoring {path}: unreadable ({type(exc).__name__})", file=sys.stderr)
+        return ""
 
 vault = os.environ.get("BWM_INTERNAL_KEY_FILE") or os.path.expanduser("~/.bwm_secrets/ea-substrate.env")
 value = read_vault(vault)
