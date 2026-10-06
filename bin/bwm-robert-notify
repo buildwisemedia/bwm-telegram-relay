@@ -6,7 +6,7 @@
 #     [--stakes "what it means in $"] [--rec "my recommendation"] [--ask "the ask"] \
 #     [--option "label"] [--option "label"] [--link URL] [--key suppress-key] \
 #     [--expires YYYY-MM-DD] [--origin name] [--judgment '{...}'] \
-#     [--json '{...raw body...}']
+#     [--json '{...raw body...}'] [--dry-run]
 #
 # --judgment (call/signoff only) opts the decision into PROJ-UPLIFT-001
 # judgment capture — set it ONLY for genuine business forks with a checkable
@@ -26,29 +26,21 @@
 #   fire    — client/business breakage; repeats with the same --key EDIT the
 #             original message instead of re-pinging.
 #
-# Auth: $BWM_INTERNAL_KEY (falls back to ~/.claude/settings.json env block).
+# --dry-run resolves the key and builds the body, then prints the body and
+# where the key came from (never the key) without sending anything.
+#
+# Auth: $BWM_INTERNAL_KEY, else the vault file $BWM_INTERNAL_KEY_FILE
+# (default ~/.bwm_secrets/ea-substrate.env, the internal-key rotation tool's
+# canonical holder), else the legacy ~/.claude/settings.json env block. The
+# vault file must be a regular file owned by you with no group/other access.
+# The key is sent on curl's stdin, never on a command line.
 # Exit: 0 sent/queued · 64 bad args · 78 no key · 1 relay error.
 set -euo pipefail
 
 RELAY_URL="${BWM_TELEGRAM_RELAY_URL:-https://bwm-telegram-relay.robert-ba0.workers.dev}"
 
-if [ -z "${BWM_INTERNAL_KEY:-}" ]; then
-  BWM_INTERNAL_KEY=$(python3 - <<'PY'
-import json, os
-p = os.path.expanduser("~/.claude/settings.json")
-try:
-    print(json.load(open(p)).get("env", {}).get("BWM_INTERNAL_KEY", ""))
-except Exception:
-    print("")
-PY
-)
-fi
-if [ -z "$BWM_INTERNAL_KEY" ]; then
-  echo "bwm-robert-notify: BWM_INTERNAL_KEY not set (settings.json env or export)" >&2
-  exit 78
-fi
-
 TYPE="" PUNCHLINE="" STAKES="" REC="" ASK="" LINK="" KEY="" EXPIRES="" ORIGIN="" JUDGMENT="" RAW_JSON=""
+DRY_RUN=0
 OPTIONS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -64,10 +56,84 @@ while [ $# -gt 0 ]; do
     --origin)    ORIGIN="$2"; shift 2;;
     --judgment)  JUDGMENT="$2"; shift 2;;
     --json)      RAW_JSON="$2"; shift 2;;
-    -h|--help)   sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    --dry-run)   DRY_RUN=1; shift;;
+    -h|--help)   sed -n '2,37p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
     *) echo "bwm-robert-notify: unknown arg: $1" >&2; exit 64;;
   esac
 done
+
+KEY_SOURCE="env"
+if [ -z "${BWM_INTERNAL_KEY:-}" ]; then
+  # Two lines on stdout: where the key came from, then the key. A pipe, not
+  # argv or the environment, carries it back to this shell.
+  # The helper is a top-level here-document: bash 3.2 (macOS /bin/bash) can't
+  # parse one inside a process substitution.
+  read -r -d '' RESOLVE_KEY_PY <<'PY' || true
+import json, os, stat, sys
+
+def parse_env(text):
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        name = name.strip()
+        if name.startswith("export "):
+            name = name[len("export "):].strip()
+        if name != "BWM_INTERNAL_KEY":
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        return value
+    return ""
+
+def read_vault(path):
+    # Same checks as log-event's secure reader: no symlink, regular file,
+    # owned by this user, no group or other permission bits.
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:
+        print(f"bwm-robert-notify: ignoring {path}: {exc.strerror}", file=sys.stderr)
+        return ""
+    with os.fdopen(fd, "r", encoding="utf-8") as handle:
+        meta = os.fstat(handle.fileno())
+        if not stat.S_ISREG(meta.st_mode):
+            print(f"bwm-robert-notify: ignoring {path}: not a regular file", file=sys.stderr)
+            return ""
+        if meta.st_uid != os.geteuid():
+            print(f"bwm-robert-notify: ignoring {path}: not owned by this user", file=sys.stderr)
+            return ""
+        if meta.st_mode & 0o077:
+            print(f"bwm-robert-notify: ignoring {path}: permissions too open (want 600)", file=sys.stderr)
+            return ""
+        return parse_env(handle.read())
+
+vault = os.environ.get("BWM_INTERNAL_KEY_FILE") or os.path.expanduser("~/.bwm_secrets/ea-substrate.env")
+value = read_vault(vault)
+source = "vault"
+if not value:
+    source = "settings"
+    try:
+        with open(os.path.expanduser("~/.claude/settings.json"), encoding="utf-8") as handle:
+            value = str(json.load(handle).get("env", {}).get("BWM_INTERNAL_KEY", "") or "")
+    except Exception:
+        value = ""
+if "\n" in value or "\r" in value:
+    value = ""
+print(source if value else "none")
+print(value)
+PY
+  KEY_SOURCE="" BWM_INTERNAL_KEY=""
+  { IFS= read -r KEY_SOURCE || true; IFS= read -r BWM_INTERNAL_KEY || true; } < <(python3 -c "$RESOLVE_KEY_PY")
+fi
+if [ -z "$BWM_INTERNAL_KEY" ]; then
+  echo "bwm-robert-notify: BWM_INTERNAL_KEY not found (export, vault file or settings.json env)" >&2
+  exit 78
+fi
 
 if [ -n "$RAW_JSON" ]; then
   BODY="$RAW_JSON"
@@ -109,11 +175,25 @@ print(json.dumps(body))
   )
 fi
 
+if [ "$DRY_RUN" = 1 ]; then
+  RELAY_URL="$RELAY_URL" KEY_SOURCE="$KEY_SOURCE" BODY="$BODY" python3 -c '
+import json, os
+try:
+    body = json.loads(os.environ["BODY"])
+except ValueError:
+    body = os.environ["BODY"]
+print(json.dumps({"dry_run": True, "relay": os.environ["RELAY_URL"] + "/notify",
+                  "key_source": os.environ["KEY_SOURCE"], "body": body}))
+'
+  exit 0
+fi
+
 # curl, not python-urllib: Cloudflare blocks the python-urllib UA (error 1010).
+# The key header goes in on stdin (-H @-) so it never shows in a process list.
 RESP=$(curl -sS -w $'\n%{http_code}' -X POST "$RELAY_URL/notify" \
-  -H "X-BWM-Internal-Key: $BWM_INTERNAL_KEY" \
+  -H @- \
   -H "Content-Type: application/json" \
-  --data "$BODY")
+  --data "$BODY" <<<"X-BWM-Internal-Key: $BWM_INTERNAL_KEY")
 CODE=$(printf '%s' "$RESP" | tail -n1)
 PAYLOAD=$(printf '%s' "$RESP" | sed '$d')
 printf '%s\n' "$PAYLOAD"
